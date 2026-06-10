@@ -10,4 +10,5 @@ contextBridge.exposeInMainWorld('agent', {
   version: () => ipcRenderer.invoke('app-version'),
   installUpdate: () => ipcRenderer.invoke('install-update'),
   openUpdate: () => ipcRenderer.invoke('open-update'),
+  refresh: () => ipcRenderer.invoke('refresh'),
 });

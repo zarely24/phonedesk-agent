@@ -221,6 +221,24 @@ class AgentCore extends EventEmitter {
     ws.addEventListener('error', () => { try { ws.close(); } catch {} });
   }
 
+  /** Manual refresh: drop every connection, restart adb + ws-scrcpy, reconnect from scratch.
+      Fixes the "phone just won't connect" moods without restarting the whole app. */
+  refreshAll() {
+    this.emit('log', 'manual refresh: restarting adb + ws-scrcpy and reconnecting everything');
+    Object.keys(this.devices).forEach((serial) => {
+      const dev = this.devices[serial];
+      try { clearInterval(dev.hb); } catch {}
+      try { dev.ws && dev.ws.close(); } catch {}
+      delete this.devices[serial];          // close handler can't reconnect a deleted entry
+    });
+    try {
+      if (this._wsProc) { this._wsProc.removeAllListeners('exit'); this._wsProc.kill(); }
+    } catch {}
+    this._wsProc = null; this._wsStarted = false;
+    try { this._adb(['kill-server']); } catch {}   // next adb call auto-starts a fresh daemon
+    this.reconcile();
+  }
+
   /** The server removed this phone: forget its token, stop reconnecting (frees a pairing slot). */
   unpair(serial) {
     const tokens = this._loadTokens();

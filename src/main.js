@@ -133,6 +133,10 @@ app.whenReady().then(() => {
 
 ipcMain.handle('backend-url', () => BACKEND);
 ipcMain.handle('app-version', () => app.getVersion());
+ipcMain.handle('refresh', () => {
+  try { core.refreshAll(); } catch (e) { fileLog('refresh error:', e && e.stack); }
+  return true;
+});
 ipcMain.handle('install-update', () => {
   try { require('electron-updater').autoUpdater.quitAndInstall(); } catch (e) { fileLog('quitAndInstall:', e && e.message); }
 });

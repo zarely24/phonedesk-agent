@@ -15,6 +15,14 @@ document.getElementById('pair-back').addEventListener('click', () => go('phones'
 window.agent.onDevice((st) => { if (st && st.phones) { renderPhones(st); updatePairStatus(st); } });
 window.agent.onStatus(() => { /* per-phone online/reconnecting - the 2s status poll refreshes the list */ });
 
+// Refresh: restart adb + the stream engine + every connection, without closing the app.
+document.getElementById('refresh-btn').addEventListener('click', async function () {
+  const b = this;
+  b.disabled = true; b.textContent = 'Refreshing...';
+  try { await window.agent.refresh(); } catch {}
+  setTimeout(() => { b.disabled = false; b.innerHTML = '&#8635; Refresh'; }, 2500);
+});
+
 // Version label + the update banner (Windows: restart-to-install; Mac: download the new dmg).
 if (window.agent.version) window.agent.version().then((v) => { document.getElementById('ver').textContent = 'v' + v; }).catch(() => {});
 if (window.agent.onUpdate) window.agent.onUpdate((u) => {

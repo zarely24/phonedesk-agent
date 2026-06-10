@@ -20,6 +20,10 @@
       justify-content:center; gap:12px; padding:10px 14px; background:#171a21; border-top:1px solid #2a2f3a; font-size:13px; }
     #update-bar .btn { width:auto; max-width:none; padding:8px 14px; font-size:13px; }
     #ver { position:fixed; right:10px; top:10px; color:#4a5160; font-size:11px; }
+    #refresh-btn { position:fixed; left:10px; top:8px; background:transparent; border:1px solid #2a2f3a;
+      color:#9aa3b2; border-radius:8px; padding:4px 10px; font-size:12px; cursor:pointer; transition:.15s; }
+    #refresh-btn:hover { border-color:#4f8cff; color:#e7e9ee; }
+    #refresh-btn:disabled { opacity:.5; cursor:wait; }
   </style>
 </head>
 <body>
@@ -53,6 +57,7 @@
     </section>
   </div>
 
+  <button id="refresh-btn" title="Restart the phone connection (adb + stream) without closing the app">&#8635; Refresh</button>
   <span id="ver"></span>
   <div id="update-bar" class="hide">
     <span id="update-text"></span>
