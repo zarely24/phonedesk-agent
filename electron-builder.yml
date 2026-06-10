@@ -8,6 +8,7 @@ files:
   - "**/*"
   - "!resources/**"
   - "!dist-installers/**"
+  - "!dist/**"
   - "!.github/**"
   - "!*.log"
   - "!repack-asar.js"

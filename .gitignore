@@ -2,6 +2,7 @@
 # (the shipped ws-scrcpy needs its runtime deps).
 /node_modules/
 /dist-installers/
+/dist/
 *.log
 .check-asar.js
 # dev leftovers - .agent.json/.debug-agent.json hold device tokens, never commit
