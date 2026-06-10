@@ -28,6 +28,7 @@ publish:
   provider: github
   owner: zarely24
   repo: phonedesk-agent
+  releaseType: release   # publish immediately (the default creates an invisible draft)
 win:
   target: nsis
   artifactName: "PhoneDesk-Setup.exe"
