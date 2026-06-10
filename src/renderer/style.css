@@ -1,0 +1,43 @@
+:root{
+  --bg:#0f1115; --surface:#171a21; --surface2:#1f232c; --border:#2a2f3a;
+  --text:#e7e9ee; --muted:#9aa3b2; --accent:#4f8cff; --accent2:#3b6fd6;
+  --green:#36d399; --amber:#fbbd23; --red:#f87272;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--text)}
+.app{height:100%;display:flex;flex-direction:column;padding:24px;text-align:center}
+.brand{font-weight:800;font-size:18px;letter-spacing:.3px;margin-bottom:8px}
+.brand span{color:var(--accent)}
+
+.step{display:none;flex:1;flex-direction:column;align-items:center;justify-content:center;gap:16px}
+.step.active{display:flex}
+.step h1{font-size:22px;margin:0}
+.muted{color:var(--muted);margin:0;font-size:14px;line-height:1.5}
+.hero{font-size:64px;line-height:1}
+.hero.ok{width:90px;height:90px;border-radius:50%;background:rgba(54,211,153,.15);color:var(--green);
+  display:grid;place-items:center;font-size:48px}
+
+.btn{border:1px solid var(--border);background:var(--surface2);color:var(--text);
+  padding:13px 22px;border-radius:12px;cursor:pointer;font-size:15px;font-weight:700;transition:.15s;width:100%;max-width:300px}
+.btn:hover{border-color:var(--accent)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.primary:hover{background:var(--accent2)}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+
+.status-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;
+  padding:16px;font-size:14px;line-height:1.5;width:100%;max-width:340px}
+.status-card.ok{border-color:var(--green);color:var(--green)}
+.status-card.warn{border-color:var(--amber)}
+.status-card.online{border-color:var(--green);color:var(--green);font-weight:700;font-size:16px}
+
+.guide{background:var(--surface2);border:1px solid var(--border);border-radius:12px;
+  padding:8px 16px;width:100%;max-width:340px;text-align:left}
+.guide ol{margin:8px 0;padding-left:20px}
+.guide li{margin:6px 0;font-size:13px;color:var(--muted)}
+
+.code-input{background:var(--surface2);border:1px solid var(--border);color:var(--text);
+  padding:14px;border-radius:12px;font-size:22px;text-align:center;letter-spacing:3px;
+  text-transform:uppercase;width:100%;max-width:300px;font-weight:700}
+.err{color:var(--red);font-size:13px;margin:0}
+.hide{display:none}

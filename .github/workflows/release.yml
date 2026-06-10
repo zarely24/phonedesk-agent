@@ -1,0 +1,42 @@
+# The PhoneDesk build robot: push a tag like v0.2.0 and this builds the Windows
+# installer + the Mac dmg and publishes them on a GitHub Release - no human uploads.
+# The Windows app then self-updates from these releases (electron-updater);
+# the Mac app shows a "Download update" button pointing at the new dmg.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # let GITHUB_TOKEN create the release + upload assets
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install
+      - run: npx electron-builder --win --publish always
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+  mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: chmod +x resources/adb/mac/adb
+      - run: npm install
+      - run: npx electron-builder --mac --publish always
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'

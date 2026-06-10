@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline';">
+  <title>PhoneDesk</title>
+  <link rel="stylesheet" href="style.css">
+  <style>
+    #phones-list { display:flex; flex-direction:column; gap:8px; margin:12px 0; text-align:left; }
+    .phone-row { display:flex; align-items:center; gap:10px; padding:10px 12px; border:1px solid rgba(255,255,255,.10); border-radius:10px; background:rgba(255,255,255,.03); }
+    .phone-row b { flex:1; font-weight:600; }
+    .phone-row .muted { font-size:13px; }
+    .dot { width:9px; height:9px; border-radius:50%; flex:none; }
+    .dot.online { background:#36d399; box-shadow:0 0 0 3px rgba(54,211,153,.18); }
+    .dot.warn { background:#fbbd23; }
+    .dot.off { background:#6b7280; }
+    #pair-status.ok { color:#36d399; font-weight:700; }
+    #pair-status.warn { color:#fbbd23; font-weight:700; }
+    #update-bar { position:fixed; left:0; right:0; bottom:0; z-index:50; display:flex; align-items:center;
+      justify-content:center; gap:12px; padding:10px 14px; background:#171a21; border-top:1px solid #2a2f3a; font-size:13px; }
+    #update-bar .btn { width:auto; max-width:none; padding:8px 14px; font-size:13px; }
+    #ver { position:fixed; right:10px; top:10px; color:#4a5160; font-size:11px; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="brand">Phone<span>Desk</span></header>
+
+    <section id="s-welcome" class="step active">
+      <div class="hero">&#128241;</div>
+      <h1>Share your phones, securely</h1>
+      <p class="muted">Add up to 5 phones on this computer. About a minute each - we'll guide you.</p>
+      <button class="btn primary" id="btn-start">Get started -></button>
+    </section>
+
+    <section id="s-phones" class="step">
+      <h1>Your phones</h1>
+      <p id="phones-counter" class="muted">0 of 5 phones online</p>
+      <div id="phones-list"></div>
+      <div id="phones-hint" class="status-card"></div>
+      <div id="detect-guide" class="guide hide"></div>
+      <button id="add-phone-btn" class="btn primary">+ Add a phone</button>
+    </section>
+
+    <section id="s-pair" class="step">
+      <h1>Add a phone</h1>
+      <p id="pair-status" class="muted">Waiting for the phone... plug it in via USB.</p>
+      <p class="muted">Your manager gives you a code for <b>each</b> phone, like <b>ABC-DEF</b>.</p>
+      <input id="code" class="code-input" placeholder="ABC-DEF" autocomplete="off" spellcheck="false">
+      <button id="pair-btn" class="btn primary">Add phone</button>
+      <p id="pair-err" class="err hide"></p>
+      <button id="pair-back" class="btn" style="margin-top:10px"><- Back to phones</button>
+    </section>
+  </div>
+
+  <span id="ver"></span>
+  <div id="update-bar" class="hide">
+    <span id="update-text"></span>
+    <button id="update-btn" class="btn primary"></button>
+  </div>
+
+  <script src="wizard.js"></script>
+</body>
+</html>

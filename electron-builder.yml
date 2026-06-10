@@ -1,0 +1,40 @@
+appId: com.phonedesk.agent
+productName: PhoneDesk
+directories:
+  output: dist-installers
+# Everything in the app dir goes into the asar (electron-builder auto-excludes devDependencies),
+# minus the bits below: resources/ ship via extraResources, the rest are build/dev files.
+files:
+  - "**/*"
+  - "!resources/**"
+  - "!dist-installers/**"
+  - "!.github/**"
+  - "!*.log"
+  - "!repack-asar.js"
+  - "!build-mac.command"
+  - "!README-MAC.txt"
+  - "!.check-asar.js"
+# Bundled at build time:
+#   resources/adb/win/adb.exe (+ AdbWinApi.dll, AdbWinUsbApi.dll)  and  resources/adb/mac/adb
+#   resources/ws-scrcpy = ws-scrcpy dist with its runtime deps installed
+extraResources:
+  - from: "resources/ws-scrcpy"
+    to: "ws-scrcpy"
+  - from: "resources/adb"
+    to: "adb"
+# The release feed electron-updater reads (latest.yml lives on these GitHub Releases).
+publish:
+  provider: github
+  owner: zarely24
+  repo: phonedesk-agent
+win:
+  target: nsis
+  artifactName: "PhoneDesk-Setup.exe"
+mac:
+  target: dmg
+  category: public.app-category.utilities
+  artifactName: "PhoneDesk.dmg"
+  identity: null
+nsis:
+  oneClick: true
+  perMachine: false

@@ -1,0 +1,23 @@
+{
+  "name": "phonedesk-agent",
+  "version": "0.2.0",
+  "private": true,
+  "description": "PhoneDesk owner agent - installs on the owner's PC/Mac, runs ws-scrcpy, and brings the phone online for VAs.",
+  "author": "PhoneDesk",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron .",
+    "core": "node agent.js",
+    "dist:win": "electron-builder --win",
+    "dist:mac": "electron-builder --mac"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.9",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.0.0"
+  }
+}
