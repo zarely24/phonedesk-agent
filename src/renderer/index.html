@@ -24,6 +24,9 @@
       color:#9aa3b2; border-radius:8px; padding:4px 10px; font-size:12px; cursor:pointer; transition:.15s; }
     #refresh-btn:hover { border-color:#4f8cff; color:#e7e9ee; }
     #refresh-btn:disabled { opacity:.5; cursor:wait; }
+    .linkbtn { margin-top:14px; background:transparent; border:0; color:#6b7280; font-size:12px;
+      text-decoration:underline; cursor:pointer; }
+    .linkbtn:hover { color:#9aa3b2; }
   </style>
 </head>
 <body>
@@ -44,6 +47,7 @@
       <div id="phones-hint" class="status-card"></div>
       <div id="detect-guide" class="guide hide"></div>
       <button id="add-phone-btn" class="btn primary">+ Add a phone</button>
+      <button id="reset-btn" class="linkbtn">Phone stuck? Reset pairings</button>
     </section>
 
     <section id="s-pair" class="step">

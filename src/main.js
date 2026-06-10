@@ -137,6 +137,10 @@ ipcMain.handle('refresh', () => {
   try { core.refreshAll(); } catch (e) { fileLog('refresh error:', e && e.stack); }
   return true;
 });
+ipcMain.handle('reset-pairings', () => {
+  try { core.resetPairings(); } catch (e) { fileLog('reset error:', e && e.stack); }
+  return true;
+});
 ipcMain.handle('install-update', () => {
   try { require('electron-updater').autoUpdater.quitAndInstall(); } catch (e) { fileLog('quitAndInstall:', e && e.message); }
 });

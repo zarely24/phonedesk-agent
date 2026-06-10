@@ -239,6 +239,21 @@ class AgentCore extends EventEmitter {
     this.reconcile();
   }
 
+  /** Reset: forget EVERY pairing on this computer (deletes the saved token file). The escape hatch
+      when a phone is stuck after being removed on the website - phones then show as new and can be
+      re-added with a fresh code. */
+  resetPairings() {
+    this.emit('log', 'reset: clearing all local pairings (agent.json)');
+    Object.keys(this.devices).forEach((serial) => {
+      const dev = this.devices[serial];
+      try { clearInterval(dev.hb); } catch {}
+      try { dev.ws && dev.ws.close(); } catch {}
+      delete this.devices[serial];
+    });
+    try { fs.unlinkSync(this.tokenFile); } catch (e) { this.emit('log', 'reset unlink: ' + ((e && e.message) || e)); }
+    this.reconcile();
+  }
+
   /** The server removed this phone: forget its token, stop reconnecting (frees a pairing slot). */
   unpair(serial) {
     const tokens = this._loadTokens();

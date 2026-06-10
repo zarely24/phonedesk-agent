@@ -11,4 +11,5 @@ contextBridge.exposeInMainWorld('agent', {
   installUpdate: () => ipcRenderer.invoke('install-update'),
   openUpdate: () => ipcRenderer.invoke('open-update'),
   refresh: () => ipcRenderer.invoke('refresh'),
+  resetPairings: () => ipcRenderer.invoke('reset-pairings'),
 });

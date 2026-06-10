@@ -23,6 +23,15 @@ document.getElementById('refresh-btn').addEventListener('click', async function 
   setTimeout(() => { b.disabled = false; b.innerHTML = '&#8635; Refresh'; }, 2500);
 });
 
+// Reset pairings: the escape hatch for a stuck phone - forgets the saved pairing on this computer.
+document.getElementById('reset-btn').addEventListener('click', async function () {
+  if (!confirm('This forgets ALL phones saved on THIS computer.\n\nUse it only if a phone is stuck and will not connect. You will need a fresh pairing code from your manager to add each phone back.\n\nReset now?')) return;
+  const b = this;
+  b.disabled = true; b.textContent = 'Resetting...';
+  try { await window.agent.resetPairings(); } catch {}
+  setTimeout(() => { b.disabled = false; b.textContent = 'Phone stuck? Reset pairings'; go('phones'); }, 2000);
+});
+
 // Version label + the update banner (Windows: restart-to-install; Mac: download the new dmg).
 if (window.agent.version) window.agent.version().then((v) => { document.getElementById('ver').textContent = 'v' + v; }).catch(() => {});
 if (window.agent.onUpdate) window.agent.onUpdate((u) => {
