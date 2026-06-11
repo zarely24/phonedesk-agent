@@ -206,6 +206,7 @@ class AgentCore extends EventEmitter {
       else if (m.op === 'switch_user') this.switchUser(serial, m.user_id, ws);
       else if (m.op === 'rename_user') this.renameUser(serial, m.user_id, m.name, ws);
       else if (m.op === 'unpair') this.unpair(serial);
+      else if (m.op === 'refresh') this.refreshAll();   // VA pressed "Refresh phone" on the website
     });
     ws.addEventListener('close', (e) => {
       clearInterval(dev.hb); dev.online = false;
