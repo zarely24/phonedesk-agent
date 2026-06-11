@@ -27,7 +27,7 @@ const WS_SCRCPY_PORT = parseInt(process.env.WS_SCRCPY_PORT || '8000', 10);
 const LOCAL_MUX = `ws://127.0.0.1:${WS_SCRCPY_PORT}/stream/?action=multiplex`;
 
 // ---------- adb ----------
-function adb(args) { return execFileSync(ADB, args, { encoding: 'utf8' }).trim(); }
+function adb(args) { return execFileSync(ADB, args, { encoding: 'utf8', timeout: 8000 }).trim(); }
 function firstSerial() {
   const rows = adb(['devices']).split('\n').slice(1).map((l) => l.trim()).filter(Boolean);
   const row = rows.map((l) => l.split('\t')).find((p) => p[1] === 'device');
@@ -72,6 +72,7 @@ function saveToken(d) { fs.writeFileSync(TOKEN_FILE, JSON.stringify(d, null, 2))
 
 // ---------- stream tunnel (backend <-> local ws-scrcpy) ----------
 function openTunnel(token, streamId) {
+  if (!streamId) { console.log('[agent] open_stream ignored: missing stream_id'); return; }
   const tunnel = new WebSocket(`${WS_BASE}/ws/agent-stream?token=${encodeURIComponent(token)}&stream_id=${encodeURIComponent(streamId)}`);
   const local = new WebSocket(LOCAL_MUX);
   tunnel.binaryType = 'arraybuffer';

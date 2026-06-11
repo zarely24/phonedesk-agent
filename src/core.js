@@ -59,7 +59,11 @@ class AgentCore extends EventEmitter {
     this._wsStarted = false;
   }
 
-  _adb(args) { return execFileSync(this.adbPath, args, { encoding: 'utf8' }).trim(); }
+  // adb hangs (USB hiccups, busy phone) must NOT block the Electron main thread - it's where the
+  // phone-home heartbeats, the reconnect loop, and the UI all run. A hung adb call with no timeout
+  // freezes the whole app and the backend then drops the socket. timeout: kill it and let the caller
+  // (all wrapped in try/catch) treat it as a transient miss.
+  _adb(args) { return execFileSync(this.adbPath, args, { encoding: 'utf8', timeout: 8000 }).trim(); }
   _getprop(serial, key) { try { return this._adb(['-s', serial, 'shell', 'getprop', key]); } catch { return ''; } }
   _battery(serial) {
     try { const m = /level:\s*(\d+)/.exec(this._adb(['-s', serial, 'shell', 'dumpsys', 'battery'])); return m ? parseInt(m[1], 10) : null; }
@@ -82,7 +86,18 @@ class AgentCore extends EventEmitter {
     return users;
   }
   _currentUser(serial) { try { const v = parseInt(this._adb(['-s', serial, 'shell', 'am', 'get-current-user']).trim(), 10); return isNaN(v) ? null : v; } catch { return null; } }
-  _metaPayload(serial) { return { battery: this._battery(serial), users: this._listUsers(serial), current_user: this._currentUser(serial) }; }
+  /** Heartbeat payload. Battery is re-read every beat (it changes); the user/profile list barely ever
+      does, so when full=false we reuse the cached list instead of shelling out `pm list users` +
+      `am get-current-user`. That keeps the 10s heartbeat from flooding adb (3 commands x N phones every
+      10s) and contending with scrcpy's video over the same adb server. switchUser/renameUser pass
+      full=true so a real change is reflected immediately. Payload shape is identical either way. */
+  _metaPayload(serial, full = true) {
+    const dev = this.devices[serial];
+    if (!full && dev && dev._metaCache) return { battery: this._battery(serial), ...dev._metaCache };
+    const cache = { users: this._listUsers(serial), current_user: this._currentUser(serial) };
+    if (dev) dev._metaCache = cache;
+    return { battery: this._battery(serial), ...cache };
+  }
 
   // ---- token store: agent.json = { devices: { serial: { device_token, name } } }
   _loadTokens() {
@@ -163,7 +178,7 @@ class AgentCore extends EventEmitter {
     });
     Object.keys(this.devices).forEach((serial) => {               // unplugged -> stop reconnecting + go offline
       if (!plugged[serial] && this.devices[serial]) {
-        const dev = this.devices[serial]; dev.token = null; clearInterval(dev.hb);
+        const dev = this.devices[serial]; dev.token = null; clearInterval(dev.hb); clearTimeout(dev.reconnectTimer);
         try { dev.ws && dev.ws.close(); } catch {}
         delete this.devices[serial];
       }
@@ -190,15 +205,21 @@ class AgentCore extends EventEmitter {
 
   connectHome(serial, token) {
     const dev = this.devices[serial] = this.devices[serial] || { backoff: 1000 };
+    // One phone-home socket per phone. Cancel any pending reconnect (the close handler and the 2s
+    // reconcile() both try to reconnect a dropped phone - without this they race and we end up with
+    // two live sockets + an orphaned heartbeat interval that never gets cleared).
+    clearTimeout(dev.reconnectTimer); dev.reconnectTimer = null;
+    if (dev.ws && dev.ws.readyState <= 1 && dev.token === token) return;   // already connecting/open
     dev.token = token;
     const ws = new WebSocket(`${this.wsBase}/ws/agent?token=${encodeURIComponent(token)}`);
     dev.ws = ws;
     ws.addEventListener('open', () => {
       dev.backoff = 1000; dev.online = true;
       this.emit('status', { serial, state: 'online' });
-      const sendMeta = () => { try { ws.send(JSON.stringify({ op: 'meta', data: this._metaPayload(serial) })); } catch {} };
-      sendMeta();
-      dev.hb = setInterval(sendMeta, 10000);
+      const sendMeta = (full) => { try { ws.send(JSON.stringify({ op: 'meta', data: this._metaPayload(serial, full) })); } catch {} };
+      sendMeta(true);                       // first beat: full (battery + fresh user list)
+      let beat = 0;
+      dev.hb = setInterval(() => { beat = (beat + 1) % 6; sendMeta(beat === 0); }, 10000);   // refresh the user list once a minute, battery every beat
     });
     ws.addEventListener('message', (e) => {
       let m = {}; try { m = JSON.parse(typeof e.data === 'string' ? e.data : ''); } catch {}
@@ -217,7 +238,7 @@ class AgentCore extends EventEmitter {
       }
       this.emit('status', { serial, state: 'reconnecting' });
       dev.backoff = Math.min((dev.backoff || 1000) * 2, 30000);
-      setTimeout(() => { if (this.devices[serial] && this.devices[serial].token === token) this.connectHome(serial, token); }, dev.backoff);
+      dev.reconnectTimer = setTimeout(() => { if (this.devices[serial] && this.devices[serial].token === token) this.connectHome(serial, token); }, dev.backoff);
     });
     ws.addEventListener('error', () => { try { ws.close(); } catch {} });
   }
@@ -229,6 +250,7 @@ class AgentCore extends EventEmitter {
     Object.keys(this.devices).forEach((serial) => {
       const dev = this.devices[serial];
       try { clearInterval(dev.hb); } catch {}
+      try { clearTimeout(dev.reconnectTimer); } catch {}
       try { dev.ws && dev.ws.close(); } catch {}
       delete this.devices[serial];          // close handler can't reconnect a deleted entry
     });
@@ -248,6 +270,7 @@ class AgentCore extends EventEmitter {
     Object.keys(this.devices).forEach((serial) => {
       const dev = this.devices[serial];
       try { clearInterval(dev.hb); } catch {}
+      try { clearTimeout(dev.reconnectTimer); } catch {}
       try { dev.ws && dev.ws.close(); } catch {}
       delete this.devices[serial];
     });
@@ -261,7 +284,7 @@ class AgentCore extends EventEmitter {
     if (tokens[serial]) { delete tokens[serial]; this._saveTokens(tokens); }
     const dev = this.devices[serial];
     if (dev) {
-      dev.token = null; clearInterval(dev.hb);
+      dev.token = null; clearInterval(dev.hb); clearTimeout(dev.reconnectTimer);
       try { dev.ws && dev.ws.close(); } catch {}
       delete this.devices[serial];
     }
@@ -270,6 +293,7 @@ class AgentCore extends EventEmitter {
   }
 
   openTunnel(serial, token, streamId, query) {
+    if (!streamId) { this.emit('log', `open_stream ignored (${serial}): missing stream_id`); return; }
     const tunnel = new WebSocket(`${this.wsBase}/ws/agent-stream?token=${encodeURIComponent(token)}&stream_id=${encodeURIComponent(streamId)}`);
     // The viewer's query selects the ws-scrcpy endpoint: device list = `action=multiplex`; live video =
     // `action=proxy-adb&remote=...&udid=<serial>`. The udid in the query targets THIS phone, so one
@@ -278,8 +302,15 @@ class AgentCore extends EventEmitter {
     const local = new WebSocket(`ws://127.0.0.1:${this.wsScrcpyPort}/stream/?${q}`);
     tunnel.binaryType = 'arraybuffer'; local.binaryType = 'arraybuffer';
     const tBuf = [], lBuf = [];
+    // buf only holds frames during the brief window before `to` opens. If `to` never opens (or stalls
+    // in CLOSING/CLOSED), don't let high-bitrate video pile up unbounded in memory - tear the tunnel down.
+    const MAX_BUF = 1024;
     const link = (from, to, buf) => {
-      from.addEventListener('message', (e) => { if (to.readyState === 1) to.send(e.data); else buf.push(e.data); });
+      from.addEventListener('message', (e) => {
+        if (to.readyState === 1) to.send(e.data);
+        else if (buf.length < MAX_BUF) buf.push(e.data);
+        else { try { from.close(); } catch {} try { to.close(); } catch {} }
+      });
       from.addEventListener('close', () => { try { to.close(); } catch {} });
       from.addEventListener('error', () => { try { to.close(); } catch {} });
     };
