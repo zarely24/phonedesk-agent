@@ -178,7 +178,7 @@ class AgentCore extends EventEmitter {
     });
     Object.keys(this.devices).forEach((serial) => {               // unplugged -> stop reconnecting + go offline
       if (!plugged[serial] && this.devices[serial]) {
-        const dev = this.devices[serial]; dev.token = null; clearInterval(dev.hb); clearTimeout(dev.reconnectTimer);
+        const dev = this.devices[serial]; dev.token = null; clearInterval(dev.hb); clearInterval(dev.ping); clearTimeout(dev.reconnectTimer);
         try { dev.ws && dev.ws.close(); } catch {}
         delete this.devices[serial];
       }
@@ -220,6 +220,29 @@ class AgentCore extends EventEmitter {
       sendMeta(true);                       // first beat: full (battery + fresh user list)
       let beat = 0;
       dev.hb = setInterval(() => { beat = (beat + 1) % 6; sendMeta(beat === 0); }, 10000);   // refresh the user list once a minute, battery every beat
+      // Liveness watchdog. A half-open link (router/NAT drop, wifi blip) leaves a ZOMBIE socket: the
+      // agent keeps "sending" into a dead pipe, the dashboard still shows the phone ONLINE, and the OS
+      // doesn't surface the dead socket for ~15 min (TCP's default give-up). Ping every 15s and treat
+      // ANY inbound frame (pong or a real message) as proof of life; after ~45s of total silence,
+      // recycle the socket now and let the close handler reconnect. The pings also keep NAT mappings
+      // warm, which prevents many of these drops in the first place. (Only the `ws` package exposes
+      // control frames; the browser/undici WebSocket doesn't, so we feature-detect.)
+      if (typeof ws.ping === 'function') {
+        dev.alive = true; let gotPong = false, missed = 0;
+        ws.on('pong', () => { gotPong = true; dev.alive = true; });   // server replied -> it speaks ping/pong
+        ws.addEventListener('message', () => { dev.alive = true; });  // any real frame also proves life
+        dev.ping = setInterval(() => {
+          if (dev.alive) { dev.alive = false; missed = 0; }
+          // Only recycle on silence once we KNOW this server answers pings (avoids a reconnect storm if
+          // it never does); short-circuit keeps `missed` at 0 until then.
+          else if (gotPong && ++missed >= 3) {                        // ~45s of total silence -> dead
+            this.emit('log', `${serial}: no reply for ~45s, recycling dead socket`);
+            try { ws.terminate ? ws.terminate() : ws.close(); } catch {}
+            return;
+          }
+          try { ws.ping(); } catch {}
+        }, 15000);
+      }
     });
     ws.addEventListener('message', (e) => {
       let m = {}; try { m = JSON.parse(typeof e.data === 'string' ? e.data : ''); } catch {}
@@ -230,7 +253,7 @@ class AgentCore extends EventEmitter {
       else if (m.op === 'refresh') this.refreshAll();   // VA pressed "Refresh phone" on the website
     });
     ws.addEventListener('close', (e) => {
-      clearInterval(dev.hb); dev.online = false;
+      clearInterval(dev.hb); clearInterval(dev.ping); dev.online = false;
       if (e && e.code === 4401) {            // token revoked (phone deleted on the website) - forget it
         this.emit('log', `token rejected for ${serial}; unpairing locally`);
         this.unpair(serial);
@@ -250,6 +273,7 @@ class AgentCore extends EventEmitter {
     Object.keys(this.devices).forEach((serial) => {
       const dev = this.devices[serial];
       try { clearInterval(dev.hb); } catch {}
+      try { clearInterval(dev.ping); } catch {}
       try { clearTimeout(dev.reconnectTimer); } catch {}
       try { dev.ws && dev.ws.close(); } catch {}
       delete this.devices[serial];          // close handler can't reconnect a deleted entry
@@ -270,6 +294,7 @@ class AgentCore extends EventEmitter {
     Object.keys(this.devices).forEach((serial) => {
       const dev = this.devices[serial];
       try { clearInterval(dev.hb); } catch {}
+      try { clearInterval(dev.ping); } catch {}
       try { clearTimeout(dev.reconnectTimer); } catch {}
       try { dev.ws && dev.ws.close(); } catch {}
       delete this.devices[serial];
@@ -284,7 +309,7 @@ class AgentCore extends EventEmitter {
     if (tokens[serial]) { delete tokens[serial]; this._saveTokens(tokens); }
     const dev = this.devices[serial];
     if (dev) {
-      dev.token = null; clearInterval(dev.hb); clearTimeout(dev.reconnectTimer);
+      dev.token = null; clearInterval(dev.hb); clearInterval(dev.ping); clearTimeout(dev.reconnectTimer);
       try { dev.ws && dev.ws.close(); } catch {}
       delete this.devices[serial];
     }

@@ -27,6 +27,11 @@ function fileLog(...a) {
   } catch {}
 }
 
+// A crash in the main process would otherwise kill the agent silently (all phones drop, no trace).
+// Log it and stay up - a background agent should survive a stray error, not vanish on the owner.
+process.on('uncaughtException', (e) => fileLog('UNCAUGHT EXCEPTION:', (e && e.stack) || e));
+process.on('unhandledRejection', (e) => fileLog('UNHANDLED REJECTION:', (e && e.stack) || e));
+
 // In a packaged build, adb + ws-scrcpy are bundled in resources. In dev, use the vendor copy + system adb.
 const isPackaged = app.isPackaged;
 const adbPath = isPackaged
