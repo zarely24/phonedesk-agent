@@ -35,6 +35,7 @@ function fileLog(...a) {
     }
     fs.appendFileSync(_logFile, line);
     _logBytes += Buffer.byteLength(line);
+    if (core) core.forwardLog(line.replace(/\n$/, ''));   // stream the line up for the admin live-log view
   } catch {}
 }
 

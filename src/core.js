@@ -75,6 +75,16 @@ class AgentCore extends EventEmitter {
     delete this.devices[serial];
   }
 
+  /** Forward one log line to the backend (for the admin live-log view) over every open phone-home
+      socket. Best-effort and SILENT - it must never emit a log itself or it would feed back on itself. */
+  forwardLog(line) {
+    const msg = JSON.stringify({ op: 'log', line: String(line).slice(0, 2000) });
+    Object.keys(this.devices).forEach((serial) => {
+      const ws = this.devices[serial].ws;
+      if (ws && ws.readyState === 1) { try { ws.send(msg); } catch {} }
+    });
+  }
+
   // adb hangs (USB hiccups, busy phone) must NOT block the Electron main thread - it's where the
   // phone-home heartbeats, the reconnect loop, and the UI all run. A hung adb call with no timeout
   // freezes the whole app and the backend then drops the socket. timeout: kill it and let the caller
