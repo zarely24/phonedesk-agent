@@ -19,11 +19,22 @@ const UPDATE_REPO = 'zarely24/phonedesk-agent';
 const MAC_DMG_URL = `https://github.com/${UPDATE_REPO}/releases/latest/download/PhoneDesk.dmg`;
 
 // Write a log file (the packaged app has no visible console). Find it at %APPDATA%\PhoneDesk\agent.log
+// Rotated so it can't grow unbounded over weeks of 24/7 logging and fill the disk: when agent.log
+// passes ~5MB it's rolled to agent.log.1 (one old copy kept), so on-disk logs stay under ~10MB.
+const LOG_MAX_BYTES = 5 * 1024 * 1024;
 let _logFile = null;
+let _logBytes = -1;   // cached size of the current agent.log; -1 = not yet seeded from disk
 function fileLog(...a) {
   try {
     if (!_logFile) _logFile = path.join(app.getPath('userData'), 'agent.log');
-    fs.appendFileSync(_logFile, new Date().toISOString() + ' ' + a.map(String).join(' ') + '\n');
+    if (_logBytes < 0) { try { _logBytes = fs.statSync(_logFile).size; } catch { _logBytes = 0; } }
+    const line = new Date().toISOString() + ' ' + a.map(String).join(' ') + '\n';
+    if (_logBytes + Buffer.byteLength(line) > LOG_MAX_BYTES) {
+      try { fs.renameSync(_logFile, _logFile + '.1'); } catch {}   // overwrites any previous .1
+      _logBytes = 0;
+    }
+    fs.appendFileSync(_logFile, line);
+    _logBytes += Buffer.byteLength(line);
   } catch {}
 }
 
@@ -133,7 +144,10 @@ app.whenReady().then(() => {
     try { core.reconcile(); } catch {}                       // connect newly-plugged phones, drop unplugged
     if (win && !win.isDestroyed()) win.webContents.send('device', core.status());
   }, 2000);
-  app.on('before-quit', () => clearInterval(poll));
+  app.on('before-quit', () => {
+    clearInterval(poll);
+    try { core.shutdown(); } catch (e) { fileLog('shutdown error:', e && e.stack); }
+  });
 });
 
 ipcMain.handle('backend-url', () => BACKEND);

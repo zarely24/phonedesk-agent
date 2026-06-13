@@ -57,6 +57,22 @@ class AgentCore extends EventEmitter {
     this.devices = {};        // serial -> { token, ws, hb, backoff, online }
     this._wsProc = null;
     this._wsStarted = false;
+    this._wsBackoff = 1000;   // respawn backoff for the shared ws-scrcpy (mirrors the phone-home backoff)
+    this._wsRespawnTimer = null;
+    this._stopped = false;    // set on shutdown() so ws-scrcpy isn't resurrected as the app quits
+  }
+
+  /** Tear down ONE device: stop its timers, close its socket, forget it. Used everywhere we drop a
+      phone (unplug, refresh, reset, unpair, shutdown) so the cleanup never drifts out of sync. */
+  _dropDevice(serial) {
+    const dev = this.devices[serial];
+    if (!dev) return;
+    dev.token = null;
+    try { clearInterval(dev.hb); } catch {}
+    try { clearInterval(dev.ping); } catch {}
+    try { clearTimeout(dev.reconnectTimer); } catch {}
+    try { dev.ws && dev.ws.close(); } catch {}
+    delete this.devices[serial];
   }
 
   // adb hangs (USB hiccups, busy phone) must NOT block the Electron main thread - it's where the
@@ -142,19 +158,52 @@ class AgentCore extends EventEmitter {
   }
 
   // ---- shared ws-scrcpy (ONE process serves every phone)
+  /** Respawn ws-scrcpy after a crash/error, with exponential backoff so a crash-looping process
+      can't peg the CPU (or re-run the pkill sweep) every 2s. Both the 'exit' and 'error' handlers
+      funnel here; `gone` guards against them both firing for the same process (double-respawn). */
+  _respawnWsScrcpy() {
+    this._wsStarted = false; this._wsProc = null;
+    if (this._stopped) return;        // app is quitting - don't bring it back
+    const delay = this._wsBackoff;
+    this._wsBackoff = Math.min(this._wsBackoff * 2, 30000);
+    this.emit('log', `ws-scrcpy down; respawning in ${delay}ms`);
+    this._wsRespawnTimer = setTimeout(() => this.startWsScrcpy(), delay);
+  }
   startWsScrcpy() {
+    if (this._stopped) return;
     if (this._wsStarted && this._wsProc) return;
     this._wsStarted = true;
-    // clear orphaned scrcpy-server on each plugged phone (else its socket stays bound -> no video)
-    this.detectAll().forEach((d) => { try { execFileSync(this.adbPath, ['-s', d.serial, 'shell', 'pkill', '-f', 'scrcpy'], { timeout: 6000 }); } catch {} });
+    // clear orphaned scrcpy-server on each plugged phone (else its socket stays bound -> no video).
+    // Fire-and-forget (NOT execFileSync) so a slow/hung adb here can't freeze the main thread on every
+    // respawn; ws-scrcpy tolerates a still-bound socket briefly and the next cycle clears it.
+    this.detectAll().forEach((d) => {
+      try {
+        const p = spawn(this.adbPath, ['-s', d.serial, 'shell', 'pkill', '-f', 'scrcpy'], { stdio: 'ignore' });
+        p.on('error', () => {});   // an unhandled spawn 'error' would otherwise throw
+      } catch {}
+    });
     const adbDir = path.dirname(this.adbPath);
     const env = { ...process.env, ...this.runAsNodeEnv, WS_SCRCPY_PATHNAME: '/stream/', ADB_PATH: this.adbPath };
     const existingPath = env.PATH || env.Path || ''; delete env.PATH; delete env.Path;
     env.PATH = adbDir + path.delimiter + existingPath;
-    this._wsProc = spawn(this.nodeBin, ['index.js'], { cwd: this.wsScrcpyDist, env });
+    const proc = spawn(this.nodeBin, ['index.js'], { cwd: this.wsScrcpyDist, env });
+    this._wsProc = proc;
+    let gone = false;                  // ensure exit/error trigger at most one respawn
+    let stableTimer = null;
     const pipe = (s) => s && s.on('data', (d) => this.emit('log', '[ws-scrcpy] ' + String(d).trimEnd()));
-    pipe(this._wsProc.stdout); pipe(this._wsProc.stderr);
-    this._wsProc.on('exit', (c) => { this.emit('log', `ws-scrcpy exited (${c}); respawning`); this._wsStarted = false; this._wsProc = null; setTimeout(() => this.startWsScrcpy(), 2000); });
+    pipe(proc.stdout); pipe(proc.stderr);
+    // If it stays up for 30s, treat the launch as healthy and reset the backoff to 1s.
+    stableTimer = setTimeout(() => { this._wsBackoff = 1000; }, 30000);
+    proc.on('error', (e) => {
+      if (gone) return; gone = true; clearTimeout(stableTimer);
+      this.emit('log', `ws-scrcpy spawn error: ${(e && e.message) || e}`);
+      this._respawnWsScrcpy();
+    });
+    proc.on('exit', (c) => {
+      if (gone) return; gone = true; clearTimeout(stableTimer);
+      this.emit('log', `ws-scrcpy exited (${c})`);
+      this._respawnWsScrcpy();
+    });
     this.emit('log', `ws-scrcpy launched on :${this.wsScrcpyPort} (adbDir=${adbDir})`);
   }
 
@@ -177,11 +226,7 @@ class AgentCore extends EventEmitter {
       if (plugged[serial] && !connected) this.connectHome(serial, tokens[serial].device_token);
     });
     Object.keys(this.devices).forEach((serial) => {               // unplugged -> stop reconnecting + go offline
-      if (!plugged[serial] && this.devices[serial]) {
-        const dev = this.devices[serial]; dev.token = null; clearInterval(dev.hb); clearInterval(dev.ping); clearTimeout(dev.reconnectTimer);
-        try { dev.ws && dev.ws.close(); } catch {}
-        delete this.devices[serial];
-      }
+      if (!plugged[serial]) this._dropDevice(serial);
     });
   }
 
@@ -210,6 +255,10 @@ class AgentCore extends EventEmitter {
     // two live sockets + an orphaned heartbeat interval that never gets cleared).
     clearTimeout(dev.reconnectTimer); dev.reconnectTimer = null;
     if (dev.ws && dev.ws.readyState <= 1 && dev.token === token) return;   // already connecting/open
+    // Re-pairing a phone whose socket is still live (token changed): tear the old one down first, else
+    // it leaks - the stale socket lingers and its heartbeat/ping intervals get orphaned (overwritten
+    // by the new socket's 'open' handler) and run forever.
+    if (dev.ws) { try { clearInterval(dev.hb); } catch {} try { clearInterval(dev.ping); } catch {} try { dev.ws.close(); } catch {} }
     dev.token = token;
     const ws = new WebSocket(`${this.wsBase}/ws/agent?token=${encodeURIComponent(token)}`);
     dev.ws = ws;
@@ -270,20 +319,29 @@ class AgentCore extends EventEmitter {
       Fixes the "phone just won't connect" moods without restarting the whole app. */
   refreshAll() {
     this.emit('log', 'manual refresh: restarting adb + ws-scrcpy and reconnecting everything');
-    Object.keys(this.devices).forEach((serial) => {
-      const dev = this.devices[serial];
-      try { clearInterval(dev.hb); } catch {}
-      try { clearInterval(dev.ping); } catch {}
-      try { clearTimeout(dev.reconnectTimer); } catch {}
-      try { dev.ws && dev.ws.close(); } catch {}
-      delete this.devices[serial];          // close handler can't reconnect a deleted entry
-    });
-    try {
-      if (this._wsProc) { this._wsProc.removeAllListeners('exit'); this._wsProc.kill(); }
-    } catch {}
-    this._wsProc = null; this._wsStarted = false;
+    Object.keys(this.devices).forEach((serial) => this._dropDevice(serial));   // close handler can't reconnect a deleted entry
+    this._killWsScrcpy();
     try { this._adb(['kill-server']); } catch {}   // next adb call auto-starts a fresh daemon
     this.reconcile();
+  }
+
+  /** Kill the shared ws-scrcpy without triggering its respawn (we either restart it ourselves or quit). */
+  _killWsScrcpy() {
+    try { clearTimeout(this._wsRespawnTimer); } catch {}
+    this._wsRespawnTimer = null;
+    try {
+      if (this._wsProc) { this._wsProc.removeAllListeners('exit'); this._wsProc.removeAllListeners('error'); this._wsProc.kill(); }
+    } catch {}
+    this._wsProc = null; this._wsStarted = false; this._wsBackoff = 1000;
+  }
+
+  /** App is quitting: stop every phone-home socket + its timers and kill ws-scrcpy, so we don't leave
+      orphan node/adb children (and a scrcpy-server bound on the phone) behind across auto-update restarts. */
+  shutdown() {
+    this.emit('log', 'shutdown: closing sockets and killing ws-scrcpy');
+    this._stopped = true;             // block any pending/future respawn
+    Object.keys(this.devices).forEach((serial) => this._dropDevice(serial));
+    this._killWsScrcpy();
   }
 
   /** Reset: forget EVERY pairing on this computer (deletes the saved token file). The escape hatch
@@ -291,14 +349,7 @@ class AgentCore extends EventEmitter {
       re-added with a fresh code. */
   resetPairings() {
     this.emit('log', 'reset: clearing all local pairings (agent.json)');
-    Object.keys(this.devices).forEach((serial) => {
-      const dev = this.devices[serial];
-      try { clearInterval(dev.hb); } catch {}
-      try { clearInterval(dev.ping); } catch {}
-      try { clearTimeout(dev.reconnectTimer); } catch {}
-      try { dev.ws && dev.ws.close(); } catch {}
-      delete this.devices[serial];
-    });
+    Object.keys(this.devices).forEach((serial) => this._dropDevice(serial));
     try { fs.unlinkSync(this.tokenFile); } catch (e) { this.emit('log', 'reset unlink: ' + ((e && e.message) || e)); }
     this.reconcile();
   }
@@ -307,12 +358,7 @@ class AgentCore extends EventEmitter {
   unpair(serial) {
     const tokens = this._loadTokens();
     if (tokens[serial]) { delete tokens[serial]; this._saveTokens(tokens); }
-    const dev = this.devices[serial];
-    if (dev) {
-      dev.token = null; clearInterval(dev.hb); clearInterval(dev.ping); clearTimeout(dev.reconnectTimer);
-      try { dev.ws && dev.ws.close(); } catch {}
-      delete this.devices[serial];
-    }
+    this._dropDevice(serial);
     this.emit('log', `unpaired ${serial} (removed on the website)`);
     this.emit('status', { serial, state: 'unpaired' });
   }
