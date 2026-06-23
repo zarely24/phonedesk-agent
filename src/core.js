@@ -54,7 +54,22 @@ class AgentCore extends EventEmitter {
     this.nodeBin = opts.nodeBin || process.execPath;
     this.runAsNodeEnv = opts.runAsNodeEnv || {};
     this.maxDevices = opts.maxDevices || 5;
-    this.devices = {};        // serial -> { token, ws, hb, backoff, online }
+    // Battery charge limiting. `suPrefix` is how we run a root shell on the phone (GrapheneOS is
+    // not rooted by default; on a rooted phone this is `su -c`). `chargeNodes` are the sysfs
+    // paths we write — Pixel/Tensor expose the firmware hysteresis levels (preferred: the
+    // embedded controller enforces them and the USB-C data link stays alive); `gates` are
+    // generic charging-FET switches used by the poll-loop fallback. All overridable per SoC.
+    this.suPrefix = opts.suPrefix != null ? opts.suPrefix : 'su -c';
+    this.chargeNodes = opts.chargeNodes || {
+      stopLevel: '/sys/devices/platform/google,charger/charge_stop_level',
+      startLevel: '/sys/devices/platform/google,charger/charge_start_level',
+      gates: [
+        '/sys/class/power_supply/battery/charging_enabled',
+        '/sys/class/power_supply/battery/input_suspend',
+        '/sys/class/power_supply/battery/charge_control_limit',
+      ],
+    };
+    this.devices = {};        // serial -> { token, ws, hb, backoff, online, chargePolicy, chargeTimer }
     this._wsProc = null;
     this._wsStarted = false;
     this._wsBackoff = 1000;   // respawn backoff for the shared ws-scrcpy (mirrors the phone-home backoff)
@@ -70,6 +85,7 @@ class AgentCore extends EventEmitter {
     dev.token = null;
     try { clearInterval(dev.hb); } catch {}
     try { clearInterval(dev.ping); } catch {}
+    try { clearInterval(dev.chargeTimer); } catch {}
     try { clearTimeout(dev.reconnectTimer); } catch {}
     try { dev.ws && dev.ws.close(); } catch {}
     delete this.devices[serial];
@@ -91,9 +107,155 @@ class AgentCore extends EventEmitter {
   // (all wrapped in try/catch) treat it as a transient miss.
   _adb(args) { return execFileSync(this.adbPath, args, { encoding: 'utf8', timeout: 8000 }).trim(); }
   _getprop(serial, key) { try { return this._adb(['-s', serial, 'shell', 'getprop', key]); } catch { return ''; } }
-  _battery(serial) {
-    try { const m = /level:\s*(\d+)/.exec(this._adb(['-s', serial, 'shell', 'dumpsys', 'battery'])); return m ? parseInt(m[1], 10) : null; }
-    catch { return null; }
+  /** Battery level + whether the phone is actually drawing charge, from ONE `dumpsys battery`
+      call (cheaper than two shell-outs every heartbeat x N phones). When our charge limit has
+      gated the FET the phone still reads plugged-in (powered) but `status` flips away from 2
+      (charging) - that "paused" state is exactly what we surface as charging:false. */
+  _batteryAndCharging(serial) {
+    try {
+      const out = this._adb(['-s', serial, 'shell', 'dumpsys', 'battery']);
+      const lvl = /level:\s*(\d+)/.exec(out);
+      const status = /status:\s*(\d+)/.exec(out);   // 2 = charging
+      const powered = [/AC powered:\s*true/i, /USB powered:\s*true/i, /Wireless powered:\s*true/i]
+        .some((re) => re.test(out));
+      const charging = status ? status[1] === '2' : powered;
+      return { battery: lvl ? parseInt(lvl[1], 10) : null, charging };
+    } catch { return { battery: null, charging: null }; }
+  }
+  _battery(serial) { return this._batteryAndCharging(serial).battery; }
+
+  // ---- charge limiting: write the phone's sysfs charge-control nodes (best-effort, needs root)
+  _writeNode(serial, node, value) {
+    const inner = `echo ${value} > ${node}`;
+    return this._adb(['-s', serial, 'shell', this.suPrefix ? `${this.suPrefix} '${inner}'` : inner]);
+  }
+  _nodeExists(serial, node) {
+    const inner = `test -e ${node} && echo yes`;
+    try { return /yes/.test(this._adb(['-s', serial, 'shell', this.suPrefix ? `${this.suPrefix} '${inner}'` : inner])); }
+    catch { return false; }
+  }
+  /** Open/close the charging FET on a generic gate node (semantics differ per node name). */
+  _setGate(serial, gate, allow) {
+    let val;
+    if (/input_suspend/.test(gate)) val = allow ? 0 : 1;            // 1 = suspend input (stop)
+    else if (/charge_control_limit/.test(gate)) val = allow ? 100 : 0;
+    else val = allow ? 1 : 0;                                       // charging_enabled style
+    try { this._writeNode(serial, gate, val); }
+    catch (e) { this.emit('log', `${serial}: charge gate write failed: ${(e && e.message) || e}`); }
+  }
+  /** Is `su` usable on this phone (rooted)? Cached per device - probing every beat would be wasteful.
+      Sysfs charge control needs root; this lets us report "needs root" instead of failing silently. */
+  _hasRoot(serial) {
+    const dev = this.devices[serial];
+    if (dev && dev._rooted != null) return dev._rooted;
+    let rooted = false;
+    try {
+      const out = this._adb(['-s', serial, 'shell', this.suPrefix ? `${this.suPrefix} 'id'` : 'id']);
+      rooted = /uid=0/.test(out);
+    } catch { rooted = false; }
+    if (dev) dev._rooted = rooted;
+    return rooted;
+  }
+  /** Apply the device's stored charge policy. Prefer the Pixel firmware hysteresis (no polling,
+      keeps USB data alive); fall back to a slow poll loop toggling a charging-FET gate. Sets
+      dev.chargeStatus to a human string that's reported up to the dashboard so the operator can
+      SEE on a real phone whether limiting is active, polling, or unavailable (no root / no node). */
+  _applyChargePolicy(serial) {
+    const dev = this.devices[serial];
+    if (!dev) return;
+    try { clearInterval(dev.chargeTimer); } catch {} dev.chargeTimer = null;
+    const pol = dev.chargePolicy;
+    if (!pol || !pol.enabled) { this._restoreCharging(serial); return; }
+    const { stop, resume } = pol;
+    const N = this.chargeNodes;
+    if (this._nodeExists(serial, N.stopLevel) && this._nodeExists(serial, N.startLevel)) {
+      try {
+        this._writeNode(serial, N.startLevel, resume);
+        this._writeNode(serial, N.stopLevel, stop);
+        dev.chargeMethod = 'firmware'; dev.chargeStatus = `firmware (stop ${stop} / resume ${resume})`;
+        this.emit('log', `${serial}: charge limit via firmware (start ${resume} / stop ${stop})`);
+        return;
+      } catch (e) { this.emit('log', `${serial}: firmware charge nodes failed: ${(e && e.message) || e}`); }
+    }
+    const gate = N.gates.find((g) => this._nodeExists(serial, g));
+    if (!gate) {
+      const rooted = this._hasRoot(serial);
+      dev.chargeMethod = 'none';
+      dev.chargeStatus = rooted ? 'unavailable (no charge-control node on this device)'
+                                : 'unavailable (phone is not rooted)';
+      this.emit('log', `${serial}: charge limiting ${dev.chargeStatus}`);
+      return;
+    }
+    dev.chargeGate = gate; dev.chargeMethod = 'poll:' + gate;
+    dev.chargeStatus = `poll ${gate.split('/').pop()} (stop ${stop} / resume ${resume})`;
+    this.emit('log', `${serial}: charge limit via ${gate} poll loop (stop ${stop} / resume ${resume})`);
+    const tick = () => {
+      try {
+        const b = this._battery(serial);
+        if (b == null) return;
+        if (b >= stop) this._setGate(serial, gate, false);
+        else if (b <= resume) this._setGate(serial, gate, true);
+      } catch {}
+    };
+    tick();
+    dev.chargeTimer = setInterval(tick, 60000);
+  }
+  /** Undo any charge gating so the phone charges normally again (policy disabled / unpaired). */
+  _restoreCharging(serial) {
+    const dev = this.devices[serial];
+    if (!dev) return;
+    try { clearInterval(dev.chargeTimer); } catch {} dev.chargeTimer = null;
+    const N = this.chargeNodes;
+    try {
+      if (this._nodeExists(serial, N.stopLevel)) this._writeNode(serial, N.stopLevel, 100);
+      if (this._nodeExists(serial, N.startLevel)) this._writeNode(serial, N.startLevel, 0);
+      if (dev.chargeGate) this._setGate(serial, dev.chargeGate, true);
+    } catch {}
+    dev.chargeMethod = null; dev.chargeGate = null; dev.chargeStatus = 'off';
+  }
+  /** Handle the backend's set_charge_policy op: validate, persist, apply, reflect in the dashboard. */
+  setChargePolicy(serial, policy, ws) {
+    if (!serial || !this.devices[serial]) return;
+    const enabled = policy.enabled !== false;
+    const stop = parseInt(policy.stop, 10);
+    const resume = parseInt(policy.resume, 10);
+    if (enabled && !(resume > 0 && resume < stop && stop <= 100)) {
+      this.emit('log', `${serial}: ignoring invalid charge policy (resume ${resume}, stop ${stop})`);
+      return;
+    }
+    const pol = { enabled, stop, resume };
+    this.devices[serial].chargePolicy = pol;
+    const tokens = this._loadTokens();
+    if (tokens[serial]) { tokens[serial].chargePolicy = pol; this._saveTokens(tokens); }
+    this.emit('log', `set_charge_policy (${serial}) -> ${JSON.stringify(pol)}`);
+    this._applyChargePolicy(serial);
+    try { ws && ws.send(JSON.stringify({ op: 'meta', data: this._metaPayload(serial) })); } catch {}
+  }
+  /** Handle create_profiles: bulk pm create-user + clone an app into each, then report back. */
+  createProfiles(serial, count, pkg, prefix, ws) {
+    count = parseInt(count, 10);
+    if (!serial || !this.devices[serial] || !(count >= 1)) return;
+    prefix = (String(prefix || 'Profile').replace(/[^\w .\-]/g, ' ').replace(/\s+/g, ' ').trim() || 'Profile').slice(0, 24);
+    pkg = String(pkg || '').trim();
+    this.emit('log', `create_profiles (${serial}) -> count=${count} package='${pkg}' prefix='${prefix}'`);
+    const sh = (args) => this._adb(['-s', serial, 'shell', ...args]);
+    let made = 0;
+    for (let i = 0; i < count; i++) {
+      try {
+        const n = this._parseUsers(serial).length;   // next ordinal (owner + any existing)
+        const out = sh(['pm', 'create-user', `'${prefix} ${n}'`]);
+        const m = /id\s+(\d+)/i.exec(out);
+        if (!m) { this.emit('log', `create-user failed: ${out}`); continue; }
+        const id = m[1]; made++;
+        if (pkg) {
+          try { sh(['pm', 'install-existing', '--user', id, pkg]); this.emit('log', `cloned ${pkg} -> user ${id}`); }
+          catch (e) { this.emit('log', `install-existing user ${id}: ${(e && e.message) || e}`); }
+        }
+      } catch (e) { this.emit('log', `create-user error: ${(e && e.message) || e}`); }
+    }
+    this.emit('log', `create_profiles done: ${made}/${count} created`);
+    try { this.devices[serial]._metaCache = null; } catch {}   // force a fresh user list next meta
+    try { ws && ws.send(JSON.stringify({ op: 'meta', data: this._metaPayload(serial, true) })); } catch {}
   }
   /** Raw `pm list users` parse (no rename overlay) - used to verify on-phone renames. */
   _parseUsers(serial) {
@@ -119,10 +281,12 @@ class AgentCore extends EventEmitter {
       full=true so a real change is reflected immediately. Payload shape is identical either way. */
   _metaPayload(serial, full = true) {
     const dev = this.devices[serial];
-    if (!full && dev && dev._metaCache) return { battery: this._battery(serial), ...dev._metaCache };
+    const bc = this._batteryAndCharging(serial);   // battery + charging in one adb call
+    const cs = dev && dev.chargeStatus;            // human-readable charge-limit state for the dashboard
+    if (!full && dev && dev._metaCache) return { battery: bc.battery, charging: bc.charging, charge_status: cs, ...dev._metaCache };
     const cache = { users: this._listUsers(serial), current_user: this._currentUser(serial) };
     if (dev) dev._metaCache = cache;
-    return { battery: this._battery(serial), ...cache };
+    return { battery: bc.battery, charging: bc.charging, charge_status: cs, ...cache };
   }
 
   // ---- token store: agent.json = { devices: { serial: { device_token, name } } }
@@ -277,6 +441,12 @@ class AgentCore extends EventEmitter {
       this.emit('status', { serial, state: 'online' });
       const sendMeta = (full) => { try { ws.send(JSON.stringify({ op: 'meta', data: this._metaPayload(serial, full) })); } catch {} };
       sendMeta(true);                       // first beat: full (battery + fresh user list)
+      // Re-apply any saved charge limit (the backend also re-pushes set_charge_policy on connect;
+      // doing it here too means the limit holds even if that message is missed).
+      try {
+        const saved = (this._loadTokens()[serial] || {}).chargePolicy;
+        if (saved) { dev.chargePolicy = saved; this._applyChargePolicy(serial); }
+      } catch {}
       let beat = 0;
       dev.hb = setInterval(() => { beat = (beat + 1) % 6; sendMeta(beat === 0); }, 10000);   // refresh the user list once a minute, battery every beat
       // Liveness watchdog. A half-open link (router/NAT drop, wifi blip) leaves a ZOMBIE socket: the
@@ -310,6 +480,8 @@ class AgentCore extends EventEmitter {
       else if (m.op === 'rename_user') this.renameUser(serial, m.user_id, m.name, ws);
       else if (m.op === 'unpair') this.unpair(serial);
       else if (m.op === 'refresh') this.refreshAll();   // VA pressed "Refresh phone" on the website
+      else if (m.op === 'set_charge_policy') this.setChargePolicy(serial, m, ws);   // battery charge limit
+      else if (m.op === 'create_profiles') this.createProfiles(serial, m.count, m.package, m.name_prefix, ws);
     });
     ws.addEventListener('close', (e) => {
       clearInterval(dev.hb); clearInterval(dev.ping); dev.online = false;
@@ -368,6 +540,7 @@ class AgentCore extends EventEmitter {
   unpair(serial) {
     const tokens = this._loadTokens();
     if (tokens[serial]) { delete tokens[serial]; this._saveTokens(tokens); }
+    try { this._restoreCharging(serial); } catch {}   // stop limiting before we forget the phone
     this._dropDevice(serial);
     this.emit('log', `unpaired ${serial} (removed on the website)`);
     this.emit('status', { serial, state: 'unpaired' });
