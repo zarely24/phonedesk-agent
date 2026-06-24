@@ -10,6 +10,7 @@ const { EventEmitter } = require('events');
 const { execFileSync, spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 
 // Electron's main process (Node 20) has no global WebSocket; fall back to the `ws` package.
 const WebSocket = globalThis.WebSocket || require('ws');
@@ -257,6 +258,74 @@ class AgentCore extends EventEmitter {
     try { this.devices[serial]._metaCache = null; } catch {}   // force a fresh user list next meta
     try { ws && ws.send(JSON.stringify({ op: 'meta', data: this._metaPayload(serial, true) })); } catch {}
   }
+  /** Handle upload_media: fetch each file from the backend and push it into the gallery.
+      Files land in /sdcard/DCIM/Camera of the ACTIVE profile, at full original quality (adb push
+      is a byte-for-byte copy - nothing is recompressed), then a media scan makes them appear. */
+  async uploadMedia(serial, m, ws) {
+    const dev = this.devices[serial];
+    const transferId = m && m.transfer_id;
+    const files = (m && Array.isArray(m.files)) ? m.files : [];
+    if (!serial || !dev || !transferId || !files.length) return;
+    const token = (this._loadTokens()[serial] || {}).device_token || dev.token || '';
+    this.emit('log', `upload_media (${serial}) -> ${files.length} file(s), transfer=${transferId}`);
+    const dest = '/sdcard/DCIM/Camera';
+    try { this._adb(['-s', serial, 'shell', 'mkdir', '-p', dest]); } catch {}
+    const results = [];
+    for (const f of files) {
+      const name = String((f && f.name) || 'file').replace(/[\/\\\0]/g, '_');
+      const tmp = path.join(os.tmpdir(), `pd_${transferId}_${f.idx}_${name}`);
+      try {
+        const url = `${this.backend}/api/devices/media/${transferId}/${f.idx}?token=${encodeURIComponent(token)}`;
+        await this._download(url, tmp);
+        await this._adbPush(serial, tmp, `${dest}/${name}`);
+        // Make it show up immediately. The legacy broadcast is deprecated on modern Android but the
+        // shell is exempt from the file:// restriction; modern MediaProvider also auto-scans DCIM via
+        // inotify, so this is belt-and-suspenders. Verify/adjust on a real GrapheneOS device.
+        try {
+          this._adb(['-s', serial, 'shell', 'am', 'broadcast', '-a',
+            'android.intent.action.MEDIA_SCANNER_SCAN_FILE', '-d', `file://${dest}/${name}`]);
+        } catch {}
+        results.push({ name, ok: true });
+        this.emit('log', `pushed ${name} -> ${dest}`);
+      } catch (e) {
+        const err = (e && e.message) || String(e);
+        results.push({ name, ok: false, error: err });
+        this.emit('log', `upload ${name} failed: ${err}`);
+      } finally {
+        try { fs.unlinkSync(tmp); } catch {}
+      }
+    }
+    try { ws && ws.send(JSON.stringify({ op: 'upload_result', transfer_id: transferId, results })); } catch {}
+  }
+  /** Stream a URL to a local file (Node http/https; no fetch in the Electron main process). */
+  _download(url, dest) {
+    return new Promise((resolve, reject) => {
+      let u; try { u = new URL(url); } catch (e) { return reject(e); }
+      const lib = u.protocol === 'https:' ? https : http;
+      const file = fs.createWriteStream(dest);
+      const req = lib.get(u, (res) => {
+        if (res.statusCode !== 200) {
+          res.resume(); try { file.close(); } catch {}
+          return reject(new Error('download HTTP ' + res.statusCode));
+        }
+        res.pipe(file);
+        file.on('finish', () => file.close((err) => err ? reject(err) : resolve()));
+      });
+      req.on('error', reject);
+      req.setTimeout(120000, () => req.destroy(new Error('download timed out')));
+    });
+  }
+  /** adb push with NO 8s cap (unlike _adb) - a large video can take a while over USB. */
+  _adbPush(serial, local, remote) {
+    return new Promise((resolve, reject) => {
+      const p = spawn(this.adbPath, ['-s', serial, 'push', local, remote], { stdio: ['ignore', 'ignore', 'pipe'] });
+      let err = '';
+      if (p.stderr) p.stderr.on('data', (d) => { err += d.toString(); });
+      p.on('error', reject);
+      p.on('close', (code) => code === 0 ? resolve()
+        : reject(new Error('adb push exit ' + code + (err ? ': ' + err.trim() : ''))));
+    });
+  }
   /** Raw `pm list users` parse (no rename overlay) - used to verify on-phone renames. */
   _parseUsers(serial) {
     try {
@@ -482,6 +551,7 @@ class AgentCore extends EventEmitter {
       else if (m.op === 'refresh') this.refreshAll();   // VA pressed "Refresh phone" on the website
       else if (m.op === 'set_charge_policy') this.setChargePolicy(serial, m, ws);   // battery charge limit
       else if (m.op === 'create_profiles') this.createProfiles(serial, m.count, m.package, m.name_prefix, ws);
+      else if (m.op === 'upload_media') this.uploadMedia(serial, m, ws);   // push photos/videos to the gallery
     });
     ws.addEventListener('close', (e) => {
       clearInterval(dev.hb); clearInterval(dev.ping); dev.online = false;
