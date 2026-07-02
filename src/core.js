@@ -267,8 +267,12 @@ class AgentCore extends EventEmitter {
     const files = (m && Array.isArray(m.files)) ? m.files : [];
     if (!serial || !dev || !transferId || !files.length) return;
     const token = (this._loadTokens()[serial] || {}).device_token || dev.token || '';
-    this.emit('log', `upload_media (${serial}) -> ${files.length} file(s), transfer=${transferId}`);
-    const dest = '/sdcard/DCIM/Camera';
+    // Which profile's gallery? user 0 (or unset) = the primary profile, reachable via /sdcard.
+    // A secondary profile has its own storage at /storage/emulated/<userId>. adb runs as the
+    // "shell" user which can reach the primary always; secondary profiles may need root.
+    const uid = (m.user_id === 0 || m.user_id > 0) ? m.user_id : null;
+    const dest = (uid && uid !== 0) ? `/storage/emulated/${uid}/DCIM/Camera` : '/sdcard/DCIM/Camera';
+    this.emit('log', `upload_media (${serial}) -> ${files.length} file(s), profile=${uid == null ? 'main' : uid}, transfer=${transferId}`);
     try { this._adb(['-s', serial, 'shell', 'mkdir', '-p', dest]); } catch {}
     const results = [];
     for (const f of files) {
@@ -282,8 +286,10 @@ class AgentCore extends EventEmitter {
         // shell is exempt from the file:// restriction; modern MediaProvider also auto-scans DCIM via
         // inotify, so this is belt-and-suspenders. Verify/adjust on a real GrapheneOS device.
         try {
-          this._adb(['-s', serial, 'shell', 'am', 'broadcast', '-a',
-            'android.intent.action.MEDIA_SCANNER_SCAN_FILE', '-d', `file://${dest}/${name}`]);
+          const scan = ['-s', serial, 'shell', 'am', 'broadcast'];
+          if (uid && uid !== 0) scan.push('--user', String(uid));
+          scan.push('-a', 'android.intent.action.MEDIA_SCANNER_SCAN_FILE', '-d', `file://${dest}/${name}`);
+          this._adb(scan);
         } catch {}
         results.push({ name, ok: true });
         this.emit('log', `pushed ${name} -> ${dest}`);
