@@ -248,6 +248,16 @@ class AgentCore extends EventEmitter {
         const m = /id\s+(\d+)/i.exec(out);
         if (!m) { this.emit('log', `create-user failed: ${out}`); continue; }
         const id = m[1]; made++;
+        // Make the profile usable headlessly: mark its setup as already complete so switching to it
+        // lands on the home screen instead of the first-run wizard that forces a PIN. No human has to
+        // tap "skip" on each phone. settings/am run under shell (WRITE_SECURE_SETTINGS) - no root.
+        // (GrapheneOS's wizard differs slightly; verify on a real device and adjust if it still prompts.)
+        try {
+          sh(['am', 'start-user', id]);                                       // bring the profile up
+          sh(['settings', 'put', '--user', id, 'secure', 'user_setup_complete', '1']);
+          sh(['settings', 'put', '--user', id, 'secure', 'tv_user_setup_complete', '1']);
+          this.emit('log', `profile ${id}: setup marked complete (no PIN prompt)`);
+        } catch (e) { this.emit('log', `setup-skip user ${id}: ${(e && e.message) || e}`); }
         if (pkg) {
           try { sh(['pm', 'install-existing', '--user', id, pkg]); this.emit('log', `cloned ${pkg} -> user ${id}`); }
           catch (e) { this.emit('log', `install-existing user ${id}: ${(e && e.message) || e}`); }
@@ -554,7 +564,7 @@ class AgentCore extends EventEmitter {
       else if (m.op === 'switch_user') this.switchUser(serial, m.user_id, ws);
       else if (m.op === 'rename_user') this.renameUser(serial, m.user_id, m.name, ws);
       else if (m.op === 'unpair') this.unpair(serial);
-      else if (m.op === 'refresh') this.refreshAll();   // VA pressed "Refresh phone" on the website
+      else if (m.op === 'refresh') this.refreshOne(serial);   // VA pressed "Refresh phone" on ONE phone's row
       else if (m.op === 'set_charge_policy') this.setChargePolicy(serial, m, ws);   // battery charge limit
       else if (m.op === 'create_profiles') this.createProfiles(serial, m.count, m.package, m.name_prefix, ws);
       else if (m.op === 'upload_media') this.uploadMedia(serial, m, ws);   // push photos/videos to the gallery
@@ -571,6 +581,17 @@ class AgentCore extends EventEmitter {
       dev.reconnectTimer = setTimeout(() => { if (this.devices[serial] && this.devices[serial].token === token) this.connectHome(serial, token); }, dev.backoff);
     });
     ws.addEventListener('error', () => { try { ws.close(); } catch {} });
+  }
+
+  /** Manual refresh of ONE phone (the row the VA clicked on the website): reconnect just that
+      phone so the rest of the fleet stays live. reconcile() reconnects the dropped phone and
+      leaves already-connected phones untouched, and it won't restart the shared ws-scrcpy or the
+      adb server (those are fleet-wide - killing them is what used to disconnect every phone). */
+  refreshOne(serial) {
+    if (!serial || !this.devices[serial]) return;
+    this.emit('log', `manual refresh (${serial}): reconnecting this phone only`);
+    this._dropDevice(serial);
+    this.reconcile();
   }
 
   /** Manual refresh: drop every connection, restart adb + ws-scrcpy, reconnect from scratch.
