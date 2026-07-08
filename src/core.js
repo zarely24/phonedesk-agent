@@ -281,9 +281,7 @@ class AgentCore extends EventEmitter {
     // A secondary profile has its own storage at /storage/emulated/<userId>. adb runs as the
     // "shell" user which can reach the primary always; secondary profiles may need root.
     const uid = (m.user_id === 0 || m.user_id > 0) ? m.user_id : null;
-    const dest = (uid && uid !== 0) ? `/storage/emulated/${uid}/DCIM/Camera` : '/sdcard/DCIM/Camera';
     this.emit('log', `upload_media (${serial}) -> ${files.length} file(s), profile=${uid == null ? 'main' : uid}, transfer=${transferId}`);
-    try { this._adb(['-s', serial, 'shell', 'mkdir', '-p', dest]); } catch {}
     const results = [];
     for (const f of files) {
       const name = String((f && f.name) || 'file').replace(/[\/\\\0]/g, '_');
@@ -291,18 +289,9 @@ class AgentCore extends EventEmitter {
       try {
         const url = `${this.backend}/api/devices/media/${transferId}/${f.idx}?token=${encodeURIComponent(token)}`;
         await this._download(url, tmp);
-        await this._adbPush(serial, tmp, `${dest}/${name}`);
-        // Make it show up immediately. The legacy broadcast is deprecated on modern Android but the
-        // shell is exempt from the file:// restriction; modern MediaProvider also auto-scans DCIM via
-        // inotify, so this is belt-and-suspenders. Verify/adjust on a real GrapheneOS device.
-        try {
-          const scan = ['-s', serial, 'shell', 'am', 'broadcast'];
-          if (uid && uid !== 0) scan.push('--user', String(uid));
-          scan.push('-a', 'android.intent.action.MEDIA_SCANNER_SCAN_FILE', '-d', `file://${dest}/${name}`);
-          this._adb(scan);
-        } catch {}
+        const landed = await this._pushToGallery(serial, tmp, name, uid);
         results.push({ name, ok: true });
-        this.emit('log', `pushed ${name} -> ${dest}`);
+        this.emit('log', `pushed ${name} -> ${landed}`);
       } catch (e) {
         const err = (e && e.message) || String(e);
         results.push({ name, ok: false, error: err });
@@ -340,6 +329,100 @@ class AgentCore extends EventEmitter {
       p.on('error', reject);
       p.on('close', (code) => code === 0 ? resolve()
         : reject(new Error('adb push exit ' + code + (err ? ': ' + err.trim() : ''))));
+    });
+  }
+  /** Land one file in DCIM/Camera of the target profile at full quality, then make it visible.
+      The method depends on which Android user owns that gallery:
+        - main / user 0: adb's shell already lives in that user, so a direct push + media scan works.
+        - a secondary profile: /storage/emulated/<uid> is a per-user mount the shell cannot reach - a
+          direct push dies with "stat failed: Permission denied". With root we cp in as su (root sees
+          every user's mount); without root we go through that user's MediaStore via `content`, which
+          IS permitted cross-user for the shell uid. Returns a short location string for logging. */
+  async _pushToGallery(serial, local, name, uid) {
+    if (!uid || uid === 0) {
+      const dest = '/sdcard/DCIM/Camera';
+      try { this._adb(['-s', serial, 'shell', 'mkdir', '-p', dest]); } catch {}
+      await this._adbPush(serial, local, `${dest}/${name}`);
+      try {
+        this._adb(['-s', serial, 'shell', 'am', 'broadcast',
+          '-a', 'android.intent.action.MEDIA_SCANNER_SCAN_FILE', '-d', `file://${dest}/${name}`]);
+      } catch {}
+      return `${dest}/${name}`;
+    }
+    try { this._adb(['-s', serial, 'shell', 'am', 'start-user', String(uid)]); } catch {}   // provider must be up
+    return this._hasRoot(serial)
+      ? this._pushToGalleryRoot(serial, local, name, uid)
+      : this._pushToGalleryMediaStore(serial, local, name, uid);
+  }
+  /** Rooted path: stage in a shell-writable dir, su-cp into the secondary user's DCIM (FUSE synthesizes
+      app-readable ownership on the copy), then scan it into that user's MediaStore. */
+  async _pushToGalleryRoot(serial, local, name, uid) {
+    const dest = `/storage/emulated/${uid}/DCIM/Camera`;
+    const staged = `/data/local/tmp/pd_${uid}_${name.replace(/[^\w.\-]/g, '_')}`;
+    await this._adbPush(serial, local, staged);
+    try {
+      const inner = `mkdir -p '${dest}' && cp '${staged}' '${dest}/${name}'`;
+      this._adb(['-s', serial, 'shell', `${this.suPrefix} "${inner}"`]);
+      try { this._adb(['-s', serial, 'shell', `${this.suPrefix} "cmd media scan '${dest}/${name}'"`]); }
+      catch {
+        try { this._adb(['-s', serial, 'shell', 'am', 'broadcast', '--user', String(uid),
+          '-a', 'android.intent.action.MEDIA_SCANNER_SCAN_FILE', '-d', `file://${dest}/${name}`]); } catch {}
+      }
+    } finally {
+      try { this._adb(['-s', serial, 'shell', 'rm', '-f', staged]); } catch {}
+    }
+    return `${dest}/${name} (user ${uid}, root)`;
+  }
+  /** Non-root path: create a row in the secondary user's MediaStore and stream the bytes into it. The
+      byte redirect runs on-device (from a staged tmp file) so the adb-shell PTY can't corrupt binary
+      data, and the write uses the uncapped shell since a large video can exceed the 8s _adb timeout. */
+  async _pushToGalleryMediaStore(serial, local, name, uid) {
+    const isVideo = /\.(mp4|mov|m4v|3gp|mkv|webm|avi)$/i.test(name);
+    const coll = isVideo ? 'content://media/external/video/media'
+                         : 'content://media/external/images/media';
+    const staged = `/data/local/tmp/pd_${uid}_${name.replace(/[^\w.\-]/g, '_')}`;
+    await this._adbPush(serial, local, staged);
+    try {
+      this._adb(['-s', serial, 'shell', 'content', 'insert', '--user', String(uid), '--uri', coll,
+        '--bind', `_display_name:s:${name}`,
+        '--bind', `mime_type:s:${this._mimeFor(name, isVideo)}`,
+        '--bind', 'relative_path:s:DCIM/Camera/']);
+      const id = this._mediaStoreId(serial, coll, name, uid);
+      if (id == null) throw new Error('MediaStore row not found after insert');
+      await this._adbShellLong(serial, `content write --user ${uid} --uri ${coll}/${id} < '${staged}'`);
+      return `${coll}/${id} (user ${uid}, mediastore)`;
+    } finally {
+      try { this._adb(['-s', serial, 'shell', 'rm', '-f', staged]); } catch {}
+    }
+  }
+  /** Newest MediaStore _id for a display name in a given user - the row we just inserted (sort DESC,
+      first row wins). Returns null if the query finds nothing. */
+  _mediaStoreId(serial, coll, name, uid) {
+    const where = `_display_name='${String(name).replace(/'/g, "''")}'`;
+    try {
+      const out = this._adb(['-s', serial, 'shell', 'content', 'query', '--user', String(uid),
+        '--uri', coll, '--projection', '_id', '--where', where, '--sort', '_id DESC']);
+      const m = /_id=(\d+)/.exec(out);
+      return m ? m[1] : null;
+    } catch { return null; }
+  }
+  _mimeFor(name, isVideo) {
+    const ext = (String(name).split('.').pop() || '').toLowerCase();
+    const map = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif',
+      webp: 'image/webp', heic: 'image/heic', heif: 'image/heif',
+      mp4: 'video/mp4', mov: 'video/quicktime', m4v: 'video/mp4', '3gp': 'video/3gpp',
+      mkv: 'video/x-matroska', webm: 'video/webm', avi: 'video/x-msvideo' };
+    return map[ext] || (isVideo ? 'video/mp4' : 'image/jpeg');
+  }
+  /** adb shell for one command string with no 8s cap (mirrors _adbPush's spawn). */
+  _adbShellLong(serial, cmd) {
+    return new Promise((resolve, reject) => {
+      const p = spawn(this.adbPath, ['-s', serial, 'shell', cmd], { stdio: ['ignore', 'pipe', 'pipe'] });
+      let err = '';
+      if (p.stderr) p.stderr.on('data', (d) => { err += d.toString(); });
+      p.on('error', reject);
+      p.on('close', (code) => code === 0 ? resolve()
+        : reject(new Error('adb shell exit ' + code + (err ? ': ' + err.trim() : ''))));
     });
   }
   /** Raw `pm list users` parse (no rename overlay) - used to verify on-phone renames. */
@@ -400,19 +483,37 @@ class AgentCore extends EventEmitter {
   }
   firstUnpairedReady() { const t = this._loadTokens(); return this.detectAll().find((d) => d.state === 'ready' && !t[d.serial]) || null; }
 
-  /** Snapshot for the wizard: phones (plugged + paired) with paired/online flags + counts. */
+  /** Persist the dashboard-assigned name + list position the backend pushed down, so the owner's
+      app shows the SAME label and order the manager sees - making each physical phone identifiable.
+      The 2s status poll redraws the wizard, so no explicit UI nudge is needed. */
+  setLabel(serial, m) {
+    const tokens = this._loadTokens();
+    const entry = tokens[serial];
+    if (!entry) return;   // not a phone this computer owns
+    if (typeof m.name === 'string' && m.name.trim()) entry.name = m.name.trim().slice(0, 40);
+    if (Number.isFinite(m.position)) entry.position = m.position;
+    this._saveTokens(tokens);
+    this.emit('log', `label set for ${serial}: "${entry.name}"${Number.isFinite(entry.position) ? ' pos ' + entry.position : ''}`);
+  }
+
+  /** Snapshot for the wizard: phones (plugged + paired) with paired/online flags + counts,
+      ordered by the manager's dashboard position (unset positions sink to the bottom). */
   status() {
     const tokens = this._loadTokens();
     const seen = {};
     const phones = this.detectAll().map((d) => {
       seen[d.serial] = true;
-      return { serial: d.serial, state: d.state, name: (tokens[d.serial] && tokens[d.serial].name) || 'Phone',
+      const t = tokens[d.serial] || {};
+      return { serial: d.serial, state: d.state, name: t.name || 'Phone', position: t.position,
         paired: !!tokens[d.serial], online: !!(this.devices[d.serial] && this.devices[d.serial].online) };
     });
     Object.keys(tokens).forEach((serial) => {   // paired but not currently plugged in
-      if (!seen[serial]) phones.push({ serial, state: 'absent', name: tokens[serial].name || 'Phone', paired: true,
+      if (!seen[serial]) phones.push({ serial, state: 'absent', name: tokens[serial].name || 'Phone',
+        position: tokens[serial].position, paired: true,
         online: !!(this.devices[serial] && this.devices[serial].online) });
     });
+    const pos = (p) => (Number.isFinite(p.position) ? p.position : 1e9);
+    phones.sort((a, b) => pos(a) - pos(b) || String(a.name).localeCompare(String(b.name)));
     return { phones, pairedCount: Object.keys(tokens).length, max: this.maxDevices };
   }
 
@@ -568,6 +669,7 @@ class AgentCore extends EventEmitter {
       else if (m.op === 'set_charge_policy') this.setChargePolicy(serial, m, ws);   // battery charge limit
       else if (m.op === 'create_profiles') this.createProfiles(serial, m.count, m.package, m.name_prefix, ws);
       else if (m.op === 'upload_media') this.uploadMedia(serial, m, ws);   // push photos/videos to the gallery
+      else if (m.op === 'set_label') this.setLabel(serial, m);   // dashboard name/order -> owner app
     });
     ws.addEventListener('close', (e) => {
       clearInterval(dev.hb); clearInterval(dev.ping); dev.online = false;
