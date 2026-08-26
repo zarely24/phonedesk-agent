@@ -132,7 +132,7 @@ app.whenReady().then(() => {
     tokenFile: path.join(app.getPath('userData'), 'agent.json'),
     nodeBin: process.execPath,                 // Electron binary...
     runAsNodeEnv: { ELECTRON_RUN_AS_NODE: '1' }, // ...run as plain Node to launch ws-scrcpy
-    maxDevices: 15,                            // up to 15 phones per computer
+    maxDevices: 30,                            // up to 30 phones per computer
   });
   core.on('status', (s) => { fileLog('status:', JSON.stringify(s)); if (win && !win.isDestroyed()) win.webContents.send('status', s); });
   core.on('log', (m) => fileLog('[core]', m));
