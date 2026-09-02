@@ -158,11 +158,69 @@ class AgentCore extends EventEmitter {
     const bc = await this._batteryAndChargingAsync(serial);
     const cs = dev && dev.chargeStatus;
     if (!full && dev && dev._metaCache) {
-      return { battery: bc.battery, charging: bc.charging, charge_status: cs, ...dev._metaCache };
+      return { battery: bc.battery, charging: bc.charging, charge_status: cs, host: this._hostStats(), ...dev._metaCache };
     }
     const cache = { users: await this._listUsersAsync(serial), current_user: await this._currentUserAsync(serial) };
     if (dev) dev._metaCache = cache;
-    return { battery: bc.battery, charging: bc.charging, charge_status: cs, ...cache };
+    return { battery: bc.battery, charging: bc.charging, charge_status: cs, host: this._hostStats(), ...cache };
+  }
+  /** Health of the computer the phones are plugged into.
+      Reported on every heartbeat so we can see the machine instead of guessing about it. Free to
+      collect: os.cpus() and process.cpuUsage() are in-process counters, no shell-out, no adb -
+      which matters, because this runs on the same event loop that relays the video.
+      busiestCore is the number that counts. ws-scrcpy relays all 18 phones on ONE Node thread and
+      this agent is a second one, so the ceiling is a single core, not the CPU as a whole: 100% on
+      one core with the average at 15% means saturated, however idle the machine looks. */
+  _hostStats() {
+    const now = Date.now();
+    // Shared across all phones on this computer. Without this cache each of the 18 heartbeats would
+    // recompute the delta against the previous phone's reading milliseconds earlier, and every CPU
+    // number would be noise measured over a near-zero window.
+    if (this._hostCache && now - this._hostCacheAt < 10000) return this._hostCache;
+    const cpus = os.cpus();
+    const cur = cpus.map((c) => {
+      const t = c.times;
+      return { idle: t.idle, total: t.user + t.nice + t.sys + t.idle + t.irq };
+    });
+    let perCore = [];
+    if (this._cpuPrev && this._cpuPrev.length === cur.length) {
+      perCore = cur.map((c, i) => {
+        const dTotal = c.total - this._cpuPrev[i].total;
+        const dIdle = c.idle - this._cpuPrev[i].idle;
+        return dTotal > 0 ? Math.max(0, Math.min(100, Math.round((1 - dIdle / dTotal) * 100))) : 0;
+      });
+    }
+    this._cpuPrev = cur;
+
+    // This process's own share, as a percentage of ONE core (so >100 is impossible here).
+    let agentPct = null;
+    const cu = process.cpuUsage();
+    if (this._cpuUsagePrev && this._cpuStamp) {
+      const usedMs = (cu.user - this._cpuUsagePrev.user + cu.system - this._cpuUsagePrev.system) / 1000;
+      const wallMs = now - this._cpuStamp;
+      if (wallMs > 0) agentPct = Math.max(0, Math.min(100, Math.round((usedMs / wallMs) * 100)));
+    }
+    this._cpuUsagePrev = cu;
+    this._cpuStamp = now;
+
+    const totalMem = os.totalmem();
+    const stats = {
+      name: os.hostname(),
+      cores: cpus.length,
+      cpu_model: (cpus[0] && cpus[0].model) ? cpus[0].model.trim() : '',
+      cpu_avg: perCore.length ? Math.round(perCore.reduce((a, b) => a + b, 0) / perCore.length) : null,
+      cpu_busiest_core: perCore.length ? Math.max(...perCore) : null,
+      cpu_per_core: perCore,
+      agent_cpu: agentPct,
+      mem_used_gb: Math.round((totalMem - os.freemem()) / 1073741824 * 10) / 10,
+      mem_total_gb: Math.round(totalMem / 1073741824 * 10) / 10,
+      phones_connected: Object.keys(this.devices || {}).length,
+      streams_open: this._openTunnels || 0,
+      uptime_h: Math.round(os.uptime() / 360) / 10,
+    };
+    this._hostCache = stats;
+    this._hostCacheAt = now;
+    return stats;
   }
   /** Cached `adb devices`. This used to shell out on the 2s reconcile timer - another blocking call
       every two seconds. _refreshDevices() keeps the cache warm off the event loop; the very first
@@ -835,6 +893,10 @@ class AgentCore extends EventEmitter {
 
   openTunnel(serial, token, streamId, query) {
     if (!streamId) { this.emit('log', `open_stream ignored (${serial}): missing stream_id`); return; }
+    // Count live streams, so CPU can be read against how many VAs are actually watching.
+    this._openTunnels = (this._openTunnels || 0) + 1;
+    let counted = true;
+    const uncount = () => { if (counted) { counted = false; this._openTunnels = Math.max(0, (this._openTunnels || 1) - 1); } };
     const tunnel = new WebSocket(`${this.wsBase}/ws/agent-stream?token=${encodeURIComponent(token)}&stream_id=${encodeURIComponent(streamId)}`);
     // The viewer's query selects the ws-scrcpy endpoint: device list = `action=multiplex`; live video =
     // `action=proxy-adb&remote=...&udid=<serial>`. The udid in the query targets THIS phone, so one
@@ -855,6 +917,7 @@ class AgentCore extends EventEmitter {
       from.addEventListener('close', () => { try { to.close(); } catch {} });
       from.addEventListener('error', () => { try { to.close(); } catch {} });
     };
+    tunnel.addEventListener('close', uncount); tunnel.addEventListener('error', uncount);
     link(tunnel, local, lBuf); link(local, tunnel, tBuf);
     local.addEventListener('open', () => { while (lBuf.length) local.send(lBuf.shift()); });
     tunnel.addEventListener('open', () => { while (tBuf.length) tunnel.send(tBuf.shift()); });
