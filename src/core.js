@@ -7,7 +7,7 @@
  * Emits: 'status' ({serial, state}), 'log'.
  */
 const { EventEmitter } = require('events');
-const { execFileSync, spawn } = require('child_process');
+const { execFile, execFileSync, spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -84,6 +84,7 @@ class AgentCore extends EventEmitter {
     const dev = this.devices[serial];
     if (!dev) return;
     dev.token = null;
+    try { clearTimeout(dev.hbStart); } catch {}
     try { clearInterval(dev.hb); } catch {}
     try { clearInterval(dev.ping); } catch {}
     try { clearInterval(dev.chargeTimer); } catch {}
@@ -107,6 +108,82 @@ class AgentCore extends EventEmitter {
   // freezes the whole app and the backend then drops the socket. timeout: kill it and let the caller
   // (all wrapped in try/catch) treat it as a transient miss.
   _adb(args) { return execFileSync(this.adbPath, args, { encoding: 'utf8', timeout: 8000 }).trim(); }
+  /** Async twin of _adb, and the one anything on a timer MUST use.
+      THIS PROCESS IS ALSO THE VIDEO RELAY (see openTunnel): frames from ws-scrcpy are pumped to the
+      backend on this same single event loop. So every synchronous adb call freezes EVERY phone's
+      stream for as long as adb takes - 100-600ms on a loaded USB tree. With 18 phones on one computer
+      the polling alone was ~190 blocking calls a minute; measured at the server that showed up as
+      video stalls of 178-672ms in the data arriving from this agent, which is exactly the stutter the
+      VAs report. One-off calls triggered by a human action may stay synchronous; recurring ones cannot. */
+  _adbAsync(args) {
+    return new Promise((resolve, reject) => {
+      execFile(this.adbPath, args, { encoding: 'utf8', timeout: 8000 }, (err, stdout) => {
+        if (err) reject(err); else resolve(String(stdout || '').trim());
+      });
+    });
+  }
+  async _batteryAndChargingAsync(serial) {
+    try {
+      const out = await this._adbAsync(['-s', serial, 'shell', 'dumpsys', 'battery']);
+      const lvl = /level:\s*(\d+)/.exec(out);
+      const status = /status:\s*(\d+)/.exec(out);
+      const powered = [/AC powered:\s*true/i, /USB powered:\s*true/i, /Wireless powered:\s*true/i]
+        .some((re) => re.test(out));
+      return { battery: lvl ? parseInt(lvl[1], 10) : null, charging: status ? status[1] === '2' : powered };
+    } catch { return { battery: null, charging: null }; }
+  }
+  async _listUsersAsync(serial) {
+    const users = [];
+    try {
+      const out = await this._adbAsync(['-s', serial, 'shell', 'pm', 'list', 'users']);
+      out.split('\n').forEach((l) => {
+        const m = /UserInfo\{(\d+):([^:]*):/.exec(l);
+        if (m) users.push({ id: parseInt(m[1], 10), name: (m[2] || ('Profile ' + m[1])).trim() });
+      });
+    } catch { return []; }
+    const ov = (this._loadTokens()[serial] || {}).profiles || {};
+    users.forEach((u) => { if (ov[u.id]) u.name = ov[u.id]; });
+    return users;
+  }
+  async _currentUserAsync(serial) {
+    try {
+      const v = parseInt(await this._adbAsync(['-s', serial, 'shell', 'am', 'get-current-user']), 10);
+      return isNaN(v) ? null : v;
+    } catch { return null; }
+  }
+  /** Async twin of _metaPayload, used by the heartbeat. Same caching rule: the profile list barely
+      ever changes, so only a `full` beat re-reads it. */
+  async _metaPayloadAsync(serial, full = true) {
+    const dev = this.devices[serial];
+    const bc = await this._batteryAndChargingAsync(serial);
+    const cs = dev && dev.chargeStatus;
+    if (!full && dev && dev._metaCache) {
+      return { battery: bc.battery, charging: bc.charging, charge_status: cs, ...dev._metaCache };
+    }
+    const cache = { users: await this._listUsersAsync(serial), current_user: await this._currentUserAsync(serial) };
+    if (dev) dev._metaCache = cache;
+    return { battery: bc.battery, charging: bc.charging, charge_status: cs, ...cache };
+  }
+  /** Cached `adb devices`. This used to shell out on the 2s reconcile timer - another blocking call
+      every two seconds. _refreshDevices() keeps the cache warm off the event loop; the very first
+      read falls back to the blocking call so startup behaviour is unchanged. */
+  detectAll() {
+    if (!this._deviceCache) this._deviceCache = this._detectAllBlocking();
+    return this._deviceCache;
+  }
+  _rowsToDevices(out) {
+    return out.split('\n').slice(1).map((l) => l.trim()).filter(Boolean).map((l) => l.split('\t'))
+      .filter((p) => p[1] === 'device' || p[1] === 'unauthorized')
+      .map((p) => ({ serial: p[0], state: p[1] === 'device' ? 'ready' : 'unauthorized' }));
+  }
+  _detectAllBlocking() {
+    try { return this._rowsToDevices(this._adb(['devices'])); } catch { return []; }
+  }
+  _refreshDevices() {
+    return this._adbAsync(['devices'])
+      .then((out) => { this._deviceCache = this._rowsToDevices(out); })
+      .catch(() => {});
+  }
   _getprop(serial, key) { try { return this._adb(['-s', serial, 'shell', 'getprop', key]); } catch { return ''; } }
   /** Battery level + whether the phone is actually drawing charge, from ONE `dumpsys battery`
       call (cheaper than two shell-outs every heartbeat x N phones). When our charge limit has
@@ -190,13 +267,17 @@ class AgentCore extends EventEmitter {
     dev.chargeGate = gate; dev.chargeMethod = 'poll:' + gate;
     dev.chargeStatus = `poll ${gate.split('/').pop()} (stop ${stop} / resume ${resume})`;
     this.emit('log', `${serial}: charge limit via ${gate} poll loop (stop ${stop} / resume ${resume})`);
+    // Async battery read: this runs once a minute for EVERY phone, and a blocking read here stalls
+    // the video relay just as the heartbeat did. Flipping the gate is rare (only when a threshold is
+    // crossed), so that one may stay synchronous.
     const tick = () => {
-      try {
-        const b = this._battery(serial);
+      this._batteryAndChargingAsync(serial).then(({ battery: b }) => {
         if (b == null) return;
-        if (b >= stop) this._setGate(serial, gate, false);
-        else if (b <= resume) this._setGate(serial, gate, true);
-      } catch {}
+        try {
+          if (b >= stop) this._setGate(serial, gate, false);
+          else if (b <= resume) this._setGate(serial, gate, true);
+        } catch {}
+      }).catch(() => {});
     };
     tick();
     dev.chargeTimer = setInterval(tick, 60000);
@@ -470,13 +551,6 @@ class AgentCore extends EventEmitter {
   _saveTokens(map) { try { fs.writeFileSync(this.tokenFile, JSON.stringify({ devices: map }, null, 2)); } catch (e) { this.emit('log', 'token save failed: ' + e); } }
 
   // ---- detection (fast: one `adb devices` call; getprop only when pairing)
-  detectAll() {
-    let rows;
-    try { rows = this._adb(['devices']).split('\n').slice(1).map((l) => l.trim()).filter(Boolean).map((l) => l.split('\t')); }
-    catch { return []; }
-    return rows.filter((p) => p[1] === 'device' || p[1] === 'unauthorized')
-      .map((p) => ({ serial: p[0], state: p[1] === 'device' ? 'ready' : 'unauthorized' }));
-  }
   _deviceInfo(serial) {
     const model = this._getprop(serial, 'ro.product.model');
     return { brand: this._getprop(serial, 'ro.product.brand'), model, android: this._getprop(serial, 'ro.build.version.release'), name: model || 'Phone' };
@@ -577,6 +651,7 @@ class AgentCore extends EventEmitter {
 
   /** Keep connections in sync with what's plugged in: connect plugged+paired phones, drop unplugged ones. */
   reconcile() {
+    this._refreshDevices();   // async; detectAll() below reads the cache it keeps warm
     this.startWsScrcpy();
     const tokens = this._loadTokens();
     const plugged = {}; this.detectAll().forEach((d) => { if (d.state === 'ready') plugged[d.serial] = true; });
@@ -618,14 +693,19 @@ class AgentCore extends EventEmitter {
     // Re-pairing a phone whose socket is still live (token changed): tear the old one down first, else
     // it leaks - the stale socket lingers and its heartbeat/ping intervals get orphaned (overwritten
     // by the new socket's 'open' handler) and run forever.
-    if (dev.ws) { try { clearInterval(dev.hb); } catch {} try { clearInterval(dev.ping); } catch {} try { dev.ws.close(); } catch {} }
+    if (dev.ws) { try { clearTimeout(dev.hbStart); } catch {} try { clearInterval(dev.hb); } catch {} try { clearInterval(dev.ping); } catch {} try { dev.ws.close(); } catch {} }
     dev.token = token;
     const ws = new WebSocket(`${this.wsBase}/ws/agent?token=${encodeURIComponent(token)}`);
     dev.ws = ws;
     ws.addEventListener('open', () => {
       dev.backoff = 1000; dev.online = true;
       this.emit('status', { serial, state: 'online' });
-      const sendMeta = (full) => { try { ws.send(JSON.stringify({ op: 'meta', data: this._metaPayload(serial, full) })); } catch {} };
+      const sendMeta = (full) => {
+        // Async: _metaPayload's synchronous adb calls used to stall every phone's video (see _adbAsync).
+        this._metaPayloadAsync(serial, full)
+          .then((data) => { try { ws.send(JSON.stringify({ op: 'meta', data })); } catch {} })
+          .catch(() => {});
+      };
       sendMeta(true);                       // first beat: full (battery + fresh user list)
       // Re-apply any saved charge limit (the backend also re-pushes set_charge_policy on connect;
       // doing it here too means the limit holds even if that message is missed).
@@ -634,7 +714,15 @@ class AgentCore extends EventEmitter {
         if (saved) { dev.chargePolicy = saved; this._applyChargePolicy(serial); }
       } catch {}
       let beat = 0;
-      dev.hb = setInterval(() => { beat = (beat + 1) % 6; sendMeta(beat === 0); }, 10000);   // refresh the user list once a minute, battery every beat
+      // Battery every 30s (it is a dashboard number, not telemetry), full profile list every 60s.
+      // The random offset matters: all 18 phones connect within a second of each other at startup, so
+      // without it every poll lands in the same instant and they queue behind one another on the USB
+      // tree. Spreading them turns one big periodic hit into a thin trickle.
+      const HB_MS = 30000;
+      dev.hbStart = setTimeout(() => {
+        sendMeta(false);
+        dev.hb = setInterval(() => { beat = (beat + 1) % 2; sendMeta(beat === 0); }, HB_MS);
+      }, Math.floor(Math.random() * HB_MS));
       // Liveness watchdog. A half-open link (router/NAT drop, wifi blip) leaves a ZOMBIE socket: the
       // agent keeps "sending" into a dead pipe, the dashboard still shows the phone ONLINE, and the OS
       // doesn't surface the dead socket for ~15 min (TCP's default give-up). Ping every 15s and treat
@@ -672,7 +760,7 @@ class AgentCore extends EventEmitter {
       else if (m.op === 'set_label') this.setLabel(serial, m);   // dashboard name/order -> owner app
     });
     ws.addEventListener('close', (e) => {
-      clearInterval(dev.hb); clearInterval(dev.ping); dev.online = false;
+      clearTimeout(dev.hbStart); clearInterval(dev.hb); clearInterval(dev.ping); dev.online = false;
       if (e && e.code === 4401) {            // token revoked (phone deleted on the website) - forget it
         this.emit('log', `token rejected for ${serial}; unpairing locally`);
         this.unpair(serial);
