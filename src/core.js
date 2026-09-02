@@ -11,6 +11,7 @@ const { execFile, execFileSync, spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
 
 // Electron's main process (Node 20) has no global WebSocket; fall back to the `ws` package.
 const WebSocket = globalThis.WebSocket || require('ws');
@@ -205,7 +206,10 @@ class AgentCore extends EventEmitter {
 
     const totalMem = os.totalmem();
     const stats = {
-      name: os.hostname(),
+      // A stable, non-identifying id instead of the hostname: machines are often named after the
+      // person who owns them, and that name has no business appearing on the dashboard. The hash is
+      // only used to group the phones that share a computer.
+      id: crypto.createHash('sha256').update(os.hostname()).digest('hex').slice(0, 8),
       cores: cpus.length,
       cpu_model: (cpus[0] && cpus[0].model) ? cpus[0].model.trim() : '',
       cpu_avg: perCore.length ? Math.round(perCore.reduce((a, b) => a + b, 0) / perCore.length) : null,
