@@ -1,5 +1,5 @@
 'use strict';
-const { app, BrowserWindow, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, Notification, dialog, ipcMain, shell } = require('electron');
 const path = require('path');
 const https = require('https');
 const { AgentCore } = require('./core');
@@ -78,6 +78,48 @@ function createWindow() {
 
 // ---- updates: Windows installs itself (electron-updater); Mac gets a "Download" button.
 let pendingUpdate = null;
+let updatePromptOpen = false;
+let updateNagTimer = null;
+
+/** Make a ready update impossible to miss.
+    Previously this only pushed a message into the app window - which the owner usually keeps
+    minimised or closed - and then waited for them to happen to restart. An update could sit
+    undelivered for days, which matters when the update IS the fix for the fleet's video.
+    Now: a desktop notification plus a dialog that comes to the front, repeated every 30 minutes
+    until they act. Restarting is one click; nothing is forced on them mid-shift, because a restart
+    drops every phone for a moment and that has to be their choice. */
+function promptForUpdate(updater, u) {
+  const title = 'PhoneDesk update ready';
+  const body = `Version ${u.version} is downloaded. Restarting takes about 20 seconds and the phones reconnect on their own.`;
+  try {
+    if (Notification.isSupported()) {
+      const n = new Notification({ title, body });
+      n.on('click', () => { try { updater.quitAndInstall(); } catch {} });
+      n.show();
+    }
+  } catch {}
+  const showDialog = () => {
+    if (updatePromptOpen) return;
+    updatePromptOpen = true;
+    dialog.showMessageBox({
+      type: 'info',
+      title,
+      message: title,
+      detail: body + '\n\nPlease restart as soon as you can - this update improves the phone streams.',
+      buttons: ['Restart now', 'Remind me in 30 minutes'],
+      defaultId: 0,
+      cancelId: 1,
+      noLink: true,
+    }).then((r) => {
+      updatePromptOpen = false;
+      if (r.response === 0) { try { updater.quitAndInstall(); } catch (e) { fileLog('quitAndInstall:', e && e.message); } }
+    }).catch(() => { updatePromptOpen = false; });
+  };
+  showDialog();
+  if (updateNagTimer) clearInterval(updateNagTimer);
+  updateNagTimer = setInterval(showDialog, 30 * 60 * 1000);
+}
+
 function announceUpdate(u) {
   pendingUpdate = u;
   fileLog('update:', JSON.stringify(u));
@@ -117,11 +159,14 @@ function initUpdates() {
   try { updater = require('electron-updater').autoUpdater; }
   catch (e) { fileLog('electron-updater unavailable:', e && e.message); return; }   // old zip builds
   updater.autoDownload = true;
-  updater.on('update-downloaded', (info) => announceUpdate({ ready: true, version: info.version }));
+  updater.on('update-downloaded', (info) => {
+    announceUpdate({ ready: true, version: info.version });
+    promptForUpdate(updater, { version: info.version });
+  });
   updater.on('error', (e) => fileLog('updater error:', (e && e.message) || e));
   const check = () => { try { updater.checkForUpdates().catch(() => {}); } catch {} };
   check();
-  setInterval(check, 6 * 3600 * 1000);
+  setInterval(check, 30 * 60 * 1000);
 }
 
 app.whenReady().then(() => {

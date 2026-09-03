@@ -1,6 +1,6 @@
 {
   "name": "phonedesk-agent",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "private": true,
   "description": "PhoneDesk owner agent - installs on the owner's PC/Mac, runs ws-scrcpy, and brings the phone online for VAs.",
   "author": "PhoneDesk",
