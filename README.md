@@ -106,8 +106,16 @@ in one burst unless it is staggered. That burst is what made the blocking calls 
 limit, sharding phones across several ws-scrcpy processes is the next move — the dashboard's
 busiest-core reading is how you would know.
 
-**Stream quality is decided by the VA's browser, not here.** The browser tells the phone what to
-encode. No change in this repo can make the video sharper or smoother by itself.
+**Stream quality is decided by the backend, applied by the VA's browser, and never here.** Since
+2026-09-07 the backend divides the farm's upload budget by however many streams are live on THIS
+computer and hands each viewer a rung off a ladder; the browser then tells the phone what to encode.
+No change in this repo can make the video sharper or smoother by itself.
+
+The one thing this repo does contribute is the grouping key. The heartbeat's `host.id` — a hash of
+the hostname, so the dashboard never shows what someone called their PC — is what tells the backend
+which phones share an uplink. **An agent that stops reporting it does not break quality, but it does
+make it pessimistic:** the backend then counts every live stream in the fleet rather than assume the
+phone is alone, because guessing high is what makes video freeze. See `backend/README.md`.
 
 ---
 
