@@ -44,6 +44,27 @@ function postJson(url, bodyObj, timeoutMs = 12000) {
   });
 }
 
+// POST raw bytes. Used only by the uplink probe, which needs to push a burst and be told how long
+// the SERVER took to receive it - so the body is bytes, not JSON, and the reply carries the verdict.
+function postBytes(url, buf, headers, timeoutMs = 60000) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const lib = u.protocol === 'https:' ? https : http;
+    const req = lib.request(u, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream', 'Content-Length': buf.length, ...headers },
+    }, (res) => {
+      let chunks = '';
+      res.on('data', (c) => (chunks += c));
+      res.on('end', () => { try { resolve(JSON.parse(chunks)); } catch { resolve({}); } });
+    });
+    req.on('error', reject);
+    req.setTimeout(timeoutMs, () => req.destroy(new Error('uplink probe timed out')));
+    req.write(buf);
+    req.end();
+  });
+}
+
 class AgentCore extends EventEmitter {
   constructor(opts = {}) {
     super();
@@ -220,6 +241,10 @@ class AgentCore extends EventEmitter {
       mem_total_gb: Math.round(totalMem / 1073741824 * 10) / 10,
       phones_connected: Object.keys(this.devices || {}).length,
       streams_open: this._openTunnels || 0,
+      // Last measured upload speed for this computer, so the dashboard can show the farm's real
+      // bandwidth next to its CPU. The backend records probes itself; this is only for display.
+      uplink_bps: (this._lastUplink || {}).bps || null,
+      uplink_at: (this._lastUplink || {}).at || null,
       uptime_h: Math.round(os.uptime() / 360) / 10,
     };
     this._hostCache = stats;
@@ -715,6 +740,7 @@ class AgentCore extends EventEmitter {
   reconcile() {
     this._refreshDevices();   // async; detectAll() below reads the cache it keeps warm
     this.startWsScrcpy();
+    this._startUplinkProbes();
     const tokens = this._loadTokens();
     const plugged = {}; this.detectAll().forEach((d) => { if (d.state === 'ready') plugged[d.serial] = true; });
     Object.keys(tokens).forEach((serial) => {
@@ -871,6 +897,8 @@ class AgentCore extends EventEmitter {
   shutdown() {
     this.emit('log', 'shutdown: closing sockets and killing ws-scrcpy');
     this._stopped = true;             // block any pending/future respawn
+    try { clearInterval(this._uplinkTimer); } catch {}
+    this._uplinkTimer = null;
     Object.keys(this.devices).forEach((serial) => this._dropDevice(serial));
     this._killWsScrcpy();
   }
@@ -893,6 +921,56 @@ class AgentCore extends EventEmitter {
     this._dropDevice(serial);
     this.emit('log', `unpaired ${serial} (removed on the website)`);
     this.emit('status', { serial, state: 'unpaired' });
+  }
+
+  /** Measure this computer's REAL upload speed, by pushing a burst at the backend and letting it
+      time the arrival.
+
+      Why here and not a speedtest website: this is the exact leg that carries the video - this
+      computer to the PhoneDesk server, same protocol, same host. A speedtest to a nearby ISP mirror
+      can read fine while this path does not, and it is this path the VAs actually watch through.
+
+      Why only when nothing is streaming: the burst would otherwise compete with a VA's video, and
+      then neither number means anything - the probe reads low because video is using the line, and
+      the video stutters because the probe is. On a 0.79 Mbit/s line that is not a subtle effect.
+
+      Deliberately small (256 KB, ~2.6s at 0.79 Mbit/s): big enough to get past TCP slow-start,
+      small enough that it is not itself an outage. */
+  async _uplinkProbe() {
+    if ((this._openTunnels || 0) > 0) return;               // someone is watching; don't fight them
+    const tokens = this._loadTokens();
+    const serial = Object.keys(tokens)[0];
+    const token = serial && (tokens[serial] || {}).device_token;
+    if (!token) return;                                      // nothing paired yet, nothing to measure
+    const SIZE = 256 * 1024;
+    // Random bytes, not zeroes: a run of zeroes is trivially compressible and any transparent proxy
+    // or middlebox on the path could squeeze it, which would read as a line far faster than it is.
+    const buf = crypto.randomBytes(SIZE);
+    try {
+      const r = await postBytes(`${this.backend}/api/uplink-probe`, buf, { 'x-device-token': token });
+      if (r && r.bps) {
+        this._lastUplink = { bps: r.bps, at: Date.now() };
+        this.emit('log', `uplink probe: ${(r.bps / 1e6).toFixed(2)} Mbit/s up ` +
+                         `(${SIZE / 1024}KB in ${r.seconds}s) -> budget ${(r.budget_bps / 1e6).toFixed(2)} Mbit/s, ` +
+                         `about ${r.max_viewers} viewer(s) at once`);
+      } else if (r && r.why) {
+        this.emit('log', `uplink probe inconclusive: ${r.why}`);
+      }
+    } catch (e) {
+      this.emit('log', `uplink probe failed: ${(e && e.message) || e}`);
+    }
+  }
+
+  /** Run the probe on a timer. Started from reconcile() so it begins once something is paired, and
+      guarded so repeated reconciles do not stack up timers. The first run is delayed and the
+      interval jittered: every agent in the fleet starts within seconds of a power cut, and 18 of
+      them probing in lockstep would measure nothing but each other. */
+  _startUplinkProbes() {
+    if (this._uplinkTimer) return;
+    const EVERY = 20 * 60 * 1000;
+    const jitter = () => EVERY + Math.floor(Math.random() * 5 * 60 * 1000);
+    setTimeout(() => this._uplinkProbe(), 30000 + Math.floor(Math.random() * 60000));
+    this._uplinkTimer = setInterval(() => this._uplinkProbe(), jitter());
   }
 
   openTunnel(serial, token, streamId, query) {

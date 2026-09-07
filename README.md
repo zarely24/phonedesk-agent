@@ -111,6 +111,17 @@ busiest-core reading is how you would know.
 computer and hands each viewer a rung off a ladder; the browser then tells the phone what to encode.
 No change in this repo can make the video sharper or smoother by itself.
 
+**This repo does measure the line, though.** Every ~20 minutes `_uplinkProbe` pushes a 256 KB burst
+of random bytes at `POST /api/uplink-probe` and the backend times its arrival — that is the farm's
+real upload speed, measured over the exact path the video takes rather than to a speedtest mirror
+that may be much closer. It runs **only when `_openTunnels === 0`**: a probe competing with a VA's
+video makes both numbers meaningless and visibly stutters the stream, which on a 0.79 Mbit/s line is
+not subtle. The first run is delayed and the interval jittered, because eighteen agents come back
+from a power cut within seconds of each other and would otherwise measure nothing but themselves.
+Random bytes rather than zeroes, so nothing on the path can compress the burst and make the line
+look faster than it is. The result rides back on the heartbeat as `host.uplink_bps` for the
+dashboard; the backend records its own copy and that is the one that sets quality.
+
 The one thing this repo does contribute is the grouping key. The heartbeat's `host.id` — a hash of
 the hostname, so the dashboard never shows what someone called their PC — is what tells the backend
 which phones share an uplink. **An agent that stops reporting it does not break quality, but it does
