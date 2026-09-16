@@ -551,10 +551,15 @@ class AgentCore extends EventEmitter {
     const staged = `/data/local/tmp/pd_${uid}_${name.replace(/[^\w.\-]/g, '_')}`;
     await this._adbPush(serial, local, staged);
     try {
-      this._adb(['-s', serial, 'shell', 'content', 'insert', '--user', String(uid), '--uri', coll,
-        '--bind', `_display_name:s:${name}`,
-        '--bind', `mime_type:s:${this._mimeFor(name, isVideo)}`,
-        '--bind', 'relative_path:s:DCIM/Camera/']);
+      // Build ONE remote command string with each value wrapped in device-shell single quotes.
+      // adb shell concatenates argv into a string the phone's /system/bin/sh re-parses, which
+      // strips bare quotes and splits on spaces - so a filename with a space, or the SQL literal
+      // in the query below, arrives mangled unless we quote it for that shell ourselves.
+      const insertCmd = `content insert --user ${uid} --uri ${coll}`
+        + ` --bind ${this._shq('_display_name:s:' + name)}`
+        + ` --bind ${this._shq('mime_type:s:' + this._mimeFor(name, isVideo))}`
+        + ` --bind ${this._shq('relative_path:s:DCIM/Camera/')}`;
+      this._adb(['-s', serial, 'shell', insertCmd]);
       const id = this._mediaStoreId(serial, coll, name, uid);
       if (id == null) throw new Error('MediaStore row not found after insert');
       await this._adbShellLong(serial, `content write --user ${uid} --uri ${coll}/${id} < '${staged}'`);
@@ -563,13 +568,23 @@ class AgentCore extends EventEmitter {
       try { this._adb(['-s', serial, 'shell', 'rm', '-f', staged]); } catch {}
     }
   }
+  /** Single-quote a value for the phone's /system/bin/sh. adb shell joins argv into one string
+      that the device shell re-parses, so any value carrying a space or an SQL quote must be quoted
+      for THAT shell or it gets split / stripped before `content` ever sees it. */
+  _shq(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'"; }
   /** Newest MediaStore _id for a display name in a given user - the row we just inserted (sort DESC,
-      first row wins). Returns null if the query finds nothing. */
+      first row wins). Returns null if the query finds nothing.
+
+      The --where value is an SQL string literal (its own single quotes), and it must survive the
+      phone's shell intact - the earlier version passed it unquoted, the device shell dropped the
+      quotes, and `content` got `_display_name=NAME.jpeg` (a bare token, not a string), matched
+      nothing, and every secondary-profile upload failed with "row not found after insert". */
   _mediaStoreId(serial, coll, name, uid) {
     const where = `_display_name='${String(name).replace(/'/g, "''")}'`;
     try {
-      const out = this._adb(['-s', serial, 'shell', 'content', 'query', '--user', String(uid),
-        '--uri', coll, '--projection', '_id', '--where', where, '--sort', '_id DESC']);
+      const cmd = `content query --user ${uid} --uri ${coll} --projection _id`
+        + ` --where ${this._shq(where)} --sort ${this._shq('_id DESC')}`;
+      const out = this._adb(['-s', serial, 'shell', cmd]);
       const m = /_id=(\d+)/.exec(out);
       return m ? m[1] : null;
     } catch { return null; }
