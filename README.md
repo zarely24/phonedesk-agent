@@ -84,6 +84,8 @@ Download page for a fresh install: <https://phonedesk.map-mgt.com/download/>
 
 | Version | What changed |
 |---|---|
+| **v0.4.5** | Upload-to-gallery works for secondary profiles again. The MediaStore `_id` lookup after insert passed its WHERE clause unquoted through `adb shell`, so the phone's shell stripped the SQL quotes and the row never matched — every non-root secondary-profile upload failed with "MediaStore row not found after insert". The `content` insert/query are now sent as one shell-quoted command; also fixes filenames containing a space |
+| **v0.4.4** | Each agent measures its own upload speed and reports it, so the fleet's bitrate budget tracks the line the phones are actually on instead of a number typed into config |
 | **v0.4.3** | An update that is ready no longer waits to be noticed: a desktop notification plus a dialog that comes to the front, repeated every 30 minutes until the owner restarts. Update checks every 30 minutes rather than every 6 hours. Restarting stays the owner's choice, since it briefly drops every phone |
 | **v0.4.2** | Reports a hashed computer id rather than the hostname — machines get named after their owners, and that name has no place on a dashboard VAs can see |
 | **v0.4.1** | Host health on every heartbeat: CPU per core, busiest core, memory, phones, live streams. Cached for 10s and shared across phones, or 18 heartbeats would each recompute the CPU delta over a near-zero window and report noise |
