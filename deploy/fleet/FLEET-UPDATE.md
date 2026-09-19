@@ -76,18 +76,30 @@ Map these to however you currently launch the shared agent (installed Electron a
 
 ---
 
-## ROLLBACK to v0.4.5 — do this immediately if ANY of:
-devices fail to reconnect · broken streams · broken touch/control · profile problems · repeated
-crashes · major RPC errors · instability affecting VA work.
+## ON FAILURE — STOP AND WAIT (do NOT auto-roll-back)
 
-**Stop troubleshooting on the live fleet and roll back:**
+Failure signals: devices fail to reconnect · broken streams · broken touch/control · profile
+problems · repeated crashes · major RPC errors · instability affecting VA work.
+
+**Default behavior is to STOP and WAIT for the user's decision — not to roll back automatically.**
+1. If the new agent is actively unstable, **stop it safely** (quit the process). Do nothing else
+   experimental across the 18 phones.
+2. **Preserve** all logs/errors and the current state (agent stdout/stderr, and I capture backend
+   logs). Do not clear anything.
+3. **Report** exactly what failed and which phones are affected.
+4. **Confirm** the preserved v0.4.5 build and `.agent.json.backup-v0.4.5` are intact and ready.
+5. Provide the **exact rollback command** (below) and **WAIT for the user's approval**. The user
+   decides whether/when to roll back.
+
+**Only exception:** if an immediate action is genuinely necessary to prevent corruption of data,
+pairings, or devices, take the minimal safe action first, then report.
+
+### Rollback command (run ONLY after the user approves)
 1. **Stop** the new (0.5.0-canary.1) agent.
-2. **Restore** the v0.4.5 build you preserved in BEFORE-2.
-3. **Restore** the token file: `cp .agent.json.backup-v0.4.5 .agent.json` (only if it changed; the
-   update shouldn't have altered it, but restore to be safe).
+2. **Restore** the v0.4.5 build preserved in BEFORE-2.
+3. **Restore** the token file if it changed: `cp .agent.json.backup-v0.4.5 .agent.json`.
 4. **Start** the v0.4.5 agent with the original env/launch command.
-5. Tell me — I confirm from the backend: **18/18 reconnect**, streams + control return.
-6. We report the failure with the relevant agent + backend logs. No fleet is left partially updated.
+5. I confirm from the backend: **18/18 reconnect**, streams + control return; we report with logs.
 
 Rollback needs **no** backend change: we never set `AGENT_DETECTOR_DEVICES`, never enabled
 monitoring, never changed stream settings. The production backend/DB and pre-deploy backups are
