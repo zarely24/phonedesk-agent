@@ -867,6 +867,10 @@ class AgentCore extends EventEmitter {
       else if (m.op === 'launch_app') this.launchApp(serial, m, ws);
       else if (m.op === 'open_url') this.openUrl(serial, m, ws);
       else if (m.op === 'check_account_status') this.checkAccountStatus(serial, m, ws);
+      // Physical device controls (real, deterministic: PhoneDesk button -> here -> adb -> phone).
+      else if (m.op === 'input_key') this.inputKey(serial, m, ws);        // Power/Vol/Back/Home/Recent...
+      else if (m.op === 'input_text') this.inputText(serial, m, ws);      // keyboard text into the focused field
+      else if (m.op === 'screenshot') this.screenshot(serial, m, ws);     // adb screencap -> PNG back to the VA
     });
     ws.addEventListener('close', (e) => {
       clearTimeout(dev.hbStart); clearInterval(dev.hb); clearInterval(dev.ping); dev.online = false;
@@ -1127,6 +1131,59 @@ class AgentCore extends EventEmitter {
       this.emit('log', `open_url (${serial}) user=${uid} -> ${ok ? 'opened' : 'failed'}`);
       this._rpcReply(ws, m, ok ? { ok: true, state: 'opened' } : { ok: false, state: 'launch_failed', error: (out || '').slice(0, 200) });
     } catch (e) { this._rpcReply(ws, m, { ok: false, state: 'launch_failed', error: String((e && e.message) || e) }); }
+  }
+
+  // ===========================================================================================
+  // Physical controls. These are the SAME hardware/nav keys a person would press, sent straight to
+  // the device with `adb ... input`. Device-global (a keyevent is not per-profile), whitelisted so a
+  // request can never inject an arbitrary keycode, and they touch NOTHING about the video stream or
+  // its quality. `ok:true` means adb dispatched the event without error - it is NOT proof the phone
+  // visibly reacted; that is confirmed by watching the stream (spec: PASS = observed on the device).
+  // ===========================================================================================
+  async inputKey(serial, m, ws) {
+    // Only the controls PhoneDesk exposes. Airplane is deliberately absent (toggling it can drop the
+    // phone off the network and needs WRITE_SECURE_SETTINGS - unsafe to do blind).
+    const KEYS = { power: 26, volume_up: 24, volume_down: 25, back: 4, home: 3, recent: 187,
+                   enter: 66, backspace: 67, tab: 61, menu: 82, dpad_up: 19, dpad_down: 20 };
+    const key = String(m.key || '').toLowerCase();
+    const code = KEYS[key];
+    if (code == null) return this._rpcReply(ws, m, { ok: false, state: 'bad_key', error: 'unsupported key: ' + key });
+    try {
+      await this._adbLong(serial, ['shell', 'input', 'keyevent', String(code)], 8000);
+      this.emit('log', `input_key (${serial}) ${key}`);
+      this._rpcReply(ws, m, { ok: true, key });
+    } catch (e) { this._rpcReply(ws, m, { ok: false, state: 'error', error: String((e && e.message) || e) }); }
+  }
+
+  async inputText(serial, m, ws) {
+    const text = String(m.text != null ? m.text : '');
+    if (!text) return this._rpcReply(ws, m, { ok: false, state: 'empty', error: 'no text' });
+    // `input text` wants %s for spaces; backslash-escape the chars the DEVICE shell would otherwise
+    // interpret so they reach `input` literally. ASCII only - unicode needs an IME (out of scope).
+    const enc = text.replace(/ /g, '%s').replace(/(["\\$`&;<>|()*?~#!'])/g, '\\$1');
+    try {
+      await this._adbLong(serial, ['shell', 'input', 'text', enc], 8000);
+      this.emit('log', `input_text (${serial}) ${text.length} chars`);
+      this._rpcReply(ws, m, { ok: true, chars: text.length });
+    } catch (e) { this._rpcReply(ws, m, { ok: false, state: 'error', error: String((e && e.message) || e) }); }
+  }
+
+  /** adb that returns raw bytes (screencap is a PNG, not text) - separate from _adbLong which is utf8. */
+  _adbBinary(serial, args, ms) {
+    return new Promise((resolve, reject) => {
+      execFile(this.adbPath, ['-s', serial, ...args], { encoding: 'buffer', timeout: ms || 15000, maxBuffer: 64 * 1024 * 1024 },
+        (err, stdout, stderr) => { if (err) reject(new Error(String((stderr && stderr.toString()) || (err && err.message) || '').trim())); else resolve(stdout); });
+    });
+  }
+
+  async screenshot(serial, m, ws) {
+    try {
+      // exec-out (not `shell`) so the PNG stream isn't corrupted by CRLF translation.
+      const png = await this._adbBinary(serial, ['exec-out', 'screencap', '-p'], 15000);
+      if (!png || !png.length) return this._rpcReply(ws, m, { ok: false, state: 'error', error: 'empty capture' });
+      this.emit('log', `screenshot (${serial}) ${png.length}B`);
+      this._rpcReply(ws, m, { ok: true, mime: 'image/png', b64: png.toString('base64'), bytes: png.length });
+    } catch (e) { this._rpcReply(ws, m, { ok: false, state: 'error', error: String((e && e.message) || e) }); }
   }
 
   /** Best-effort deep link into Instagram's Account Status. Not an officially documented scheme, so
