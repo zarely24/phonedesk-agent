@@ -12,6 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const instagram = require('./instagram');   // Instagram account-status classifier (pure/testable)
 
 // Electron's main process (Node 20) has no global WebSocket; fall back to the `ws` package.
 const WebSocket = globalThis.WebSocket || require('ws');
@@ -861,6 +862,11 @@ class AgentCore extends EventEmitter {
       else if (m.op === 'create_profiles') this.createProfiles(serial, m.count, m.package, m.name_prefix, ws);
       else if (m.op === 'upload_media') this.uploadMedia(serial, m, ws);   // push photos/videos to the gallery
       else if (m.op === 'set_label') this.setLabel(serial, m);   // dashboard name/order -> owner app
+      // Account monitoring + shortcuts (request/response over this same socket; reply carries request_id).
+      else if (m.op === 'check_apps_installed') this.checkAppsInstalled(serial, m, ws);
+      else if (m.op === 'launch_app') this.launchApp(serial, m, ws);
+      else if (m.op === 'open_url') this.openUrl(serial, m, ws);
+      else if (m.op === 'check_account_status') this.checkAccountStatus(serial, m, ws);
     });
     ws.addEventListener('close', (e) => {
       clearTimeout(dev.hbStart); clearInterval(dev.hb); clearInterval(dev.ping); dev.online = false;
@@ -1041,6 +1047,127 @@ class AgentCore extends EventEmitter {
     sh(['svc', 'data', 'enable']);
     this.emit('log', `switch_user ${id} done`);
     try { ws.send(JSON.stringify({ op: 'meta', data: this._metaPayload(serial) })); } catch {}
+  }
+
+  // ===========================================================================================
+  // Account monitoring + shortcuts (spec §3-22). Request/response over the phone-home socket: the
+  // backend sends an op with a request_id, we do the work and reply with op:'rpc_result'. Every
+  // operation targets an explicit Android user (uid) and NEVER silently falls back to the owner
+  // profile (spec §8). NONE of this touches the video stream/quality (spec §34).
+  // ===========================================================================================
+  _rpcReply(ws, m, obj) {
+    try { ws && ws.readyState === 1 && ws.send(JSON.stringify(Object.assign({ op: 'rpc_result', request_id: m && m.request_id }, obj))); } catch {}
+  }
+  /** adb with a longer timeout + bigger buffer than _adb — uiautomator/pm dumps exceed the 8s cap. */
+  _adbLong(serial, args, ms) {
+    return new Promise((resolve, reject) => {
+      execFile(this.adbPath, ['-s', serial, ...args], { encoding: 'utf8', timeout: ms || 30000, maxBuffer: 12 * 1024 * 1024 },
+        (err, stdout, stderr) => { if (err) reject(new Error(String(stderr || err.message || '').trim())); else resolve(String(stdout || '').trim()); });
+    });
+  }
+  async _userExists(serial, uid) {
+    const out = await this._adbLong(serial, ['shell', 'pm', 'list', 'users'], 8000);
+    return new RegExp('UserInfo\\{' + uid + ':').test(out);        // e.g. "UserInfo{0:Owner:c13} running"
+  }
+  async _pkgInstalledForUser(serial, uid, pkg) {
+    const out = await this._adbLong(serial, ['shell', 'pm', 'list', 'packages', '--user', String(uid), pkg], 10000);
+    return out.split('\n').some((l) => l.trim() === 'package:' + pkg);   // pm can substring-match; require exact
+  }
+  async _resolveLauncher(serial, uid, pkg) {
+    try {
+      const out = await this._adbLong(serial, ['shell', 'cmd', 'package', 'resolve-activity', '--brief', '--user', String(uid), pkg], 8000);
+      const line = out.split('\n').map((s) => s.trim()).filter(Boolean).pop() || '';
+      if (line.includes('/')) return line;                          // com.instagram.android/.activity.MainTabActivity
+    } catch {}
+    return null;
+  }
+  async _uiDump(serial) {
+    await this._adbLong(serial, ['shell', 'uiautomator', 'dump', '/sdcard/pd_ui.xml'], 20000);
+    return this._adbLong(serial, ['shell', 'cat', '/sdcard/pd_ui.xml'], 10000);
+  }
+
+  async checkAppsInstalled(serial, m, ws) {
+    const uid = parseInt(m.uid != null ? m.uid : 0, 10);
+    const packages = Array.isArray(m.packages) ? m.packages : [];
+    try {
+      if (!(await this._userExists(serial, uid))) return this._rpcReply(ws, m, { ok: false, state: 'profile_not_found', error: 'PROFILE_NOT_FOUND' });
+      const installed = {};
+      for (const p of packages) { try { installed[p] = await this._pkgInstalledForUser(serial, uid, p); } catch { installed[p] = false; } }
+      this._rpcReply(ws, m, { ok: true, uid, installed });
+    } catch (e) { this._rpcReply(ws, m, { ok: false, state: 'error', error: String((e && e.message) || e) }); }
+  }
+
+  async launchApp(serial, m, ws) {
+    const uid = parseInt(m.uid != null ? m.uid : 0, 10);
+    const pkg = String(m.package || '');
+    try {
+      if (!pkg) return this._rpcReply(ws, m, { ok: false, state: 'launch_failed', error: 'no package' });
+      if (!(await this._userExists(serial, uid))) return this._rpcReply(ws, m, { ok: false, state: 'profile_not_found', error: 'PROFILE_NOT_FOUND' });
+      if (!(await this._pkgInstalledForUser(serial, uid, pkg))) return this._rpcReply(ws, m, { ok: false, state: 'app_not_installed', error: 'APP_NOT_INSTALLED' });
+      const comp = await this._resolveLauncher(serial, uid, pkg);
+      const out = comp
+        ? await this._adbLong(serial, ['shell', 'am', 'start', '--user', String(uid), '-n', comp], 10000)
+        : await this._adbLong(serial, ['shell', 'monkey', '-p', pkg, '--user', String(uid), '-c', 'android.intent.category.LAUNCHER', '1'], 10000);
+      const ok = !/error|exception|not found|no activities/i.test(out || '');
+      this.emit('log', `launch_app (${serial}) user=${uid} ${pkg} -> ${ok ? 'opened' : 'failed'}`);
+      this._rpcReply(ws, m, ok ? { ok: true, state: 'opened' } : { ok: false, state: 'launch_failed', error: (out || '').slice(0, 200) });
+    } catch (e) { this._rpcReply(ws, m, { ok: false, state: 'launch_failed', error: String((e && e.message) || e) }); }
+  }
+
+  async openUrl(serial, m, ws) {
+    const uid = parseInt(m.uid != null ? m.uid : 0, 10);
+    const url = String(m.url || '');
+    try {
+      if (!/^https?:\/\//i.test(url)) return this._rpcReply(ws, m, { ok: false, state: 'launch_failed', error: 'invalid url' });
+      if (!(await this._userExists(serial, uid))) return this._rpcReply(ws, m, { ok: false, state: 'profile_not_found', error: 'PROFILE_NOT_FOUND' });
+      // Opens in the profile's default browser (its existing logged-in session). We never touch
+      // cookies/credentials (spec §7).
+      const out = await this._adbLong(serial, ['shell', 'am', 'start', '-a', 'android.intent.action.VIEW', '-d', url, '--user', String(uid)], 10000);
+      const ok = !/error|exception|no activities|unable/i.test(out || '');
+      this.emit('log', `open_url (${serial}) user=${uid} -> ${ok ? 'opened' : 'failed'}`);
+      this._rpcReply(ws, m, ok ? { ok: true, state: 'opened' } : { ok: false, state: 'launch_failed', error: (out || '').slice(0, 200) });
+    } catch (e) { this._rpcReply(ws, m, { ok: false, state: 'launch_failed', error: String((e && e.message) || e) }); }
+  }
+
+  /** Best-effort deep link into Instagram's Account Status. Not an officially documented scheme, so
+      failure is normal — the classifier then returns UNKNOWN rather than guess (spec §21). Real-phone
+      tuning may replace this with resource-id/text taps (Profile -> menu -> Account Status). */
+  async _navigateAccountStatus(serial, uid) {
+    try { await this._adbLong(serial, ['shell', 'am', 'start', '-a', 'android.intent.action.VIEW', '-d', 'instagram://account_status', '--user', String(uid)], 8000); } catch {}
+  }
+
+  async checkAccountStatus(serial, m, ws) {
+    const uid = parseInt(m.uid != null ? m.uid : 0, 10);
+    const pkg = String(m.package || 'com.instagram.android');
+    if (!this._checking) this._checking = new Set();
+    // One status check per physical phone at a time (spec §27) — never two navigating the same device.
+    if (this._checking.has(serial)) return this._rpcReply(ws, m, { ok: false, state: 'device_busy', status: 'UNKNOWN', error: 'another check in progress' });
+    this._checking.add(serial);
+    const started = Date.now();
+    try {
+      if (!(await this._userExists(serial, uid))) return this._rpcReply(ws, m, { ok: false, status: 'PROFILE_UNAVAILABLE', error: 'PROFILE_NOT_FOUND' });
+      if (!(await this._pkgInstalledForUser(serial, uid, pkg))) return this._rpcReply(ws, m, { ok: false, status: 'APP_ERROR', error: 'instagram not installed for this profile' });
+      // Foreground Instagram for THIS profile (never the owner) then read the UI hierarchy.
+      const comp = await this._resolveLauncher(serial, uid, pkg);
+      if (comp) { try { await this._adbLong(serial, ['shell', 'am', 'start', '--user', String(uid), '-n', comp], 10000); } catch {} }
+      await new Promise((r) => setTimeout(r, 2500));               // let the UI settle
+      let xml = ''; try { xml = await this._uiDump(serial); } catch { xml = ''; }
+      let r = instagram.classify(xml);
+      // Logged in but the recommendation status isn't on screen yet — try Account Status once.
+      if (r.status === 'UNKNOWN' && r.loggedInHome) {
+        try {
+          await this._navigateAccountStatus(serial, uid);
+          await new Promise((res) => setTimeout(res, 2000));
+          const r2 = instagram.classify(await this._uiDump(serial));
+          if (r2.status !== 'UNKNOWN') r = r2;
+        } catch {}
+      }
+      const dur = ((Date.now() - started) / 1000).toFixed(1);
+      this.emit('log', `check_account_status (${serial}) user=${uid} -> ${r.status} conf=${r.confidence} in ${dur}s`);
+      this._rpcReply(ws, m, { ok: true, status: r.status, confidence: r.confidence, evidence: r.evidence, reason: (r.evidence && r.evidence[0]) || r.status });
+    } catch (e) {
+      this._rpcReply(ws, m, { ok: false, status: 'APP_ERROR', error: String((e && e.message) || e) });
+    } finally { this._checking.delete(serial); }
   }
 
   /** Rename a profile: try on the phone itself (newer Androids); remember the name here if it refuses. */
