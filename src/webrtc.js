@@ -112,8 +112,11 @@ function startCapture(adbPath, serial, profile, cbs) {
 
 async function open(agent, ws, serial, msg) {
   // Agent-side safety flags (defense in depth; the backend also gates via WEBRTC_DEVICE_IDS):
-  // WEBRTC_ENABLED=false disables it entirely; WEBRTC_TEST_DEVICE pins WebRTC to ONE phone's serial.
-  if (String(process.env.WEBRTC_ENABLED).toLowerCase() === 'false') { log(agent, 'WEBRTC_ENABLED=false — ignoring open_webrtc'); return; }
+  // WebRTC is OPT-IN and dormant by default — it runs ONLY when WEBRTC_ENABLED is explicitly
+  // truthy (1/true/yes/on). Absent or anything else => dormant (spec: WebRTC OFF by default).
+  // WEBRTC_TEST_DEVICE then pins WebRTC to ONE phone's serial.
+  const enabled = /^(1|true|yes|on)$/i.test(String(process.env.WEBRTC_ENABLED || '').trim());
+  if (!enabled) { log(agent, 'WEBRTC disabled by default (WEBRTC_ENABLED not set truthy) — ignoring open_webrtc'); return; }
   const testSerial = process.env.WEBRTC_TEST_DEVICE || '';
   if (testSerial && serial !== testSerial) { log(agent, `open_webrtc for ${serial} ignored — not the test device (${testSerial})`); return; }
   if (!werift) { try { werift = require('werift'); } catch (e) { log(agent, 'werift not installed — run `npm i werift`'); return; } }
