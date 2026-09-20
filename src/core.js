@@ -873,10 +873,18 @@ class AgentCore extends EventEmitter {
       else if (m.op === 'screenshot') this.screenshot(serial, m, ws);     // adb screencap -> PNG back to the VA
       // WebRTC video (POC, per-device flag on the backend). Signaling only rides this socket; SRTP
       // media goes agent <-> (coturn) <-> browser directly. See src/webrtc.js.
-      else if (m.op === 'open_webrtc') require('./webrtc').open(this, ws, serial, m);
-      else if (m.op === 'rtc_answer') require('./webrtc').answer(this, m);
-      else if (m.op === 'rtc_ice') require('./webrtc').ice(this, m);
-      else if (m.op === 'close_webrtc') require('./webrtc').close(this, m);
+      else if (m.op === 'open_webrtc' || m.op === 'rtc_answer' || m.op === 'rtc_ice' || m.op === 'close_webrtc') {
+        // Isolated: any error loading/handling WebRTC stays here — never breaks the agent, other
+        // phones, or legacy streaming (spec §5). WebRTC is off by default; this only runs for the
+        // opt-in test device the backend allows.
+        try {
+          const wrtc = require('./webrtc');
+          if (m.op === 'open_webrtc') wrtc.open(this, ws, serial, m);
+          else if (m.op === 'rtc_answer') wrtc.answer(this, m);
+          else if (m.op === 'rtc_ice') wrtc.ice(this, m);
+          else wrtc.close(this, m);
+        } catch (e) { this.emit('log', '[webrtc] dispatch error (isolated): ' + (e && e.message)); }
+      }
     });
     ws.addEventListener('close', (e) => {
       clearTimeout(dev.hbStart); clearInterval(dev.hb); clearInterval(dev.ping); dev.online = false;

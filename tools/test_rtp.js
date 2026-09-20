@@ -74,4 +74,39 @@ function annexb(nals, fourByte) { const sc = fourByte ? Buffer.from([0, 0, 0, 1]
   ok('all share the frame timestamp', pkts.every((p) => p.readUInt32BE(4) === 12345));
 })();
 
-console.log(`\nPASSED ✅  (${passed} checks) — H.264 NAL parse + RTP packetization`);
+// ---- 5. malformed / edge input (parser must never throw) ----
+(() => {
+  ok('empty buffer -> []', parseAnnexB(Buffer.alloc(0)).length === 0);
+  ok('no start code -> []', parseAnnexB(Buffer.from([1, 2, 3, 4, 5])).length === 0);
+  ok('start code only -> []', parseAnnexB(Buffer.from([0, 0, 0, 1])).length === 0);
+  ok('trailing start code ignored', parseAnnexB(Buffer.concat([annexb([nal(NAL.NON_IDR, 20)], true), Buffer.from([0, 0, 1])])).length === 1);
+  ok('two IDRs back to back', parseAnnexB(annexb([nal(NAL.IDR, 100), nal(NAL.IDR, 100)], true)).length === 2);
+  const pk = new RtpH264Packetizer({ payloadType: 96 });
+  ok('packetize([]) -> []', pk.packetize([], 0).length === 0);
+  ok('1-byte NAL packetizes', pk.packetize([Buffer.from([0x65])], 0).length === 1);
+})();
+
+// ---- 6. mock WebRTC session lifecycle: creation / isolation / cleanup / idempotency (spec §5,§6,§10)
+(() => {
+  const webrtc = require('../src/webrtc');
+  const agent = { emit() {} };
+  function mockSession(id) {
+    const rec = { pcClosed: 0, capStopped: 0 };
+    webrtc.sessions.set(id, { pc: { close() { rec.pcClosed++; } }, capture: { stop() { rec.capStopped++; } }, stats: { rtp: 3, keyframes: 1 } });
+    return rec;
+  }
+  const a = mockSession('sessA'); const b = mockSession('sessB');
+  ok('two sessions coexist', webrtc.sessions.size >= 2);
+  webrtc.close(agent, { session_id: 'sessA' });
+  ok('close(A): pc closed + capture stopped', a.pcClosed === 1 && a.capStopped === 1);
+  ok('close(A): session A removed', !webrtc.sessions.has('sessA'));
+  ok('ISOLATION: session B untouched', webrtc.sessions.has('sessB') && b.pcClosed === 0);
+  webrtc.close(agent, { session_id: 'sessA' });     // idempotent
+  ok('close(A) again is a no-op (no throw)', a.pcClosed === 1);
+  webrtc.close(agent, { session_id: 'does-not-exist' });
+  ok('close(unknown) is safe', true);
+  webrtc.close(agent, { session_id: 'sessB' });
+  ok('cleanup B', !webrtc.sessions.has('sessB') && b.pcClosed === 1);
+})();
+
+console.log(`\nPASSED ✅  (${passed} checks) — H.264 NAL parse + RTP packetization + malformed + session lifecycle`);

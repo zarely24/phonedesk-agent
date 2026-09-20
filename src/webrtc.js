@@ -117,8 +117,20 @@ async function open(agent, ws, serial, msg) {
   const testSerial = process.env.WEBRTC_TEST_DEVICE || '';
   if (testSerial && serial !== testSerial) { log(agent, `open_webrtc for ${serial} ignored — not the test device (${testSerial})`); return; }
   if (!werift) { try { werift = require('werift'); } catch (e) { log(agent, 'werift not installed — run `npm i werift`'); return; } }
+  const sessionId = msg && msg.session_id;
+  if (!sessionId) return;
+  try {
+    await _open(agent, ws, serial, msg, sessionId);
+  } catch (e) {
+    // FAILURE ISOLATION (spec §5): a broken WebRTC session must never crash the agent or touch
+    // another phone. Clean up whatever we created and stop — the browser falls back to legacy.
+    log(agent, `open_webrtc session=${sessionId} FAILED, isolated: ${e && e.message}`);
+    try { close(agent, { session_id: sessionId }); } catch (e2) {}
+  }
+}
+
+async function _open(agent, ws, serial, msg, sessionId) {
   const { RTCPeerConnection, MediaStreamTrack } = werift;
-  const sessionId = msg.session_id;
   const iceServers = (msg.iceServers || []).map((s) => ({ urls: s.urls, username: s.username, credential: s.credential }));
   const pc = new RTCPeerConnection({ iceServers, codecs: { video: [new werift.RTCRtpCodecParameters({ mimeType: 'video/H264', clockRate: 90000, rtcpFeedback: [{ type: 'nack' }, { type: 'nack', parameter: 'pli' }] })] } });
 
@@ -144,12 +156,19 @@ async function open(agent, ws, serial, msg) {
       for (const pkt of packets) { try { track.writeRtp(pkt); stats.rtp++; stats.bytes += pkt.length; } catch (e) {} }
       stats.nals += nals.length; if (keyframe) stats.keyframes++;
     },
-    onError(e) { log(agent, `session ${sessionId} capture error: ${e.message}`); },
+    onError(e) {
+      log(agent, `session ${sessionId} capture error: ${e && e.message}`);
+      // Isolated teardown: scrcpy/socket died -> close this session only; browser falls back to legacy.
+      try { close(agent, { session_id: sessionId }); } catch (e2) {}
+    },
   });
 
   pc.onIceCandidate.subscribe((c) => { if (c) sendSig(ws, { op: 'rtc_ice', session_id: sessionId, candidate: c }); });
   pc.iceConnectionStateChange.subscribe((s) => log(agent, `session ${sessionId} ice=${s}`));
-  pc.connectionStateChange.subscribe((s) => log(agent, `session ${sessionId} pc=${s}`));
+  pc.connectionStateChange.subscribe((s) => {
+    log(agent, `session ${sessionId} pc=${s}`);
+    if (s === 'failed' || s === 'closed' || s === 'disconnected') { try { close(agent, { session_id: sessionId }); } catch (e) {} }
+  });
 
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
