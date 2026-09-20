@@ -871,6 +871,12 @@ class AgentCore extends EventEmitter {
       else if (m.op === 'input_key') this.inputKey(serial, m, ws);        // Power/Vol/Back/Home/Recent...
       else if (m.op === 'input_text') this.inputText(serial, m, ws);      // keyboard text into the focused field
       else if (m.op === 'screenshot') this.screenshot(serial, m, ws);     // adb screencap -> PNG back to the VA
+      // WebRTC video (POC, per-device flag on the backend). Signaling only rides this socket; SRTP
+      // media goes agent <-> (coturn) <-> browser directly. See src/webrtc.js.
+      else if (m.op === 'open_webrtc') require('./webrtc').open(this, ws, serial, m);
+      else if (m.op === 'rtc_answer') require('./webrtc').answer(this, m);
+      else if (m.op === 'rtc_ice') require('./webrtc').ice(this, m);
+      else if (m.op === 'close_webrtc') require('./webrtc').close(this, m);
     });
     ws.addEventListener('close', (e) => {
       clearTimeout(dev.hbStart); clearInterval(dev.hb); clearInterval(dev.ping); dev.online = false;
