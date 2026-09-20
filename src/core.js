@@ -871,6 +871,8 @@ class AgentCore extends EventEmitter {
       else if (m.op === 'input_key') this.inputKey(serial, m, ws);        // Power/Vol/Back/Home/Recent...
       else if (m.op === 'input_text') this.inputText(serial, m, ws);      // keyboard text into the focused field
       else if (m.op === 'screenshot') this.screenshot(serial, m, ws);     // adb screencap -> PNG back to the VA
+      else if (m.op === 'input_tap') this.inputTap(serial, m, ws);        // tap at device coords (WebRTC video)
+      else if (m.op === 'input_swipe') this.inputSwipe(serial, m, ws);    // swipe/drag/scroll at device coords
       // WebRTC video (POC, per-device flag on the backend). Signaling only rides this socket; SRTP
       // media goes agent <-> (coturn) <-> browser directly. See src/webrtc.js.
       else if (m.op === 'open_webrtc' || m.op === 'rtc_answer' || m.op === 'rtc_ice' || m.op === 'close_webrtc') {
@@ -1167,6 +1169,22 @@ class AgentCore extends EventEmitter {
       this.emit('log', `input_key (${serial}) ${key}`);
       this._rpcReply(ws, m, { ok: true, key });
     } catch (e) { this._rpcReply(ws, m, { ok: false, state: 'error', error: String((e && e.message) || e) }); }
+  }
+
+  // Coordinate input for the WebRTC video (the legacy path taps via ws-scrcpy inside the iframe;
+  // the WebRTC <video> maps the click on the browser side and sends DEVICE coords here). Device-global.
+  async inputTap(serial, m, ws) {
+    const x = Math.round(m.x), y = Math.round(m.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return this._rpcReply(ws, m, { ok: false, error: 'bad coords' });
+    try { await this._adbLong(serial, ['shell', 'input', 'tap', String(x), String(y)], 8000); this._rpcReply(ws, m, { ok: true }); }
+    catch (e) { this._rpcReply(ws, m, { ok: false, error: String((e && e.message) || e) }); }
+  }
+  async inputSwipe(serial, m, ws) {
+    const a = [m.x1, m.y1, m.x2, m.y2].map((v) => Math.round(v));
+    if (a.some((v) => !Number.isFinite(v))) return this._rpcReply(ws, m, { ok: false, error: 'bad coords' });
+    const dur = Math.max(10, Math.min(3000, Math.round(m.dur || 150)));   // ms; scroll/drag use longer
+    try { await this._adbLong(serial, ['shell', 'input', 'swipe', ...a.map(String), String(dur)], 8000); this._rpcReply(ws, m, { ok: true }); }
+    catch (e) { this._rpcReply(ws, m, { ok: false, error: String((e && e.message) || e) }); }
   }
 
   async inputText(serial, m, ws) {
