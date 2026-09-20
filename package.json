@@ -9,6 +9,8 @@
     "start": "electron .",
     "dev": "electron .",
     "core": "node agent.js",
+    "webrtc-diagnose": "node tools/webrtc-diagnose.js",
+    "test:rtp": "node tools/test_rtp.js",
     "dist:win": "electron-builder --win",
     "dist:mac": "electron-builder --mac"
   },
