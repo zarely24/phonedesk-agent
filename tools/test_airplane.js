@@ -34,6 +34,7 @@ async function run() {
       if (cmd.includes('airplane-mode enable')) { air = '1'; return ''; }
       if (cmd.includes('airplane-mode disable')) { air = '0'; return ''; }
       if (cmd.includes('settings get global airplane_mode_on')) return air;
+      if (cmd.includes('telephony.registry')) return 'mDataConnectionState=2';   // DATA_CONNECTED
       if (cmd.includes('ping')) return PING_OK;
       return '';
     });
@@ -42,7 +43,32 @@ async function run() {
     ok(/Profile switch: PASS/.test(L), 'happy: Profile switch PASS');
     ok(/Airplane ON: PASS/.test(L), 'happy: Airplane ON PASS');
     ok(/Airplane OFF: PASS/.test(L), 'happy: Airplane OFF PASS');
-    ok(/Mobile network recovery: PASS/.test(L), 'happy: network recovery PASS');
+    ok(/Mobile network recovery: PASS \(android\)/.test(L), 'happy: network recovery PASS via Android signal');
+  }
+
+  // 1b) ICMP blocked but mobile data IS connected -> still PASS via the Android telephony signal.
+  {
+    const core = makeCore((cmd) => {
+      if (cmd.includes('get-current-user')) return '5';
+      if (cmd.includes('settings get global airplane_mode_on')) return cmd.includes('enable') ? '1' : '0';
+      if (cmd.includes('telephony.registry')) return 'blah\n  mDataConnectionState = 2\n';
+      if (cmd.includes('ping')) return 'connect: Network is unreachable';   // ICMP blocked
+      return '';
+    });
+    // airplane_mode_on read returns based on last set; simplify: return '1' after enable, '0' after disable
+    let air2 = '0';
+    core._adbLong = (serial, args, ms) => {
+      const cmd = args.join(' '); core.__calls.push(cmd);
+      if (cmd.includes('airplane-mode enable')) air2 = '1';
+      if (cmd.includes('airplane-mode disable')) air2 = '0';
+      if (cmd.includes('settings get global airplane_mode_on')) return Promise.resolve(air2);
+      if (cmd.includes('get-current-user')) return Promise.resolve('5');
+      if (cmd.includes('telephony.registry')) return Promise.resolve('mDataConnectionState=2');
+      if (cmd.includes('ping')) return Promise.resolve('connect: Network is unreachable');
+      return Promise.resolve('');
+    };
+    await core.switchUser('SER1b', 5, { send: () => {} });
+    ok(/Mobile network recovery: PASS \(android\)/.test(core.__logs.join(' | ')), 'icmp-blocked: PASS via Android signal despite ping failing');
   }
 
   // 2) Profile switch FAILED -> airplane cycle skipped, NO airplane/data commands sent.
@@ -71,12 +97,18 @@ async function run() {
   // 4) Network never recovers -> _waitForNetwork returns false and respects its deadline.
   {
     realTimers();  // real clock for the timeout window
-    const core = makeCore((cmd) => cmd.includes('ping') ? 'connect: Network is unreachable' : '');
+    // No Android data (state != 2) AND ping fails -> no signal.
+    const core = makeCore((cmd) => cmd.includes('telephony.registry') ? 'mDataConnectionState=0' : (cmd.includes('ping') ? 'unreachable' : ''));
     const t0 = Date.now();
     const res = await core._waitForNetwork('SER4', 250);
     instantTimers();
-    ok(res === false, 'network-fail: _waitForNetwork returns false when ping fails');
+    ok(!res, 'network-fail: _waitForNetwork returns "" when neither signal confirms');
     ok(Date.now() - t0 >= 200, 'network-fail: honored the timeout window');
+    // And _networkUp prefers the Android signal when present.
+    const up = makeCore((cmd) => cmd.includes('telephony.registry') ? 'mDataConnectionState=2' : '');
+    ok(await up._networkUp('S') === 'android', 'networkUp: Android telephony state=2 -> "android"');
+    const pingOnly = makeCore((cmd) => cmd.includes('telephony.registry') ? 'mDataConnectionState=1' : (cmd.includes('ping') ? PING_OK : ''));
+    ok(await pingOnly._networkUp('S') === 'ping', 'networkUp: falls back to ping when telephony not connected');
   }
 
   // 5) Failure isolation — adb throws for this phone; switchUser must not throw (other phones unaffected).

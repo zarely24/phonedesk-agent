@@ -1084,7 +1084,7 @@ class AgentCore extends EventEmitter {
         await this._adbLong(serial, ['shell', 'svc', 'data', 'enable'], 6000).catch(() => {});
         // 4) Wait for the mobile network to actually come back (a reachability probe, no IP logged).
         R.network = await this._waitForNetwork(serial, 14000);
-        log(`Mobile network recovery: ${R.network ? 'PASS' : 'FAIL'}`);
+        log(`Mobile network recovery: ${R.network ? 'PASS (' + R.network + ')' : 'FAIL'}`);
       }
     } catch (e) {
       log(`switch_user isolated error: ${(e && e.message) || e}`);
@@ -1110,17 +1110,34 @@ class AgentCore extends EventEmitter {
     return null;
   }
 
-  /** Poll until the phone can reach the internet again (data recovered) or the deadline passes. A plain
-      reachability probe to a public resolver — the output is never logged, so no IP/network detail leaks. */
+  /** Is the phone's mobile data back after the airplane cycle? Returns which signal confirmed it
+      ('android' | 'ping') or '' if not yet.
+      PRIMARY: Android's own telephony data-connection state (mDataConnectionState=2 == CONNECTED). This
+      is a direct mobile-data signal and works even on networks that block ICMP. SECONDARY: an actual
+      reachability probe, which proves the data path end-to-end. We accept EITHER, and report which — so
+      an ICMP-blocked-but-working network still passes on the Android signal. No IP/network detail is
+      logged (only which signal, and only the state number is read). */
+  async _networkUp(serial) {
+    try {
+      const t = await this._adbLong(serial, ['shell', 'dumpsys', 'telephony.registry'], 6000).catch(() => '');
+      const m = t.match(/mDataConnectionState\s*=\s*(\d+)/);
+      if (m && m[1] === '2') return 'android';   // 2 = DATA_CONNECTED
+    } catch (e) {}
+    const r = await this._adbLong(serial, ['shell', 'ping', '-c', '1', '-W', '2', '8.8.8.8'], 5000).catch(() => '');
+    if (/0% packet loss|bytes from|1 (packets )?received/i.test(r)) return 'ping';
+    return '';
+  }
+
+  /** Poll _networkUp until data recovers or the deadline passes; returns the confirming signal or ''. */
   async _waitForNetwork(serial, timeoutMs) {
     const wait = (ms) => new Promise((r) => setTimeout(r, ms));
     const deadline = Date.now() + (timeoutMs || 12000);
     while (Date.now() < deadline) {
-      const r = await this._adbLong(serial, ['shell', 'ping', '-c', '1', '-W', '2', '8.8.8.8'], 5000).catch(() => '');
-      if (/0% packet loss|bytes from|1 (packets )?received/i.test(r)) return true;
+      const s = await this._networkUp(serial);
+      if (s) return s;
       await wait(2000);
     }
-    return false;
+    return '';
   }
 
   // ===========================================================================================
