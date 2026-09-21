@@ -1047,26 +1047,80 @@ class AgentCore extends EventEmitter {
     this.emit('log', `stream ${streamId.slice(0, 8)} (${serial}) -> ?${q.slice(0, 56)}`);
   }
 
-  /** Switch the phone's active Android user (profile), then cycle airplane mode -> fresh mobile IP. */
+  /** Switch the phone's active Android user (profile), then VERIFY each step of the airplane cycle
+      that gives the profile a fresh mobile IP (v0.5.2). Everything here is ASYNC (`_adbLong`) so the
+      single-event-loop video relay is never frozen — a slow/failing phone can't stall the others, and
+      the whole thing is wrapped so one phone's error is isolated. Honest PASS/FAIL logs; the airplane
+      cycle is SKIPPED if the profile switch itself didn't take. No IPs or network details are logged. */
   async switchUser(serial, userId, ws) {
     const id = parseInt(userId, 10);
     if (isNaN(id) || !serial) return;
-    const sh = (args) => { try { return this._adb(['-s', serial, 'shell', ...args]); } catch (e) { this.emit('log', `adb ${args.join(' ')}: ${(e && e.message) || e}`); return ''; } };
+    const log = (m) => this.emit('log', `[switch ${serial}->${id}] ${m}`);
     const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-    const airplane = (on) => {
-      const r = sh(['cmd', 'connectivity', 'airplane-mode', on ? 'enable' : 'disable']);   // Android 11+
-      if (/unknown|error|not found|usage/i.test(r)) {                                       // older fallback
-        sh(['settings', 'put', 'global', 'airplane_mode_on', on ? '1' : '0']);
-        sh(['am', 'broadcast', '-a', 'android.intent.action.AIRPLANE_MODE', '--ez', 'state', on ? 'true' : 'false']);
+    const R = { user_switch: false, airplane_on: null, airplane_off: false, network: false };
+    try {
+      // 1) Switch the Android user, then confirm it actually took.
+      await this._adbLong(serial, ['shell', 'am', 'switch-user', String(id)], 12000).catch(() => {});
+      await wait(2500);
+      const cur = (await this._adbLong(serial, ['shell', 'am', 'get-current-user'], 6000).catch(() => '')).trim();
+      R.user_switch = cur === String(id);
+      log(`Profile switch: ${R.user_switch ? 'PASS' : 'FAIL'}`);
+      if (!R.user_switch) {
+        // Do NOT toggle airplane mode if the profile switch failed — that would drop the network for
+        // no reason on a phone that's still on the wrong profile.
+        log('Airplane cycle: SKIPPED (profile switch did not complete)');
+      } else {
+        // 2) Airplane ON, then verify the setting actually flipped.
+        await this._setAirplane(serial, true);
+        await wait(1500);
+        R.airplane_on = await this._airplaneOn(serial);
+        log(`Airplane ON: ${R.airplane_on === true ? 'PASS' : R.airplane_on === false ? 'FAIL' : 'UNKNOWN'}`);
+        await wait(4000);
+        // 3) Airplane OFF, verify, and re-enable mobile data.
+        await this._setAirplane(serial, false);
+        await wait(1500);
+        R.airplane_off = (await this._airplaneOn(serial)) === false;
+        log(`Airplane OFF: ${R.airplane_off ? 'PASS' : 'FAIL'}`);
+        await this._adbLong(serial, ['shell', 'svc', 'data', 'enable'], 6000).catch(() => {});
+        // 4) Wait for the mobile network to actually come back (a reachability probe, no IP logged).
+        R.network = await this._waitForNetwork(serial, 14000);
+        log(`Mobile network recovery: ${R.network ? 'PASS' : 'FAIL'}`);
       }
-    };
-    this.emit('log', `switch_user (${serial}) -> ${id} (+ airplane cycle for a fresh IP)`);
-    sh(['am', 'switch-user', String(id)]);
-    airplane(true); await wait(4000);
-    airplane(false); await wait(4000);
-    sh(['svc', 'data', 'enable']);
-    this.emit('log', `switch_user ${id} done`);
+    } catch (e) {
+      log(`switch_user isolated error: ${(e && e.message) || e}`);
+    }
     try { ws.send(JSON.stringify({ op: 'meta', data: this._metaPayload(serial) })); } catch {}
+  }
+
+  /** Set airplane mode on/off. Android 11+ path first; older devices get the settings+broadcast
+      fallback. Async so it never blocks the video relay. */
+  async _setAirplane(serial, on) {
+    const r = await this._adbLong(serial, ['shell', 'cmd', 'connectivity', 'airplane-mode', on ? 'enable' : 'disable'], 6000).catch(() => 'err');
+    if (/unknown|error|not found|usage|exception/i.test(r)) {
+      await this._adbLong(serial, ['shell', 'settings', 'put', 'global', 'airplane_mode_on', on ? '1' : '0'], 6000).catch(() => {});
+      await this._adbLong(serial, ['shell', 'am', 'broadcast', '-a', 'android.intent.action.AIRPLANE_MODE', '--ez', 'state', on ? 'true' : 'false'], 6000).catch(() => {});
+    }
+  }
+
+  /** true = airplane on, false = off, null = couldn't read. Reads the global setting (source of truth). */
+  async _airplaneOn(serial) {
+    const v = (await this._adbLong(serial, ['shell', 'settings', 'get', 'global', 'airplane_mode_on'], 5000).catch(() => '')).trim();
+    if (v === '1') return true;
+    if (v === '0') return false;
+    return null;
+  }
+
+  /** Poll until the phone can reach the internet again (data recovered) or the deadline passes. A plain
+      reachability probe to a public resolver — the output is never logged, so no IP/network detail leaks. */
+  async _waitForNetwork(serial, timeoutMs) {
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    const deadline = Date.now() + (timeoutMs || 12000);
+    while (Date.now() < deadline) {
+      const r = await this._adbLong(serial, ['shell', 'ping', '-c', '1', '-W', '2', '8.8.8.8'], 5000).catch(() => '');
+      if (/0% packet loss|bytes from|1 (packets )?received/i.test(r)) return true;
+      await wait(2000);
+    }
+    return false;
   }
 
   // ===========================================================================================

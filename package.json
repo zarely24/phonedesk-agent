@@ -12,7 +12,8 @@
     "webrtc-diagnose": "node tools/webrtc-diagnose.js",
     "test:rtp": "node tools/test_rtp.js",
     "dist:win": "electron-builder --win",
-    "dist:mac": "electron-builder --mac"
+    "dist:mac": "electron-builder --mac",
+    "test:airplane": "node tools/test_airplane.js"
   },
   "dependencies": {
     "electron-updater": "^6.8.9",
