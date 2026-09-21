@@ -1,14 +1,23 @@
 'use strict';
-// Fixture tests for the Instagram classifier (spec §29). No phone required: each fixture is a
-// sanitized `uiautomator dump` snippet for a known state, and we assert the normalized status.
-// When Instagram changes its UI, update a fixture here and re-run — no device needed.
+// Fixture tests for the Instagram classifier (spec §29). No phone required.
+//
+// TWO sources of fixtures:
+//  1) SYNTHETIC (inline below): tiny hand-written uiautomator snippets that exercise each matcher and
+//     the "never guess HEALTHY" invariants. They test the classifier LOGIC, not real Instagram — the
+//     text/resource-ids here are PROVISIONAL and must be validated against a real device in Phase 1.
+//  2) REAL (tools/fixtures/instagram/*.xml + expected.json): sanitized dumps captured from an actual
+//     phone. This directory is the Phase-1 drop point; the loader picks them up automatically. It is
+//     intentionally empty of real signatures now (we do not invent Instagram IDs/text we haven't seen).
+//
+// Run: node tools/test_instagram.js
+const fs = require('fs');
+const path = require('path');
 const { classify } = require('../src/instagram');
 
-// Minimal but representative uiautomator XML. Real dumps are far larger/nested; the classifier
-// only scrapes text=/content-desc=/resource-id=, so these exercise the same matchers.
 const node = (attrs) => `<node ${Object.entries(attrs).map(([k, v]) => `${k}="${v}"`).join(' ')} />`;
 const wrap = (nodes) => `<?xml version='1.0'?><hierarchy rotation="0">${nodes.join('')}</hierarchy>`;
 
+// ---- SYNTHETIC fixtures (provisional signatures — validate on real device in Phase 1) ----
 const FIX = {
   HEALTHY: wrap([
     node({ 'resource-id': 'com.instagram.android:id/action_bar_title', text: 'Account Status' }),
@@ -42,13 +51,29 @@ const FIX = {
     node({ text: "Instagram isn't responding" }),
     node({ text: 'Close app' }), node({ text: 'Wait' }),
   ]),
-  // Logged-in home: NOT enough to prove recommendation status -> UNKNOWN + loggedInHome:true
+  // Logged-in home: NOT enough to prove recommendation status -> UNKNOWN + loggedInHome:true.
   LOGGED_IN_HOME: wrap([
     node({ 'resource-id': 'com.instagram.android:id/tab_bar' }),
     node({ 'content-desc': 'Home' }), node({ 'content-desc': 'Reels' }),
     node({ 'content-desc': 'Search and explore' }), node({ 'content-desc': 'Your profile' }),
     node({ 'content-desc': 'New post' }),
   ]),
+  // ---- "never HEALTHY accidentally" edge cases ----
+  // Home feed that happens to contain the word "recommended" (Suggested-for-you etc.) but is NOT the
+  // Account Status surface -> must NOT be HEALTHY.
+  HOME_WITH_RECOMMENDED_WORD: wrap([
+    node({ 'resource-id': 'com.instagram.android:id/tab_bar' }),
+    node({ 'content-desc': 'Home' }), node({ 'content-desc': 'Your profile' }),
+    node({ text: 'Suggested for you' }), node({ text: 'Recommended accounts' }),
+    node({ text: 'Follow' }), node({ text: 'Reels' }),
+  ]),
+  // On the Account Status surface but with no clear good/bad wording -> UNKNOWN, never HEALTHY.
+  ACCOUNT_STATUS_AMBIGUOUS: wrap([
+    node({ 'resource-id': 'com.instagram.android:id/action_bar_title', text: 'Account Status' }),
+    node({ text: 'Overview' }), node({ text: 'Loading' }),
+  ]),
+  // Just the words "Log in" with no credential field / id -> not enough for LOGIN_REQUIRED.
+  LOGIN_WORD_ONLY: wrap([node({ text: 'Log in with Facebook' }), node({ text: 'Terms' })]),
   UNKNOWN: wrap([node({ text: 'Something completely different' })]),
   EMPTY: '',
 };
@@ -61,22 +86,49 @@ const cases = [
   ['SUSPENDED', 'SUSPENDED', false],
   ['DISABLED', 'DISABLED', false],
   ['APP_ERROR', 'APP_ERROR', false],
-  ['LOGGED_IN_HOME', 'UNKNOWN', true],   // logged in, but account status not read
+  ['LOGGED_IN_HOME', 'UNKNOWN', true],
+  ['HOME_WITH_RECOMMENDED_WORD', 'UNKNOWN', true],   // <- must not be HEALTHY
+  ['ACCOUNT_STATUS_AMBIGUOUS', 'UNKNOWN', false],    // <- on page but unclear -> UNKNOWN
+  ['LOGIN_WORD_ONLY', 'UNKNOWN', false],
   ['UNKNOWN', 'UNKNOWN', false],
   ['EMPTY', 'UNKNOWN', false],
 ];
 
-let fails = 0;
+let fails = 0, ran = 0;
+const check = (name, ok, detail) => { ran++; if (!ok) fails++; console.log((ok ? '  ok   ' : '  FAIL ') + name + (detail ? '  ' + detail : '')); };
+
+console.log('SYNTHETIC fixtures:');
 for (const [fixture, wantStatus, wantHome] of cases) {
   const r = classify(FIX[fixture]);
   const ok = r.status === wantStatus && (!!r.loggedInHome === wantHome);
-  console.log((ok ? '  ok  ' : '  FAIL') + '  ' + fixture + ' -> ' + r.status +
-    (r.loggedInHome ? ' (loggedInHome)' : '') + '  conf=' + r.confidence +
-    (ok ? '' : `   [wanted ${wantStatus}${wantHome ? ' +home' : ''}]`));
-  if (!ok) fails++;
+  check(`${fixture} -> ${r.status}${r.loggedInHome ? ' (home)' : ''}`, ok, ok ? '' : `[wanted ${wantStatus}${wantHome ? '+home' : ''}]`);
 }
-// Never-guess-HEALTHY invariant: a logged-in home must NOT classify as HEALTHY on its own.
-if (classify(FIX.LOGGED_IN_HOME).status === 'HEALTHY') { console.log('  FAIL  invariant: logged-in home guessed HEALTHY'); fails++; }
+// Hard invariant: NOTHING that looks like a home/feed may classify HEALTHY on its own.
+for (const fx of ['LOGGED_IN_HOME', 'HOME_WITH_RECOMMENDED_WORD', 'ACCOUNT_STATUS_AMBIGUOUS', 'LOGIN_WORD_ONLY', 'UNKNOWN', 'EMPTY']) {
+  check(`invariant: ${fx} is never HEALTHY`, classify(FIX[fx]).status !== 'HEALTHY');
+}
 
-if (fails) { console.log(`\nFAILED ❌ (${fails})`); process.exit(1); }
-console.log('\nPASSED ✅ (all Instagram classifier fixtures)');
+// ---- REAL fixtures (Phase 1 drop point) ----
+const dir = path.join(__dirname, 'fixtures', 'instagram');
+let real = 0;
+try {
+  const manifestPath = path.join(dir, 'expected.json');
+  if (fs.existsSync(manifestPath)) {
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    const entries = Object.entries(manifest).filter(([f]) => f.endsWith('.xml'));
+    if (entries.length) {
+      console.log(`\nREAL fixtures (${entries.length}):`);
+      for (const [file, want] of entries) {
+        const xml = fs.readFileSync(path.join(dir, file), 'utf8');
+        const r = classify(xml);
+        const wantStatus = typeof want === 'string' ? want : want.status;
+        check(`${file} -> ${r.status}`, r.status === wantStatus, r.status === wantStatus ? '' : `[wanted ${wantStatus}]`);
+        real++;
+      }
+    }
+  }
+} catch (e) { console.log('  (real-fixture load error: ' + e.message + ')'); }
+if (!real) console.log('\nREAL fixtures: 0 — none captured yet (Phase 1). Loader is ready; drop *.xml + expected.json into tools/fixtures/instagram/.');
+
+console.log(`\n${fails ? 'FAILED ❌ (' + fails + ')' : 'PASSED ✅'}  (${ran} checks, ${real} real fixtures)`);
+process.exit(fails ? 1 : 0);
