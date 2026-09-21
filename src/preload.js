@@ -12,4 +12,6 @@ contextBridge.exposeInMainWorld('agent', {
   openUpdate: () => ipcRenderer.invoke('open-update'),
   refresh: () => ipcRenderer.invoke('refresh'),
   resetPairings: () => ipcRenderer.invoke('reset-pairings'),
+  listDevices: () => ipcRenderer.invoke('list-devices'),
+  runIgDiagnostic: (opts) => ipcRenderer.invoke('run-ig-diagnostic', opts),
 });

@@ -15,6 +15,13 @@ files:
   - "!build-mac.command"
   - "!README-MAC.txt"
   - "!.check-asar.js"
+# The Instagram diagnostic is executed with ELECTRON_RUN_AS_NODE (plain Node), which CANNOT read files
+# from inside app.asar. Unpack the diagnostic + the pure classifier it requires so the packaged app can
+# run them off disk (app.asar.unpacked/). Nothing here auto-runs — only the manual launcher triggers it.
+asarUnpack:
+  - "tools/ig-status-diagnose.js"
+  - "tools/ig-diagnose-logic.js"
+  - "src/instagram.js"
 # Bundled at build time:
 #   resources/adb/win/adb.exe (+ AdbWinApi.dll, AdbWinUsbApi.dll)  and  resources/adb/mac/adb
 #   resources/ws-scrcpy = ws-scrcpy dist with its runtime deps installed

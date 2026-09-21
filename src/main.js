@@ -210,6 +210,46 @@ ipcMain.handle('install-update', () => {
   try { require('electron-updater').autoUpdater.quitAndInstall(); } catch (e) { fileLog('quitAndInstall:', e && e.message); }
 });
 ipcMain.handle('open-update', () => shell.openExternal(MAC_DMG_URL));
+
+// ---- Instagram diagnostic launcher (Phase-1, MANUAL only) ---------------------------------------
+// Isolated from streaming/pairing: if any of this fails, the rest of the agent is unaffected. Nothing
+// here auto-runs — the owner must open the panel, pick a phone/profile, and confirm the phone is free.
+ipcMain.handle('list-devices', () => {
+  try { return core ? core.status() : { phones: [] }; } catch (e) { return { phones: [] }; }
+});
+ipcMain.handle('run-ig-diagnostic', async (_e, opts) => {
+  opts = opts || {};
+  const serial = String(opts.serial || '').trim();
+  const uid = String(opts.uid == null ? '' : opts.uid).trim();
+  if (!serial || uid === '') return { ok: false, output: 'Pick a phone and enter a profile UID first.' };
+  // Explicit "this phone is free" confirmation (spec 7). The diagnostic itself ALSO refuses if a
+  // scrcpy/stream is running, so this is defence in depth.
+  const r = await dialog.showMessageBox(win, {
+    type: 'warning', buttons: ['Run diagnostic', 'Cancel'], defaultId: 1, cancelId: 1, noLink: true,
+    message: 'Run the Instagram diagnostic on this phone?',
+    detail: `Phone ${serial}, profile ${uid}.\n\nRun this ONLY if no one is using this phone right now. `
+      + `It reads the screen to check the account; it will NOT switch profiles, post, like, message, or `
+      + `change anything.\n\nI confirm this phone is currently free.`,
+  });
+  if (r.response !== 0) return { ok: false, output: 'Cancelled.' };
+  // Packaged: the script lives in app.asar.unpacked (plain Node can't read app.asar). Pass the packaged
+  // adb via ADB_PATH so the diagnostic finds it (resources/ ships outside the asar).
+  const { execFile } = require('child_process');
+  const script = path.join(__dirname, '..', 'tools', 'ig-status-diagnose.js').replace('app.asar' + path.sep, 'app.asar.unpacked' + path.sep);
+  const args = [script, '--serial', serial, '--uid', uid, '--confirm-free'];
+  if (opts.username) args.push('--username', String(opts.username));
+  fileLog('ig-diagnostic: running for', serial, 'uid', uid);
+  return await new Promise((resolve) => {
+    execFile(process.execPath, args, {
+      env: Object.assign({}, process.env, { ELECTRON_RUN_AS_NODE: '1', ADB_PATH: adbPath }),
+      timeout: 120000, maxBuffer: 8 * 1024 * 1024,
+    }, (err, stdout, stderr) => {
+      const out = String(stdout || '') + (stderr ? '\n[stderr]\n' + String(stderr) : '');
+      resolve({ ok: !err, output: out.trim() || (err && err.message) || 'no output' });
+    });
+  });
+});
+
 ipcMain.handle('add-phone', async (_e, code) => {
   try {
     fileLog('add-phone: pairing the next plugged-in phone');

@@ -124,3 +124,34 @@ async function doPair() {
     err.classList.remove('hide');
   } finally { btn.disabled = false; btn.textContent = 'Add phone'; }
 }
+
+// ---- Instagram diagnostic (advanced, manual) — isolated; failures here never affect the wizard ----
+(function () {
+  try {
+    var toggle = document.getElementById('diag-toggle');
+    var body = document.getElementById('diag-body');
+    var sel = document.getElementById('diag-device');
+    var runBtn = document.getElementById('diag-run');
+    var out = document.getElementById('diag-out');
+    if (!toggle || !body || !sel || !runBtn || !out || !window.agent || !window.agent.runIgDiagnostic) return;
+
+    async function refreshDevices() {
+      try {
+        var st = await window.agent.listDevices();
+        var phones = (st && st.phones) || [];
+        sel.innerHTML = phones.length
+          ? phones.map(function (p) { return '<option value="' + p.serial + '">' + (p.name || p.serial) + ' (' + p.serial + ')</option>'; }).join('')
+          : '<option value="">(no phones detected)</option>';
+      } catch (e) { sel.innerHTML = '<option value="">(could not list phones)</option>'; }
+    }
+    toggle.onclick = function () { body.classList.toggle('hide'); if (!body.classList.contains('hide')) refreshDevices(); };
+    runBtn.onclick = async function () {
+      var serial = sel.value, uid = document.getElementById('diag-uid').value, username = document.getElementById('diag-user').value;
+      if (!serial || uid === '') { out.textContent = 'Pick a phone and enter a profile UID first.'; return; }
+      runBtn.disabled = true; out.textContent = 'Running… reading the phone screen (no profile switch, no account actions).';
+      try { var r = await window.agent.runIgDiagnostic({ serial: serial, uid: uid, username: username }); out.textContent = (r && r.output) || 'no output'; }
+      catch (e) { out.textContent = 'Error: ' + ((e && e.message) || e); }
+      finally { runBtn.disabled = false; }
+    };
+  } catch (e) { /* diagnostic UI is optional; never break the agent */ }
+})();

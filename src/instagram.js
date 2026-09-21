@@ -9,6 +9,12 @@
 // Statuses returned MATCH the backend enum (app/monitoring/status.py): HEALTHY, NOT_RECOMMENDED,
 // LOGIN_REQUIRED, CHECKPOINT, CHALLENGE_REQUIRED, SUSPENDED, DISABLED, APP_ERROR, UNKNOWN.
 // Hard rule: never guess HEALTHY. If nothing matches, UNKNOWN (spec §21).
+//
+// PROVISIONAL SIGNATURES (Phase 0): the exact resource-ids / text below are hand-written from expected
+// Instagram wording and are NOT yet confirmed against a real current build. They must be validated and
+// corrected against real sanitized dumps in Phase 1 (see tools/fixtures/instagram/README.md). The
+// STRUCTURE (resource-id first, content-desc, then text; HEALTHY only on the Account Status surface;
+// UNKNOWN when evidence is insufficient) is the contract and should be preserved when tuning.
 
 // Pull the human-readable signals out of the XML: text=, content-desc=, and resource-id=. We don't
 // need a real XML parser — attribute scraping is robust to Instagram's deeply nested hierarchies.
