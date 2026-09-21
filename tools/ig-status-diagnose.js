@@ -18,10 +18,13 @@
  *   node tools/ig-status-diagnose.js --serial <ADB_SERIAL> --uid <TARGET_UID> --confirm-free [--username <handle_to_redact>]
  */
 const { execFile } = require('child_process');
+const https = require('https');
+const http = require('http');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const instagram = require('../src/instagram');
+const { assessMultiUser, sanitizeXml, sanitizeLine, navCandidates } = require('./ig-diagnose-logic');
 
 const IG = 'com.instagram.android';
 function argv(flag) { const i = process.argv.indexOf(flag); return i >= 0 ? process.argv[i + 1] : null; }
@@ -29,6 +32,11 @@ const SERIAL = argv('--serial');
 const UID = argv('--uid');
 const USERNAME = argv('--username') || '';
 const CONFIRM = process.argv.includes('--confirm-free');
+// OPTIONAL backend presence verification (belt-and-suspenders on top of --confirm-free + the local
+// scrcpy check). Requires all three so we can hit GET /api/devices/<id>/activity as an admin.
+const BACKEND = argv('--backend');           // e.g. https://phonedesk.map-mgt.com
+const TOKEN = argv('--token');               // admin JWT
+const DEVICE_ID = argv('--device-id');       // PhoneDesk device id (UUID), NOT the adb serial
 
 function adbPath() {
   if (process.env.ADB_PATH) return process.env.ADB_PATH;
@@ -45,21 +53,22 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (...a) => console.log(...a);
 const section = (t) => log('\n==== ' + t + ' ' + '='.repeat(Math.max(0, 60 - t.length)));
 
-// ---- sanitizer: strip PII from a dump BEFORE it is ever written to disk ----------------------
-function sanitize(xml) {
-  let out = xml;
-  const redactAttr = (val) => {
-    let v = val;
-    v = v.replace(/[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/g, '[EMAIL]');           // emails
-    v = v.replace(/(\+?\d[\d ()\-]{7,}\d)/g, '[PHONE]');                                       // phone-ish
-    v = v.replace(/@[A-Za-z0-9._]{2,}/g, '[HANDLE]');                                          // @handles
-    if (USERNAME) v = v.split(USERNAME).join('[USERNAME]');
-    // Long free text is likely a message/caption/bio -> redact the body, keep it short.
-    if (v.length > 60) v = '[LONG_TEXT_REDACTED]';
-    return v;
-  };
-  out = out.replace(/(text|content-desc)="([^"]*)"/g, (m, attr, val) => `${attr}="${redactAttr(val)}"`);
-  return out;
+const sanitize = (xml) => sanitizeXml(xml, USERNAME);   // PII redaction lives in ig-diagnose-logic.js
+
+// OPTIONAL: ask the PhoneDesk backend whether ANY viewer/control session is active for this device.
+// Returns { ok, viewers, busy } or { ok:false } if we couldn't check.
+function checkBackendActivity() {
+  return new Promise((resolve) => {
+    if (!BACKEND || !TOKEN || !DEVICE_ID) return resolve({ ok: false, skipped: true });
+    let u; try { u = new URL(`${BACKEND.replace(/\/$/, '')}/api/devices/${DEVICE_ID}/activity`); } catch { return resolve({ ok: false }); }
+    const lib = u.protocol === 'http:' ? http : https;
+    const req = lib.request(u, { method: 'GET', headers: { Authorization: 'Bearer ' + TOKEN }, timeout: 8000 }, (res) => {
+      let b = ''; res.on('data', (d) => (b += d));
+      res.on('end', () => { try { const j = JSON.parse(b); resolve({ ok: res.statusCode === 200, code: res.statusCode, viewers: j.viewers, busy: j.busy, online: j.online }); } catch { resolve({ ok: false, code: res.statusCode }); } });
+    });
+    req.on('error', () => resolve({ ok: false })); req.on('timeout', () => { req.destroy(); resolve({ ok: false }); });
+    req.end();
+  });
 }
 
 async function connected() {
@@ -92,18 +101,6 @@ async function foregroundActivity() {
   if (!m) { out = await sh(['shell', 'dumpsys', 'window'], 10000); m = out.match(/mCurrentFocus[^\n]*\bu(\d+)\s+([A-Za-z0-9_.]+)\//); }
   return m ? { uid: parseInt(m[1], 10), pkg: m[2] } : null;
 }
-// Report candidate Account-Status navigation anchors we can SEE (no taps performed).
-function navCandidates(xml) {
-  const ids = [...xml.matchAll(/resource-id="([^"]*)"/g)].map((m) => m[1]);
-  const descs = [...xml.matchAll(/content-desc="([^"]*)"/g)].map((m) => m[1]);
-  const interesting = (s) => /account.?status|menu|settings|options|hamburger|profile|more|supervision/i.test(s);
-  return {
-    resourceIds: [...new Set(ids.filter(interesting))].slice(0, 20),
-    contentDescs: [...new Set(descs.filter(interesting))].slice(0, 20),
-    mentionsAccountStatus: /account status/i.test(xml),
-  };
-}
-
 const CAP_DIR = path.join(__dirname, 'fixtures', 'instagram', 'captured');
 
 async function main() {
@@ -117,32 +114,58 @@ async function main() {
   log(`adb: ${ADB}`);
   log(`serial: ${SERIAL}   target uid: ${UID}   redacting username: ${USERNAME || '(none given)'}`);
 
+  // ---- PRE-FLIGHT busy/in-use safety (ordered): local adb -> local scrcpy -> backend presence ----
   if (!(await connected())) { log('ABORT: device not connected/authorized in adb.'); process.exit(1); }
   if (await scrcpyRunning()) {
     log('ABORT: a scrcpy/stream process is running on this phone — it looks IN USE. Leaving it alone.');
     process.exit(1);
+  }
+  const act = await checkBackendActivity();
+  if (act.skipped) {
+    log('note: backend presence NOT checked (no --backend/--token/--device-id). Relying on your');
+    log('      PhoneDesk verification (--confirm-free) + the local scrcpy check.');
+  } else if (!act.ok) {
+    log('ABORT: could not verify backend presence for this device (auth/URL/device-id?). Refusing to');
+    log('       launch Instagram without confirming no viewer is active.');
+    process.exit(1);
+  } else if (act.viewers && act.viewers > 0) {
+    log(`ABORT: PhoneDesk reports ${act.viewers} active viewer/control session(s) on this device — IN USE.`);
+    process.exit(1);
+  } else {
+    log(`backend presence: online=${act.online} viewers=${act.viewers} busy=${act.busy} -> free`);
   }
   if (!(await userExists(UID))) { log(`ABORT: android user ${UID} not found on this phone.`); process.exit(1); }
   if (!(await igInstalled(UID))) { log(`ABORT: Instagram not installed for user ${UID}.`); process.exit(1); }
 
   const findings = { serial: SERIAL, targetUid: Number(UID), when: new Date().toISOString() };
 
-  // ---- GOAL 1: multi-user foreground behavior ------------------------------------------------
+  // ---- GOAL 1: multi-user foreground behavior (STRICT three-state) ---------------------------
   section('GOAL 1 — Android multi-user foreground behavior');
-  const currentUser = (await sh(['shell', 'am', 'get-current-user'], 6000)).trim();
-  findings.foregroundUserBefore = currentUser;
-  log(`am get-current-user (foreground): ${currentUser}`);
+  const currentUserBefore = (await sh(['shell', 'am', 'get-current-user'], 6000)).trim();
+  findings.foregroundUserBefore = currentUserBefore;
+  log(`am get-current-user BEFORE: ${currentUserBefore}`);
   const comp = await resolveLauncher(UID);
   log(`Instagram launcher for uid ${UID}: ${comp || '(unresolved)'}`);
   if (comp) { await sh(['shell', 'am', 'start', '--user', String(UID), '-n', comp], 10000); await wait(3500); }
+  // Re-check the phone is STILL free right before we trust the result (a viewer could have opened).
+  const act2 = await checkBackendActivity();
+  if (!act2.skipped && act2.ok && act2.viewers && act2.viewers > 0) {
+    log(`ABORT (race): a viewer opened during the diagnostic (${act2.viewers}). Restoring + stopping.`);
+    await sh(['shell', 'input', 'keyevent', 'KEYCODE_HOME'], 6000);
+    process.exit(1);
+  }
   const fg = await foregroundActivity();
+  const currentUserAfter = (await sh(['shell', 'am', 'get-current-user'], 6000)).trim();
   findings.foregroundActivityAfterStart = fg;
-  log(`foreground after start: ${fg ? `u${fg.uid} ${fg.pkg}` : '(could not read)'}`);
-  const targetForegrounded = !!(fg && fg.pkg === IG && fg.uid === Number(UID));
-  findings.targetInstagramForegrounded = targetForegrounded;
-  findings.switchUserRequired = !targetForegrounded;
-  log(`\n>>> Instagram for TARGET uid ${UID} is foreground: ${targetForegrounded ? 'YES' : 'NO'}`);
-  log(`>>> CONCLUSION: am switch-user ${targetForegrounded ? 'NOT required (am start --user reached the target)' : 'IS REQUIRED (UIAutomator would see the foreground user, not the target)'}`);
+  findings.foregroundUserAfterStart = currentUserAfter;
+  log(`resumed activity after start: ${fg ? `u${fg.uid} ${fg.pkg}` : '(could not read)'}`);
+  log(`am get-current-user AFTER: ${currentUserAfter}`);
+  // We DO NOT conclude anything from the package/activity name alone. Strict assessment:
+  const assess = assessMultiUser({ currentUserBefore, currentUserAfter, fgAfter: fg, targetUid: UID });
+  findings.multiUserResult = assess.result;
+  findings.multiUserReasons = assess.reasons;
+  log(`\n>>> MULTI-USER RESULT: ${assess.result}`);
+  assess.reasons.forEach((r) => log(`    - ${r}`));
 
   // ---- GOAL 2: capture + sanitize the natural screen -----------------------------------------
   section('GOAL 2 — capture + sanitize UI');
@@ -155,7 +178,7 @@ async function main() {
 
   // ---- GOAL 3: Account Status navigation -----------------------------------------------------
   section('GOAL 3 — Account Status navigation');
-  const navFromScreen = navCandidates(cleanScreen);
+  const navFromScreen = navCandidates(cleanScreen, USERNAME);
   log(`current screen mentions "Account Status": ${navFromScreen.mentionsAccountStatus}`);
   log(`candidate nav resource-ids: ${JSON.stringify(navFromScreen.resourceIds)}`);
   log(`candidate nav content-descs: ${JSON.stringify(navFromScreen.contentDescs)}`);
@@ -175,7 +198,9 @@ async function main() {
   section('GOAL 4 — classifier on real UI');
   for (const [name, xml] of [['current screen', cleanScreen], ['after deep link', cleanDeep]]) {
     const r = instagram.classify(xml);
-    log(`${name.padEnd(16)} -> ${r.status}  conf=${r.confidence}  loggedInHome=${!!r.loggedInHome}  evidence=${JSON.stringify(r.evidence)}`);
+    // Evidence can echo matched UI text; run it through the same redactor before logging (defence in depth).
+    const ev = (r.evidence || []).map((e) => sanitizeLine(e, USERNAME));
+    log(`${name.padEnd(16)} -> ${r.status}  conf=${r.confidence}  loggedInHome=${!!r.loggedInHome}  evidence=${JSON.stringify(ev)}`);
   }
 
   // ---- restore: leave the phone on Home, unchanged profile -----------------------------------
