@@ -1,0 +1,2 @@
+# raw diagnostic captures — review + sanitize, then move into the parent dir + expected.json before committing
+*.xml
