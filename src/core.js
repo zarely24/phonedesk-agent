@@ -867,6 +867,7 @@ class AgentCore extends EventEmitter {
       else if (m.op === 'launch_app') this.launchApp(serial, m, ws);
       else if (m.op === 'open_url') this.openUrl(serial, m, ws);
       else if (m.op === 'check_account_status') this.checkAccountStatus(serial, m, ws);
+      else if (m.op === 'ig_diagnostic') this.igDiagnostic(serial, m, ws);   // Phase-1 remote diagnostic
       // Physical device controls (real, deterministic: PhoneDesk button -> here -> adb -> phone).
       else if (m.op === 'input_key') this.inputKey(serial, m, ws);        // Power/Vol/Back/Home/Recent...
       else if (m.op === 'input_text') this.inputText(serial, m, ws);      // keyboard text into the focused field
@@ -1328,6 +1329,83 @@ class AgentCore extends EventEmitter {
     } catch (e) {
       this._rpcReply(ws, m, { ok: false, status: 'APP_ERROR', error: String((e && e.message) || e) });
     } finally { this._checking.delete(serial); }
+  }
+
+  /** Is a live scrcpy/stream capture running on this phone (i.e. someone is watching it)? Human-priority
+      abort signal for the diagnostic. */
+  async _scrcpyRunning(serial) {
+    try { return /scrcpy|com\.genymobile\.scrcpy/i.test(await this._adbLong(serial, ['shell', 'ps', '-A'], 8000)); }
+    catch { return false; }
+  }
+  /** The ACTUAL foreground resumed activity: { uid, pkg } or null. We never conclude multi-user from
+      this alone — assessMultiUser() in ig-diagnose-logic weighs it against the foreground USER. */
+  async _foregroundActivity(serial) {
+    let out = await this._adbLong(serial, ['shell', 'dumpsys', 'activity', 'activities'], 10000).catch(() => '');
+    let m = out.match(/(?:mResumedActivity|topResumedActivity)[^\n]*\bu(\d+)\s+([A-Za-z0-9_.]+)\//);
+    if (!m) { out = await this._adbLong(serial, ['shell', 'dumpsys', 'window'], 10000).catch(() => ''); m = out.match(/mCurrentFocus[^\n]*\bu(\d+)\s+([A-Za-z0-9_.]+)\//); }
+    return m ? { uid: parseInt(m[1], 10), pkg: m[2] } : null;
+  }
+
+  /** Phase-1 REMOTE Instagram diagnostic (triggered from the web dashboard via the backend RPC). READ-
+      ONLY, one phone, one profile. Reuses ig-diagnose-logic (strict 3-state + PII redaction) and the
+      instagram classifier IN-PROCESS on the agent's own adb. NEVER switches users / cycles airplane /
+      posts / changes account state. Returns a SANITIZED, structured result — no raw UI XML leaves here.
+      Human-priority: aborts if a live stream is running (before and after launch). */
+  async igDiagnostic(serial, m, ws) {
+    const uid = parseInt(m.uid != null ? m.uid : 0, 10);
+    const username = String(m.username || '');
+    const pkg = 'com.instagram.android';
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    const t0 = Date.now();
+    const dur = () => Math.round((Date.now() - t0) / 100) / 10;
+    const { assessMultiUser, sanitizeXml, navCandidates } = require('../tools/ig-diagnose-logic');
+    const instagram = require('./instagram');
+    if (!this._igDiag) this._igDiag = new Set();
+    if (this._igDiag.has(serial)) return this._rpcReply(ws, m, { ok: false, state: 'device_busy', error: 'another diagnostic is running on this phone' });
+    this._igDiag.add(serial);
+    try {
+      if (await this._scrcpyRunning(serial)) return this._rpcReply(ws, m, { ok: false, state: 'device_busy', error: 'a live stream is active on this phone' });
+      if (!(await this._userExists(serial, uid))) return this._rpcReply(ws, m, { ok: false, state: 'profile_not_found', error: 'PROFILE_NOT_FOUND' });
+      if (!(await this._pkgInstalledForUser(serial, uid, pkg))) {
+        return this._rpcReply(ws, m, { ok: true, multiUser: 'INCONCLUSIVE', instagram: 'NOT_DETECTED', classifier: 'APP_ERROR', accountStatusNav: 'INCONCLUSIVE', fixtureCaptured: false, durationSec: dur(), reasons: ['Instagram not installed for this profile'] });
+      }
+      const before = (await this._adbLong(serial, ['shell', 'am', 'get-current-user'], 6000).catch(() => '')).trim();
+      const comp = await this._resolveLauncher(serial, uid, pkg);
+      if (comp) { await this._adbLong(serial, ['shell', 'am', 'start', '--user', String(uid), '-n', comp], 10000).catch(() => {}); await wait(3500); }
+      if (await this._scrcpyRunning(serial)) {   // a viewer opened mid-run -> HUMAN WINS
+        await this._adbLong(serial, ['shell', 'input', 'keyevent', 'KEYCODE_HOME'], 5000).catch(() => {});
+        return this._rpcReply(ws, m, { ok: false, state: 'device_busy', error: 'a viewer opened during the diagnostic' });
+      }
+      const fg = await this._foregroundActivity(serial);
+      const after = (await this._adbLong(serial, ['shell', 'am', 'get-current-user'], 6000).catch(() => '')).trim();
+      const assess = assessMultiUser({ currentUserBefore: before, currentUserAfter: after, fgAfter: fg, targetUid: uid });
+      const cleanScreen = sanitizeXml(await this._uiDump(serial).catch(() => ''), username);
+      const r1 = instagram.classify(cleanScreen);
+      // Account Status deep link — observe only, no tapping / account changes.
+      await this._adbLong(serial, ['shell', 'am', 'start', '-a', 'android.intent.action.VIEW', '-d', 'instagram://account_status', '--user', String(uid)], 8000).catch(() => {});
+      await wait(3000);
+      const cleanDeep = sanitizeXml(await this._uiDump(serial).catch(() => ''), username);
+      const rDeep = instagram.classify(cleanDeep);
+      const nav1 = navCandidates(cleanScreen, username), nav2 = navCandidates(cleanDeep, username);
+      const classifier = rDeep.status !== 'UNKNOWN' ? rDeep.status : r1.status;
+      const accountStatusNav = (nav1.mentionsAccountStatus || nav2.mentionsAccountStatus) ? 'FOUND'
+        : ((nav1.resourceIds.length || nav2.resourceIds.length) ? 'INCONCLUSIVE' : 'NOT_FOUND');
+      await this._adbLong(serial, ['shell', 'input', 'keyevent', 'KEYCODE_HOME'], 5000).catch(() => {});   // restore
+      this.emit('log', `ig_diagnostic (${serial}) user=${uid} -> multiUser=${assess.result} classifier=${classifier} in ${dur()}s`);
+      return this._rpcReply(ws, m, {
+        ok: true,
+        multiUser: assess.result, instagram: 'DETECTED', classifier, accountStatusNav,
+        fixtureCaptured: !!(cleanScreen && cleanScreen.length > 40),
+        durationSec: dur(),
+        reasons: assess.reasons,
+        evidence: [...new Set([...(r1.evidence || []), ...(rDeep.evidence || [])])].slice(0, 8),   // sanitized already
+        navResourceIds: [...new Set([...nav1.resourceIds, ...nav2.resourceIds])].slice(0, 20),     // structural, not PII
+        foregroundBefore: before, foregroundAfter: after,
+      });
+    } catch (e) {
+      try { await this._adbLong(serial, ['shell', 'input', 'keyevent', 'KEYCODE_HOME'], 5000).catch(() => {}); } catch {}
+      return this._rpcReply(ws, m, { ok: false, status: 'APP_ERROR', error: String((e && e.message) || e) });
+    } finally { this._igDiag.delete(serial); }
   }
 
   /** Rename a profile: try on the phone itself (newer Androids); remember the name here if it refuses. */
