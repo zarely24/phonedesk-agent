@@ -860,7 +860,7 @@ class AgentCore extends EventEmitter {
       else if (m.op === 'refresh') this.refreshOne(serial);   // VA pressed "Refresh phone" on ONE phone's row
       else if (m.op === 'set_charge_policy') this.setChargePolicy(serial, m, ws);   // battery charge limit
       else if (m.op === 'create_profiles') this.createProfiles(serial, m.count, m.package, m.name_prefix, ws);
-      else if (m.op === 'list_apps') this.listApps(serial, ws);           // per-profile app list for the picker
+      else if (m.op === 'list_apps') this.listApps(serial, m, ws);           // per-profile app list for the picker
       else if (m.op === 'install_apps') this.installApps(serial, m, ws);  // clone apps into existing profiles
       else if (m.op === 'upload_media')this.uploadMedia(serial, m, ws);   // push photos/videos to the gallery
       else if (m.op === 'set_label') this.setLabel(serial, m);   // dashboard name/order -> owner app
@@ -1191,10 +1191,8 @@ class AgentCore extends EventEmitter {
     } catch (e) { this._rpcReply(ws, m, { ok: false, state: 'error', error: String((e && e.message) || e) }); }
   }
 
-  /** Handle list_apps: which third-party apps each profile has, for the dashboard's
-      "Add apps to profiles" picker. Anything installed in ANY profile can be cloned into another. */
-  async listApps(serial, ws) {
-    if (!serial || !this.devices[serial]) return;
+  /** Per-profile third-party package list (pm list packages -3 --user N), keyed by user id. */
+  async _appsByUser(serial) {
     const byUser = {};
     for (const u of await this._listUsersAsync(serial)) {
       try {
@@ -1202,13 +1200,19 @@ class AgentCore extends EventEmitter {
         byUser[u.id] = out.split('\n').map((l) => l.trim().replace(/^package:/, '')).filter(Boolean).sort();
       } catch (e) { this.emit('log', `list_apps user ${u.id}: ${(e && e.message) || e}`); }
     }
-    try { ws && ws.readyState === 1 && ws.send(JSON.stringify({ op: 'apps', data: { at: Date.now(), by_user: byUser } })); } catch {}
+    return byUser;
   }
-  /** Handle install_apps: clone already-installed apps into existing profiles (pm install-existing,
-      the same thing create_profiles does for new ones). Reports per profile+app, then a fresh list. */
+  /** RPC list_apps: which apps each profile has, for the dashboard's "Add apps to profiles"
+      picker. Anything installed in ANY profile can be cloned into another. */
+  async listApps(serial, m, ws) {
+    try { this._rpcReply(ws, m, { ok: true, by_user: await this._appsByUser(serial) }); }
+    catch (e) { this._rpcReply(ws, m, { ok: false, state: 'error', error: String((e && e.message) || e) }); }
+  }
+  /** RPC install_apps: clone already-installed apps into existing profiles (pm install-existing,
+      the same thing create_profiles does for new ones). Replies per profile+app, plus a fresh list. */
   async installApps(serial, m, ws) {
-    if (!serial || !this.devices[serial]) return;
     const uids = (Array.isArray(m.user_ids) ? m.user_ids : []).map((x) => parseInt(x, 10)).filter((x) => x >= 0);
+    // adb shell joins args into one shell string on the phone - only plain package names get through.
     const pkgs = (Array.isArray(m.packages) ? m.packages : []).map(String).filter((p) => /^[A-Za-z0-9_.]+$/.test(p));
     this.emit('log', `install_apps (${serial}) -> users=[${uids}] packages=[${pkgs}]`);
     const results = [];
@@ -1226,8 +1230,9 @@ class AgentCore extends EventEmitter {
         }
       }
     }
-    try { ws && ws.readyState === 1 && ws.send(JSON.stringify({ op: 'apps_install_result', job_id: m.job_id, results })); } catch {}
-    await this.listApps(serial, ws);
+    let byUser = {};
+    try { byUser = await this._appsByUser(serial); } catch {}
+    this._rpcReply(ws, m, { ok: true, results, by_user: byUser });
   }
 
   async launchApp(serial, m, ws) {
