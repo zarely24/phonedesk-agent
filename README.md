@@ -104,6 +104,24 @@ moved 18 phones without anyone touching the owner's machine.
 **Eighteen phones all connect within a second of each other**, so anything on a per-phone timer fires
 in one burst unless it is staggered. That burst is what made the blocking calls so visible.
 
+**The connect-time charge probe is still synchronous, and it is a fleet-wide outage waiting to
+happen (2026-10-16).** On every socket `open`, `_applyChargePolicy` runs from the saved policy: about
+five `_adb` (execFileSync) calls — `_nodeExists` for the firmware nodes and each gate, then `_hasRoot`
+— ~1.1 s per phone. The `_rooted` cache does not help because `_dropDevice` deletes the device object
+on every reconnect. The backend then re-pushes `set_charge_policy` on connect and `setChargePolicy`
+runs the whole thing again plus a synchronous `_metaPayload`. Sixteen phones reconnecting in the same
+second = the event loop frozen ~30 s, which exceeded the server's 20 s ping timeout, which dropped
+all sixteen again: a self-sustaining reconnect spiral in which no `open_stream` is answered inside the
+viewer's 10 s window, so every phone on that computer shows Online with a blank screen and the row's
+Refresh (which only reconnects the socket) cannot help. It was triggered by one `spawnSync` gallery
+upload timing out (`upload 8.MOV failed: ... ETIMEDOUT`). Mitigated on the server (uvicorn
+`--ws-ping-timeout 120`, see the backend README, Diagnostics). **The fix that belongs here:** move
+`_nodeExists` / `_hasRoot` / `_restoreCharging` and `setChargePolicy`'s meta reply onto `_adbAsync`,
+keep `_rooted` in the token file so a reconnect does not re-probe, and make `uploadMedia` use
+`execFile` with a timeout instead of `spawnSync`. Charge limiting is "unavailable (phone is not
+rooted)" on every phone in the fleet today, so until then the cheapest relief is to not re-push the
+policy on connect at all.
+
 **One shared ws-scrcpy serves every phone**, and it is single-threaded too. If CPU ever becomes the
 limit, sharding phones across several ws-scrcpy processes is the next move — the dashboard's
 busiest-core reading is how you would know.
