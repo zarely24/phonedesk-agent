@@ -12,7 +12,11 @@ document.getElementById('pair-btn').addEventListener('click', doPair);
 document.getElementById('pair-back').addEventListener('click', () => go('phones'));
 
 // The main process sends the full phone status every ~2s.
-window.agent.onDevice((st) => { if (st && st.phones) { renderPhones(st); updatePairStatus(st); } });
+window.agent.onDevice((st) => {
+  if (!st || !st.phones) return;
+  renderPhones(st); updatePairStatus(st);
+  try { fillDiagDevices(st); } catch {}   // the diagnostic picker is optional; never let it break the list
+});
 window.agent.onStatus(() => { /* per-phone online/reconnecting - the 2s status poll refreshes the list */ });
 
 // Refresh: restart adb + the stream engine + every connection, without closing the app.
@@ -126,6 +130,19 @@ async function doPair() {
 }
 
 // ---- Instagram diagnostic (advanced, manual) — isolated; failures here never affect the wizard ----
+// The phone picker is filled from the same status snapshot that draws the list (every ~2s), in the
+// same order as the dashboard. v0.5.2 asked the main process for a separate list when the panel was
+// opened; that call runs a synchronous `adb devices`, and whenever adb was slow the picker stayed empty.
+function fillDiagDevices(st) {
+  const sel = document.getElementById('diag-device');
+  if (!sel) return;
+  const cur = sel.value;
+  const phones = st.phones.filter((p) => p.paired);
+  sel.innerHTML = '<option value="">Pick a phone&#8230;</option>' + (phones.length
+    ? phones.map((p) => `<option value="${esc(p.serial)}">${esc(p.name || 'Phone')} (${esc(p.serial)})${p.online ? '' : ' - not connected'}</option>`).join('')
+    : '<option value="" disabled>(no phones added yet)</option>');
+  if (cur && phones.some((p) => p.serial === cur)) sel.value = cur;   // keep the owner's choice across refreshes
+}
 (function () {
   try {
     var toggle = document.getElementById('diag-toggle');
@@ -135,16 +152,10 @@ async function doPair() {
     var out = document.getElementById('diag-out');
     if (!toggle || !body || !sel || !runBtn || !out || !window.agent || !window.agent.runIgDiagnostic) return;
 
-    async function refreshDevices() {
-      try {
-        var st = await window.agent.listDevices();
-        var phones = (st && st.phones) || [];
-        sel.innerHTML = phones.length
-          ? phones.map(function (p) { return '<option value="' + p.serial + '">' + (p.name || p.serial) + ' (' + p.serial + ')</option>'; }).join('')
-          : '<option value="">(no phones detected)</option>';
-      } catch (e) { sel.innerHTML = '<option value="">(could not list phones)</option>'; }
-    }
-    toggle.onclick = function () { body.classList.toggle('hide'); if (!body.classList.contains('hide')) refreshDevices(); };
+    toggle.onclick = function () {
+      body.classList.toggle('hide');
+      toggle.innerHTML = 'Instagram diagnostic (advanced) ' + (body.classList.contains('hide') ? '&#9662;' : '&#9652;');
+    };
     runBtn.onclick = async function () {
       var serial = sel.value, uid = document.getElementById('diag-uid').value, username = document.getElementById('diag-user').value;
       if (!serial || uid === '') { out.textContent = 'Pick a phone and enter a profile UID first.'; return; }

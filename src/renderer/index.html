@@ -19,6 +19,7 @@
     #update-bar { position:fixed; left:0; right:0; bottom:0; z-index:50; display:flex; align-items:center;
       justify-content:center; gap:12px; padding:10px 14px; background:#171a21; border-top:1px solid #2a2f3a; font-size:13px; }
     #update-bar .btn { width:auto; max-width:none; padding:8px 14px; font-size:13px; }
+    #update-bar.hide { display:none; }   /* the id rule above beats .hide; without this the empty bar (a blue pill) always shows */
     #ver { position:fixed; right:10px; top:10px; color:#4a5160; font-size:11px; }
     #refresh-btn { position:fixed; left:10px; top:8px; background:transparent; border:1px solid #2a2f3a;
       color:#9aa3b2; border-radius:8px; padding:4px 10px; font-size:12px; cursor:pointer; transition:.15s; }
@@ -27,6 +28,22 @@
     .linkbtn { margin-top:14px; background:transparent; border:0; color:#6b7280; font-size:12px;
       text-decoration:underline; cursor:pointer; }
     .linkbtn:hover { color:#9aa3b2; }
+    /* style.css sets .app{height:100%}. With 16+ phone rows the list is taller than the fixed 660px window,
+       and anything placed AFTER .app in <body> then lands at the 660px mark, drawn on top of the list
+       (v0.5.2 did that with the diagnostic panel). min-height lets the page grow and scroll instead. */
+    .app { min-height:100%; height:auto; }
+    /* Instagram diagnostic panel: lives INSIDE the phones step, below the list, collapsed by default. */
+    #diag-panel { width:100%; max-width:340px; border-top:1px solid rgba(255,255,255,.08); padding-top:10px; text-align:left; }
+    #diag-panel .linkbtn { margin-top:0; }
+    #diag-body { margin-top:8px; display:flex; flex-direction:column; gap:6px; }
+    #diag-body.hide { display:none; }   /* an id rule beats the .hide class, so hide must be restated here */
+    #diag-body select, #diag-body input { width:100%; padding:8px 10px; background:var(--surface2); color:var(--text);
+      border:1px solid var(--border); border-radius:8px; font-size:13px; color-scheme:dark; }
+    #diag-body select option { background:var(--surface2); color:var(--text); }
+    #diag-body .btn { max-width:none; }
+    #diag-out { white-space:pre-wrap; font-size:11px; max-height:220px; overflow:auto; background:rgba(0,0,0,.25);
+      padding:8px; border-radius:8px; margin:0; }
+    #diag-out:empty { display:none; }
   </style>
 </head>
 <body>
@@ -48,6 +65,20 @@
       <div id="detect-guide" class="guide hide"></div>
       <button id="add-phone-btn" class="btn primary">+ Add a phone</button>
       <button id="reset-btn" class="linkbtn">Phone stuck? Reset pairings</button>
+
+      <!-- Instagram diagnostic (Phase-1, manual, advanced). Collapsed by default; nothing runs on its own.
+           It sits inside this step on purpose: placed after .app it was drawn over the phone list. -->
+      <div id="diag-panel">
+        <button id="diag-toggle" class="linkbtn">Instagram diagnostic (advanced) &#9662;</button>
+        <div id="diag-body" class="hide">
+          <p class="muted" style="font-size:12px">Reads one phone's screen to check an Instagram account. It will NOT switch profiles, post, or change anything. Run only when the phone is free.</p>
+          <select id="diag-device"><option value="">Pick a phone&#8230;</option></select>
+          <input id="diag-uid" type="number" placeholder="Android profile UID (e.g. 11)">
+          <input id="diag-user" placeholder="account username to hide from the report (optional)">
+          <button id="diag-run" class="btn primary">Run diagnostic</button>
+          <pre id="diag-out"></pre>
+        </div>
+      </div>
     </section>
 
     <section id="s-pair" class="step">
@@ -66,19 +97,6 @@
   <div id="update-bar" class="hide">
     <span id="update-text"></span>
     <button id="update-btn" class="btn primary"></button>
-  </div>
-
-  <!-- Instagram diagnostic (Phase-1, manual, advanced). Collapsed by default; nothing runs on its own. -->
-  <div id="diag-panel" style="margin-top:14px;border-top:1px solid rgba(255,255,255,.08);padding-top:10px">
-    <button id="diag-toggle" class="linkbtn">Instagram diagnostic (advanced) ▾</button>
-    <div id="diag-body" class="hide" style="margin-top:8px;display:flex;flex-direction:column;gap:6px">
-      <p class="muted" style="font-size:12px;margin:0">Reads one phone's screen to check an Instagram account. It will NOT switch profiles, post, or change anything. Run only when the phone is free.</p>
-      <select id="diag-device" style="padding:6px"></select>
-      <input id="diag-uid" type="number" placeholder="Android profile UID (e.g. 11)" style="padding:6px">
-      <input id="diag-user" placeholder="account username to hide from the report (optional)" style="padding:6px">
-      <button id="diag-run" class="btn primary">Run diagnostic</button>
-      <pre id="diag-out" style="white-space:pre-wrap;font-size:11px;max-height:220px;overflow:auto;background:rgba(0,0,0,.25);padding:8px;border-radius:8px;margin:0"></pre>
-    </div>
   </div>
 
   <script src="wizard.js"></script>

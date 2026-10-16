@@ -84,6 +84,10 @@ Download page for a fresh install: <https://phonedesk.map-mgt.com/download/>
 
 | Version | What changed |
 |---|---|
+| **v0.5.3** | Owner-window fix only, no agent/phone logic touched. In v0.5.2 the Instagram diagnostic panel was appended to `<body>` *after* `.app`, and `.app` is `height:100%` of a fixed 480x660 window - so on a computer with more than ~11 phones the list was taller than the window and the panel was painted on top of phones 29-33 ("Instagram diagnostic (advanced)" text across the rows, white input boxes over the list). Its body also carried an inline `display:flex`, which beats the `.hide` class, so it was never collapsed. And its phone picker asked the main process for a *separate* phone list via a synchronous `adb devices`; whenever adb was busy the picker stayed empty and "Run diagnostic" could only say "Pick a phone". Now: the panel lives inside the phones step below "Reset pairings", `.app` grows with the list (`min-height`), hide/show is done with id-level rules, the controls are dark-themed, and the picker is filled from the same 2 s status snapshot that draws the list (same names, same order, "- not connected" suffix for unplugged phones). Also hides the update bar properly - the same id-beats-class flaw left an empty bar with a blue pill at the bottom of every window since v0.4.3 |
+| **v0.5.2** | Profile switch now *verifies* the airplane-mode cycle (Airplane ON / OFF / mobile-network recovery each reported PASS or FAIL via telephony state, not just ping), the read-only Instagram status diagnostic (`tools/ig-status-diagnose.js`, manual launcher in the owner window, and the `ig_diagnostic` RPC op so the backend can trigger it) and the monitoring fixtures/classifier tests |
+| **v0.5.1** | Ships the WebRTC-capable agent, dormant by default. The WebRTC path is a proof of concept: no TURN, unvalidated on real hardware - do not switch it on for the farm |
+| **v0.5.0** | Device controls from the dashboard: `input_key`, `input_text`, `screenshot`, `launch_app`, `open_url` RPC ops; the Instagram status classifier (dormant); fleet canary/update/rollback runbooks under `deploy/` |
 | **v0.4.5** | Upload-to-gallery works for secondary profiles again. The MediaStore `_id` lookup after insert passed its WHERE clause unquoted through `adb shell`, so the phone's shell stripped the SQL quotes and the row never matched — every non-root secondary-profile upload failed with "MediaStore row not found after insert". The `content` insert/query are now sent as one shell-quoted command; also fixes filenames containing a space |
 | **v0.4.4** | Each agent measures its own upload speed and reports it, so the fleet's bitrate budget tracks the line the phones are actually on instead of a number typed into config |
 | **v0.4.3** | An update that is ready no longer waits to be noticed: a desktop notification plus a dialog that comes to the front, repeated every 30 minutes until the owner restarts. Update checks every 30 minutes rather than every 6 hours. Restarting stays the owner's choice, since it briefly drops every phone |
@@ -96,6 +100,19 @@ Download page for a fresh install: <https://phonedesk.map-mgt.com/download/>
 ---
 
 ## Gotchas
+
+**The owner window is a fixed 480x660 and `.app` is `height:100%`** (`src/renderer/style.css`). Anything
+you append to `<body>` after `.app` is laid out at the 660 px mark - which, once the phone list is longer
+than the window (about 11 phones), is *on top of the list*. New panels go **inside the step they belong
+to** (`#s-phones` etc.), and `index.html` now overrides `.app` to `min-height:100%` so a long list grows
+the page and scrolls. Same file, same trap: `.hide` is a plain class, so any id-level `display:` rule or
+inline `style="display:..."` wins over it and the element is never hidden - that is how the v0.5.2
+diagnostic panel was always expanded and how the update bar showed as an empty blue pill since v0.4.3.
+Every element that gets `.hide` toggled and also has an id-level display rule needs an explicit
+`#thatid.hide { display:none }`. Test the window with a long list before tagging: serve
+`src/renderer/` with a stub `window.agent` that pushes 20 phones and screenshot it headless at 480x660
+(`chrome --headless=new --window-size=480,660 --screenshot ...`); the real Electron window is not
+resizable, so a layout that fits 5 phones tells you nothing about the farm.
 
 **`BACKEND` is a hostname, not an address** (`src/config.js`). Moving the backend to a different
 server needs only a DNS change — no rebuild, no client action. This is how the New York migration
