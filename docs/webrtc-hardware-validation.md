@@ -23,3 +23,23 @@ command exercises A1–A4 and A7 (SPS/PPS/IDR/bitrate/fps) and needs **no** back
 fleet change. A5/A6/A8 are confirmed by the first real browser session (WebRTC stats overlay). Paste
 the diagnostic output back and the likely fix for any failing row is a small, localized change here —
 not an architecture change.
+
+## H.265 path (added 2026-10-20) — also implemented without a phone
+
+The H.265 path uses a DIFFERENT server: upstream **scrcpy-server 5.0.1** (`resources/scrcpy/`), launched
+by `src/scrcpy-capture.js` with `key=value` options (`video_codec=h265 …`). The wire protocol was read
+from the 5.0.1 sources (`DesktopConnection.java`, `Streamer.java`, `SurfaceEncoder.java`), not inferred
+from ws-scrcpy, so it is far less speculative than A1–A4 — but still unconfirmed on hardware.
+`npm run webrtc-diagnose -- --codec both` exercises all of it.
+
+| # | Assumption | Where in code | Confirmed by | If wrong |
+|---|---|---|---|---|
+| B1 | **5.0.1 launch**: `app_process / com.genymobile.scrcpy.Server 5.0.1 scid=… video_codec=h265 audio=false control=false tunnel_forward=true send_*=true …`; the first arg must equal the jar's version string. | `scrcpy-capture.js startCapture()` | `scrcpy server start: PASS` for H.265. A version-mismatch error on stderr (`server said:`) = jar/arg drift. | Re-download the matching jar (`SERVER_VERSION`) and keep both in step. |
+| B2 | **Socket handshake** = 1 dummy byte, 64-byte device name, u32 codec id (`0x68323635` = "h265"), then 12-byte records. Codec id 0/1 means "stream disabled"/"config error". | `onData()` stages 0–3 | `video socket: PASS (WxH)` + `H265 data received: PASS`. A `config error` = the phone has no HEVC encoder or refused the size/bitrate. | Check the `VIDEO ENCODERS` list; try `video_encoder=<name>` or a smaller `max_size`. |
+| B3 | **Record framing**: session record when byte 0 has its top bit set (flags/width/height, no payload); media record otherwise (bit 62 = config, bit 61 = key frame, then u32 size + payload). | `onData()` record loop | `VPS/SPS/PPS detected: PASS` and `IRAP detected: PASS`; `estimated FPS` ≈ real. Garbage sizes = framing off by a record. | Compare against `Streamer.java` at the exact tag; the layout changed in 4.x (session records are new). |
+| B4 | **MediaCodec HEVC output is Annex-B** with VPS+SPS+PPS in one config packet before the first IRAP; re-sending them with every IRAP lets a late joiner decode. | `webrtc.js startH265()` `lastConfig` | Browser overlay shows `codec H265` and `framesDecoded` climbing within one keyframe interval (10 s at scrcpy's default I-frame interval). | Lower the I-frame interval via `video_codec_options=i-frame-interval:2`, or honour PLI by restarting the encoder. |
+| B5 | **Browser negotiates H.265** from our fmtp (`profile-id=1;tier-flag=0;level-id=120;tx-mode=SRST`). Chrome ≥ 136 does so only where it has a hardware HEVC decoder; Edge does not advertise H.265 at all. | `webrtc.js codecParams()` | Agent log `negotiated H.265 (pt N)`. `negotiated H.264 … browser declined H.265` means that VA's browser can't decode it — not a bug, the fallback working. | Nothing to fix in the agent; it is per-VA-machine. Check `chrome://gpu` → "Video Decode" for HEVC. |
+
+Everything on the RTP side (FU type 49, S/E bits, marker placement, 2-byte payload header with the
+NAL's LayerId/TID copied through) is pinned by `tools/test_h265_rtp.js` and proven against ffmpeg's
+independent RFC 7798 implementation by `tools/rtp-ffmpeg-check.js` (180/180 frames decoded).

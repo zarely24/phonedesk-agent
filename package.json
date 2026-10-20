@@ -10,11 +10,12 @@
     "dev": "electron .",
     "core": "node agent.js",
     "webrtc-diagnose": "node tools/webrtc-diagnose.js",
-    "test:rtp": "node tools/test_rtp.js",
+    "test:rtp": "node tools/test_rtp.js && node tools/test_h265_rtp.js",
     "dist:win": "electron-builder --win",
     "dist:mac": "electron-builder --mac",
     "test:airplane": "node tools/test_airplane.js",
-    "ig-diagnose": "node tools/ig-status-diagnose.js"
+    "ig-diagnose": "node tools/ig-status-diagnose.js",
+    "rtp-check": "node tools/rtp-ffmpeg-check.js"
   },
   "dependencies": {
     "electron-updater": "^6.8.9",
