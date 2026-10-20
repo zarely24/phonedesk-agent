@@ -16,6 +16,7 @@ const instagram = require('./instagram');   // Instagram account-status classifi
 
 // Electron's main process (Node 20) has no global WebSocket; fall back to the `ws` package.
 const WebSocket = globalThis.WebSocket || require('ws');
+const SCREEN_OFF_TIMEOUT_MS = 30 * 60 * 1000;   // per-profile screen timeout set after a profile switch
 const http = require('http');
 const https = require('https');
 
@@ -98,6 +99,7 @@ class AgentCore extends EventEmitter {
     this._wsStarted = false;
     this._wsBackoff = 1000;   // respawn backoff for the shared ws-scrcpy (mirrors the phone-home backoff)
     this._wsRespawnTimer = null;
+    this._chargeProbe = {};   // serial -> { rooted, nodes }: what the phone's sysfs offers, probed ONCE (v0.5.4)
     this._stopped = false;    // set on shutdown() so ws-scrcpy isn't resurrected as the app quits
   }
 
@@ -261,8 +263,8 @@ class AgentCore extends EventEmitter {
   }
   _rowsToDevices(out) {
     return out.split('\n').slice(1).map((l) => l.trim()).filter(Boolean).map((l) => l.split('\t'))
-      .filter((p) => p[1] === 'device' || p[1] === 'unauthorized')
-      .map((p) => ({ serial: p[0], state: p[1] === 'device' ? 'ready' : 'unauthorized' }));
+      .filter((p) => p[1] === 'device' || p[1] === 'unauthorized' || p[1] === 'offline')
+      .map((p) => ({ serial: p[0], state: p[1] === 'device' ? 'ready' : p[1] }));   // 'offline' = USB there, adb lost it
   }
   _detectAllBlocking() {
     try { return this._rowsToDevices(this._adb(['devices'])); } catch { return []; }
@@ -273,117 +275,138 @@ class AgentCore extends EventEmitter {
       .catch(() => {});
   }
   _getprop(serial, key) { try { return this._adb(['-s', serial, 'shell', 'getprop', key]); } catch { return ''; } }
-  /** Battery level + whether the phone is actually drawing charge, from ONE `dumpsys battery`
-      call (cheaper than two shell-outs every heartbeat x N phones). When our charge limit has
-      gated the FET the phone still reads plugged-in (powered) but `status` flips away from 2
-      (charging) - that "paused" state is exactly what we surface as charging:false. */
-  _batteryAndCharging(serial) {
-    try {
-      const out = this._adb(['-s', serial, 'shell', 'dumpsys', 'battery']);
-      const lvl = /level:\s*(\d+)/.exec(out);
-      const status = /status:\s*(\d+)/.exec(out);   // 2 = charging
-      const powered = [/AC powered:\s*true/i, /USB powered:\s*true/i, /Wireless powered:\s*true/i]
-        .some((re) => re.test(out));
-      const charging = status ? status[1] === '2' : powered;
-      return { battery: lvl ? parseInt(lvl[1], 10) : null, charging };
-    } catch { return { battery: null, charging: null }; }
-  }
-  _battery(serial) { return this._batteryAndCharging(serial).battery; }
-
   // ---- charge limiting: write the phone's sysfs charge-control nodes (best-effort, needs root)
-  _writeNode(serial, node, value) {
-    const inner = `echo ${value} > ${node}`;
-    return this._adb(['-s', serial, 'shell', this.suPrefix ? `${this.suPrefix} '${inner}'` : inner]);
+  // All async since v0.5.4. This runs on every socket open (saved policy) and again when the backend
+  // re-pushes the policy on connect, i.e. on EVERY reconnect of EVERY phone. It used to be ~5
+  // execFileSync calls per run (~1.1 s) and the backend's push ran it again plus a synchronous
+  // _metaPayload (~1.7 s): one flapping phone froze every stream on the computer several times a
+  // minute. See README, Gotchas.
+  /** One `adb shell` on the phone, wrapped in su when a prefix is configured. */
+  _shellAsync(serial, inner) {
+    return this._adbAsync(['-s', serial, 'shell', this.suPrefix ? `${this.suPrefix} '${inner}'` : inner]);
   }
-  _nodeExists(serial, node) {
-    const inner = `test -e ${node} && echo yes`;
-    try { return /yes/.test(this._adb(['-s', serial, 'shell', this.suPrefix ? `${this.suPrefix} '${inner}'` : inner])); }
-    catch { return false; }
+  _writeNodeAsync(serial, node, value) { return this._shellAsync(serial, `echo ${value} > ${node}`); }
+  /** true / false, or null when adb itself failed (phone busy or offline) so nobody caches a miss. */
+  async _nodeExistsAsync(serial, node) {
+    try { return /yes/.test(await this._shellAsync(serial, `test -e ${node} && echo yes`)); }
+    catch { return null; }
   }
   /** Open/close the charging FET on a generic gate node (semantics differ per node name). */
-  _setGate(serial, gate, allow) {
+  async _setGate(serial, gate, allow) {
     let val;
     if (/input_suspend/.test(gate)) val = allow ? 0 : 1;            // 1 = suspend input (stop)
     else if (/charge_control_limit/.test(gate)) val = allow ? 100 : 0;
     else val = allow ? 1 : 0;                                       // charging_enabled style
-    try { this._writeNode(serial, gate, val); }
+    try { await this._writeNodeAsync(serial, gate, val); }
     catch (e) { this.emit('log', `${serial}: charge gate write failed: ${(e && e.message) || e}`); }
   }
-  /** Is `su` usable on this phone (rooted)? Cached per device - probing every beat would be wasteful.
-      Sysfs charge control needs root; this lets us report "needs root" instead of failing silently. */
-  _hasRoot(serial) {
-    const dev = this.devices[serial];
-    if (dev && dev._rooted != null) return dev._rooted;
-    let rooted = false;
-    try {
-      const out = this._adb(['-s', serial, 'shell', this.suPrefix ? `${this.suPrefix} 'id'` : 'id']);
-      rooted = /uid=0/.test(out);
-    } catch { rooted = false; }
-    if (dev) dev._rooted = rooted;
-    return rooted;
+  /** Is `su` usable on this phone (rooted)? Cached per SERIAL in this._chargeProbe, which survives
+      _dropDevice. The old cache lived on the device object, which every reconnect threw away, so
+      every reconnect probed root again. */
+  async _hasRootAsync(serial) {
+    const c = this._chargeProbe[serial] = this._chargeProbe[serial] || {};
+    if (c.rooted != null) return c.rooted;
+    try { c.rooted = /uid=0/.test(await this._shellAsync(serial, 'id')); }
+    catch { return false; }   // adb failed: answer "no" for now, do not cache it
+    return c.rooted;
+  }
+  /** Which charge-control mechanism this phone has: { firmware: bool, gate: string|null }. Probed
+      once per serial (sysfs does not change while the phone stays plugged in) and cached only when
+      every probe got an answer from the phone, so a busy adb cannot pin a wrong result. Concurrent
+      callers (the saved policy on open + the backend's push a moment later) share one probe. */
+  _probeChargeNodes(serial) {
+    const c = this._chargeProbe[serial] = this._chargeProbe[serial] || {};
+    if (c.nodes) return Promise.resolve(c.nodes);
+    if (c.probing) return c.probing;
+    const N = this.chargeNodes;
+    c.probing = (async () => {
+      let complete = true;
+      const has = async (node) => { const r = await this._nodeExistsAsync(serial, node); if (r == null) complete = false; return !!r; };
+      const firmware = (await has(N.stopLevel)) && (await has(N.startLevel));
+      let gate = null;
+      if (!firmware) { for (const g of N.gates) { if (await has(g)) { gate = g; break; } } }
+      const nodes = { firmware, gate };
+      if (complete) c.nodes = nodes;
+      return nodes;
+    })();
+    c.probing.finally(() => { c.probing = null; }).catch(() => {});
+    return c.probing;
   }
   /** Apply the device's stored charge policy. Prefer the Pixel firmware hysteresis (no polling,
       keeps USB data alive); fall back to a slow poll loop toggling a charging-FET gate. Sets
       dev.chargeStatus to a human string that's reported up to the dashboard so the operator can
-      SEE on a real phone whether limiting is active, polling, or unavailable (no root / no node). */
-  _applyChargePolicy(serial) {
+      SEE on a real phone whether limiting is active, polling, or unavailable (no root / no node).
+      dev.chargeApplied records the policy actually in force so a repeat push can be skipped. */
+  async _applyChargePolicy(serial) {
     const dev = this.devices[serial];
     if (!dev) return;
     try { clearInterval(dev.chargeTimer); } catch {} dev.chargeTimer = null;
     const pol = dev.chargePolicy;
-    if (!pol || !pol.enabled) { this._restoreCharging(serial); return; }
+    if (!pol || !pol.enabled) { await this._restoreCharging(serial); return; }
     const { stop, resume } = pol;
     const N = this.chargeNodes;
-    if (this._nodeExists(serial, N.stopLevel) && this._nodeExists(serial, N.startLevel)) {
+    const nodes = await this._probeChargeNodes(serial);
+    if (this.devices[serial] !== dev) return;   // dropped / reconnected while we were probing
+    if (nodes.firmware) {
       try {
-        this._writeNode(serial, N.startLevel, resume);
-        this._writeNode(serial, N.stopLevel, stop);
+        await this._writeNodeAsync(serial, N.startLevel, resume);
+        await this._writeNodeAsync(serial, N.stopLevel, stop);
         dev.chargeMethod = 'firmware'; dev.chargeStatus = `firmware (stop ${stop} / resume ${resume})`;
+        dev.chargeApplied = pol;
         this.emit('log', `${serial}: charge limit via firmware (start ${resume} / stop ${stop})`);
         return;
       } catch (e) { this.emit('log', `${serial}: firmware charge nodes failed: ${(e && e.message) || e}`); }
     }
-    const gate = N.gates.find((g) => this._nodeExists(serial, g));
+    const gate = nodes.gate;
     if (!gate) {
-      const rooted = this._hasRoot(serial);
+      const rooted = await this._hasRootAsync(serial);
+      if (this.devices[serial] !== dev) return;
       dev.chargeMethod = 'none';
       dev.chargeStatus = rooted ? 'unavailable (no charge-control node on this device)'
                                 : 'unavailable (phone is not rooted)';
+      dev.chargeApplied = pol;
       this.emit('log', `${serial}: charge limiting ${dev.chargeStatus}`);
       return;
     }
     dev.chargeGate = gate; dev.chargeMethod = 'poll:' + gate;
     dev.chargeStatus = `poll ${gate.split('/').pop()} (stop ${stop} / resume ${resume})`;
+    dev.chargeApplied = pol;
     this.emit('log', `${serial}: charge limit via ${gate} poll loop (stop ${stop} / resume ${resume})`);
-    // Async battery read: this runs once a minute for EVERY phone, and a blocking read here stalls
-    // the video relay just as the heartbeat did. Flipping the gate is rare (only when a threshold is
-    // crossed), so that one may stay synchronous.
+    // Once a minute for EVERY phone, so it must stay off the event loop like the heartbeat.
     const tick = () => {
       this._batteryAndChargingAsync(serial).then(({ battery: b }) => {
         if (b == null) return;
-        try {
-          if (b >= stop) this._setGate(serial, gate, false);
-          else if (b <= resume) this._setGate(serial, gate, true);
-        } catch {}
+        if (b >= stop) return this._setGate(serial, gate, false);
+        if (b <= resume) return this._setGate(serial, gate, true);
       }).catch(() => {});
     };
     tick();
     dev.chargeTimer = setInterval(tick, 60000);
   }
   /** Undo any charge gating so the phone charges normally again (policy disabled / unpaired). */
-  _restoreCharging(serial) {
+  async _restoreCharging(serial) {
     const dev = this.devices[serial];
     if (!dev) return;
     try { clearInterval(dev.chargeTimer); } catch {} dev.chargeTimer = null;
     const N = this.chargeNodes;
     try {
-      if (this._nodeExists(serial, N.stopLevel)) this._writeNode(serial, N.stopLevel, 100);
-      if (this._nodeExists(serial, N.startLevel)) this._writeNode(serial, N.startLevel, 0);
-      if (dev.chargeGate) this._setGate(serial, dev.chargeGate, true);
+      const nodes = await this._probeChargeNodes(serial);
+      if (nodes.firmware) {
+        await this._writeNodeAsync(serial, N.stopLevel, 100);
+        await this._writeNodeAsync(serial, N.startLevel, 0);
+      }
+      if (dev.chargeGate) await this._setGate(serial, dev.chargeGate, true);
     } catch {}
     dev.chargeMethod = null; dev.chargeGate = null; dev.chargeStatus = 'off';
+    dev.chargeApplied = { enabled: false };
   }
-  /** Handle the backend's set_charge_policy op: validate, persist, apply, reflect in the dashboard. */
+  /** Two policies mean the same thing on the phone? (a disabled policy's numbers are irrelevant) */
+  _samePolicy(a, b) {
+    return !!a && !!b && !!a.enabled === !!b.enabled && (!a.enabled || (a.stop === b.stop && a.resume === b.resume));
+  }
+  /** Handle the backend's set_charge_policy op: validate, persist, apply, reflect in the dashboard.
+      The backend re-pushes the stored policy on EVERY connect; when it equals what this phone is
+      already running, nothing is probed or written - only the dashboard meta is refreshed. */
   setChargePolicy(serial, policy, ws) {
     if (!serial || !this.devices[serial]) return;
     const enabled = policy.enabled !== false;
@@ -394,12 +417,24 @@ class AgentCore extends EventEmitter {
       return;
     }
     const pol = { enabled, stop, resume };
-    this.devices[serial].chargePolicy = pol;
+    const dev = this.devices[serial];
+    dev.chargePolicy = pol;
     const tokens = this._loadTokens();
-    if (tokens[serial]) { tokens[serial].chargePolicy = pol; this._saveTokens(tokens); }
+    if (tokens[serial] && !this._samePolicy(tokens[serial].chargePolicy, pol)) { tokens[serial].chargePolicy = pol; this._saveTokens(tokens); }
+    if (this._samePolicy(dev.chargeApplied, pol)) {
+      this.emit('log', `set_charge_policy (${serial}) unchanged (${JSON.stringify(pol)}) - already applied, not re-probing`);
+      this._sendMeta(serial, ws);
+      return;
+    }
     this.emit('log', `set_charge_policy (${serial}) -> ${JSON.stringify(pol)}`);
-    this._applyChargePolicy(serial);
-    try { ws && ws.send(JSON.stringify({ op: 'meta', data: this._metaPayload(serial) })); } catch {}
+    this._applyChargePolicy(serial).catch(() => {}).then(() => this._sendMeta(serial, ws));
+  }
+  /** Reply with a fresh meta payload on the given socket. Always the async reader: the blocking
+      _metaPayload (3 execFileSync calls) was what every profile switch / rename / policy push paid. */
+  _sendMeta(serial, ws) {
+    this._metaPayloadAsync(serial, true)
+      .then((data) => { try { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ op: 'meta', data })); } catch {} })
+      .catch(() => {});
   }
   /** Handle create_profiles: bulk pm create-user + clone an app into each, then report back. */
   createProfiles(serial, count, pkg, prefix, ws) {
@@ -435,7 +470,7 @@ class AgentCore extends EventEmitter {
     }
     this.emit('log', `create_profiles done: ${made}/${count} created`);
     try { this.devices[serial]._metaCache = null; } catch {}   // force a fresh user list next meta
-    try { ws && ws.send(JSON.stringify({ op: 'meta', data: this._metaPayload(serial, true) })); } catch {}
+    this._sendMeta(serial, ws);
   }
   /** Handle upload_media: fetch each file from the backend and push it into the gallery.
       Files land in /sdcard/DCIM/Camera of the ACTIVE profile, at full original quality (adb push
@@ -510,16 +545,16 @@ class AgentCore extends EventEmitter {
   async _pushToGallery(serial, local, name, uid) {
     if (!uid || uid === 0) {
       const dest = '/sdcard/DCIM/Camera';
-      try { this._adb(['-s', serial, 'shell', 'mkdir', '-p', dest]); } catch {}
+      try { await this._adbAsync(['-s', serial, 'shell', 'mkdir', '-p', dest]); } catch {}
       await this._adbPush(serial, local, `${dest}/${name}`);
       try {
-        this._adb(['-s', serial, 'shell', 'am', 'broadcast',
+        await this._adbAsync(['-s', serial, 'shell', 'am', 'broadcast',
           '-a', 'android.intent.action.MEDIA_SCANNER_SCAN_FILE', '-d', `file://${dest}/${name}`]);
       } catch {}
       return `${dest}/${name}`;
     }
-    try { this._adb(['-s', serial, 'shell', 'am', 'start-user', String(uid)]); } catch {}   // provider must be up
-    return this._hasRoot(serial)
+    try { await this._adbAsync(['-s', serial, 'shell', 'am', 'start-user', String(uid)]); } catch {}   // provider must be up
+    return (await this._hasRootAsync(serial))
       ? this._pushToGalleryRoot(serial, local, name, uid)
       : this._pushToGalleryMediaStore(serial, local, name, uid);
   }
@@ -531,14 +566,14 @@ class AgentCore extends EventEmitter {
     await this._adbPush(serial, local, staged);
     try {
       const inner = `mkdir -p '${dest}' && cp '${staged}' '${dest}/${name}'`;
-      this._adb(['-s', serial, 'shell', `${this.suPrefix} "${inner}"`]);
-      try { this._adb(['-s', serial, 'shell', `${this.suPrefix} "cmd media scan '${dest}/${name}'"`]); }
+      await this._adbAsync(['-s', serial, 'shell', `${this.suPrefix} "${inner}"`]);
+      try { await this._adbAsync(['-s', serial, 'shell', `${this.suPrefix} "cmd media scan '${dest}/${name}'"`]); }
       catch {
-        try { this._adb(['-s', serial, 'shell', 'am', 'broadcast', '--user', String(uid),
+        try { await this._adbAsync(['-s', serial, 'shell', 'am', 'broadcast', '--user', String(uid),
           '-a', 'android.intent.action.MEDIA_SCANNER_SCAN_FILE', '-d', `file://${dest}/${name}`]); } catch {}
       }
     } finally {
-      try { this._adb(['-s', serial, 'shell', 'rm', '-f', staged]); } catch {}
+      try { await this._adbAsync(['-s', serial, 'shell', 'rm', '-f', staged]); } catch {}
     }
     return `${dest}/${name} (user ${uid}, root)`;
   }
@@ -560,13 +595,13 @@ class AgentCore extends EventEmitter {
         + ` --bind ${this._shq('_display_name:s:' + name)}`
         + ` --bind ${this._shq('mime_type:s:' + this._mimeFor(name, isVideo))}`
         + ` --bind ${this._shq('relative_path:s:DCIM/Camera/')}`;
-      this._adb(['-s', serial, 'shell', insertCmd]);
-      const id = this._mediaStoreId(serial, coll, name, uid);
+      await this._adbAsync(['-s', serial, 'shell', insertCmd]);
+      const id = await this._mediaStoreId(serial, coll, name, uid);
       if (id == null) throw new Error('MediaStore row not found after insert');
       await this._adbShellLong(serial, `content write --user ${uid} --uri ${coll}/${id} < '${staged}'`);
       return `${coll}/${id} (user ${uid}, mediastore)`;
     } finally {
-      try { this._adb(['-s', serial, 'shell', 'rm', '-f', staged]); } catch {}
+      try { await this._adbAsync(['-s', serial, 'shell', 'rm', '-f', staged]); } catch {}
     }
   }
   /** Single-quote a value for the phone's /system/bin/sh. adb shell joins argv into one string
@@ -580,12 +615,12 @@ class AgentCore extends EventEmitter {
       phone's shell intact - the earlier version passed it unquoted, the device shell dropped the
       quotes, and `content` got `_display_name=NAME.jpeg` (a bare token, not a string), matched
       nothing, and every secondary-profile upload failed with "row not found after insert". */
-  _mediaStoreId(serial, coll, name, uid) {
+  async _mediaStoreId(serial, coll, name, uid) {
     const where = `_display_name='${String(name).replace(/'/g, "''")}'`;
     try {
       const cmd = `content query --user ${uid} --uri ${coll} --projection _id`
         + ` --where ${this._shq(where)} --sort ${this._shq('_id DESC')}`;
-      const out = this._adb(['-s', serial, 'shell', cmd]);
+      const out = await this._adbAsync(['-s', serial, 'shell', cmd]);
       const m = /_id=(\d+)/.exec(out);
       return m ? m[1] : null;
     } catch { return null; }
@@ -618,29 +653,6 @@ class AgentCore extends EventEmitter {
       return users;
     } catch { return []; }
   }
-  /** Android users = "profiles". Owner-set names (renames the phone refused) overlay the raw ones. */
-  _listUsers(serial) {
-    const users = this._parseUsers(serial);
-    const ov = (this._loadTokens()[serial] || {}).profiles || {};
-    users.forEach((u) => { if (ov[u.id]) u.name = ov[u.id]; });
-    return users;
-  }
-  _currentUser(serial) { try { const v = parseInt(this._adb(['-s', serial, 'shell', 'am', 'get-current-user']).trim(), 10); return isNaN(v) ? null : v; } catch { return null; } }
-  /** Heartbeat payload. Battery is re-read every beat (it changes); the user/profile list barely ever
-      does, so when full=false we reuse the cached list instead of shelling out `pm list users` +
-      `am get-current-user`. That keeps the 10s heartbeat from flooding adb (3 commands x N phones every
-      10s) and contending with scrcpy's video over the same adb server. switchUser/renameUser pass
-      full=true so a real change is reflected immediately. Payload shape is identical either way. */
-  _metaPayload(serial, full = true) {
-    const dev = this.devices[serial];
-    const bc = this._batteryAndCharging(serial);   // battery + charging in one adb call
-    const cs = dev && dev.chargeStatus;            // human-readable charge-limit state for the dashboard
-    if (!full && dev && dev._metaCache) return { battery: bc.battery, charging: bc.charging, charge_status: cs, ...dev._metaCache };
-    const cache = { users: this._listUsers(serial), current_user: this._currentUser(serial) };
-    if (dev) dev._metaCache = cache;
-    return { battery: bc.battery, charging: bc.charging, charge_status: cs, ...cache };
-  }
-
   // ---- token store: agent.json = { devices: { serial: { device_token, name } } }
   _loadTokens() {
     let raw; try { raw = JSON.parse(fs.readFileSync(this.tokenFile, 'utf8')); } catch { return {}; }
@@ -764,8 +776,18 @@ class AgentCore extends EventEmitter {
       const connected = dev && dev.ws && dev.ws.readyState <= 1;   // CONNECTING(0) or OPEN(1)
       if (plugged[serial] && !connected) this.connectHome(serial, tokens[serial].device_token);
     });
-    Object.keys(this.devices).forEach((serial) => {               // unplugged -> stop reconnecting + go offline
-      if (!plugged[serial]) this._dropDevice(serial);
+    // Unplugged -> stop reconnecting + go offline. Debounced (v0.5.4): a phone must be missing from
+    // TWO consecutive scans (>= 4 s) before it is dropped. A USB hiccup makes a Pixel vanish from
+    // `adb devices` (or show "offline") for a single scan; dropping it on that costs a full
+    // reconnect, which the dashboard shows as a disconnect and which re-applies the charge policy.
+    Object.keys(this.devices).forEach((serial) => {
+      const dev = this.devices[serial];
+      if (plugged[serial]) { dev.missedScans = 0; return; }
+      dev.missedScans = (dev.missedScans || 0) + 1;
+      if (dev.missedScans < 2) return;
+      const row = this.detectAll().find((d) => d.serial === serial);
+      this.emit('log', `${serial}: ${row ? 'adb reports it "' + row.state + '"' : 'gone from adb devices'} for ${dev.missedScans} scans - dropping (USB cable/hub?)`);
+      this._dropDevice(serial);
     });
   }
 
@@ -815,7 +837,7 @@ class AgentCore extends EventEmitter {
       // doing it here too means the limit holds even if that message is missed).
       try {
         const saved = (this._loadTokens()[serial] || {}).chargePolicy;
-        if (saved) { dev.chargePolicy = saved; this._applyChargePolicy(serial); }
+        if (saved) { dev.chargePolicy = saved; this._applyChargePolicy(serial).catch(() => {}); }
       } catch {}
       let beat = 0;
       // Battery every 30s (it is a dashboard number, not telemetry), full profile list every 60s.
@@ -896,8 +918,10 @@ class AgentCore extends EventEmitter {
         this.unpair(serial);
         return;
       }
-      this.emit('status', { serial, state: 'reconnecting' });
       dev.backoff = Math.min((dev.backoff || 1000) * 2, 30000);
+      const owned = this.devices[serial] === dev;   // false after _dropDevice: reconcile() decides, not this timer
+      this.emit('log', `${serial}: phone-home socket closed (code ${(e && e.code) || '?'}) - ${owned ? 'reconnecting in ' + dev.backoff + ' ms' : 'dropped by this app (unplug/refresh/unpair)'}`);
+      this.emit('status', { serial, state: 'reconnecting' });
       dev.reconnectTimer = setTimeout(() => { if (this.devices[serial] && this.devices[serial].token === token) this.connectHome(serial, token); }, dev.backoff);
     });
     ws.addEventListener('error', () => { try { ws.close(); } catch {} });
@@ -959,7 +983,7 @@ class AgentCore extends EventEmitter {
   unpair(serial) {
     const tokens = this._loadTokens();
     if (tokens[serial]) { delete tokens[serial]; this._saveTokens(tokens); }
-    try { this._restoreCharging(serial); } catch {}   // stop limiting before we forget the phone
+    this._restoreCharging(serial).catch(() => {}).then(() => { delete this._chargeProbe[serial]; });   // stop limiting before we forget the phone
     this._dropDevice(serial);
     this.emit('log', `unpaired ${serial} (removed on the website)`);
     this.emit('status', { serial, state: 'unpaired' });
@@ -1086,11 +1110,27 @@ class AgentCore extends EventEmitter {
         // 4) Wait for the mobile network to actually come back (a reachability probe, no IP logged).
         R.network = await this._waitForNetwork(serial, 14000);
         log(`Mobile network recovery: ${R.network ? 'PASS (' + R.network + ')' : 'FAIL'}`);
+        // 5) The new profile's screen timeout + stay awake while plugged in (see _keepScreenOn).
+        R.screen = await this._keepScreenOn(serial, id);
+        log(`Keep screen on: ${R.screen ? 'PASS' : 'FAIL'}`);
       }
     } catch (e) {
       log(`switch_user isolated error: ${(e && e.message) || e}`);
     }
-    try { ws.send(JSON.stringify({ op: 'meta', data: this._metaPayload(serial) })); } catch {}
+    this._sendMeta(serial, ws);
+  }
+  /** Keep the profile we just switched to from going dark. Every Android profile has its OWN
+      screen timeout and a fresh one defaults to 30 s, so a VA sees the phone "go black" half a
+      minute after the switch (scrcpy mirrors a sleeping phone as black). Stay-awake-while-plugged
+      is global and covers the charging case; the 30-minute per-profile timeout covers the Pixel 8s
+      that drop out of "charging" during the switch. Best-effort, verified by reading back. */
+  async _keepScreenOn(serial, uid) {
+    try {
+      await this._adbLong(serial, ['shell', 'settings', 'put', 'global', 'stay_on_while_plugged_in', '7'], 6000).catch(() => {});
+      await this._adbLong(serial, ['shell', 'settings', '--user', String(uid), 'put', 'system', 'screen_off_timeout', String(SCREEN_OFF_TIMEOUT_MS)], 6000).catch(() => {});
+      const v = (await this._adbLong(serial, ['shell', 'settings', '--user', String(uid), 'get', 'system', 'screen_off_timeout'], 6000).catch(() => '')).trim();
+      return v === String(SCREEN_OFF_TIMEOUT_MS);
+    } catch { return false; }
   }
 
   /** Set airplane mode on/off. Android 11+ path first; older devices get the settings+broadcast
@@ -1425,7 +1465,7 @@ class AgentCore extends EventEmitter {
       this._saveTokens(tokens);
     }
     this.emit('log', `rename_user ${id} -> "${clean}" (${onPhone ? 'renamed on the phone' : 'saved in PhoneDesk'})`);
-    try { ws.send(JSON.stringify({ op: 'meta', data: this._metaPayload(serial) })); } catch {}
+    this._sendMeta(serial, ws);
   }
 }
 

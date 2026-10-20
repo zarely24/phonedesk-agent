@@ -25,9 +25,12 @@ roughly **190 blocking calls a minute** with 18 phones on one computer. Measured
 video arriving from this agent stalled 20 times in 40 seconds, the worst gap 672 ms. It was invisible
 with two or three phones and crippling with eighteen.
 
-**Rule: anything on a timer must use `_adbAsync`, never `_adb`.** One-off calls behind a human action
-(switch profile, rename, upload) may stay synchronous — they are rare and not on the video path.
-`tools/test-nonblocking.js` enforces this.
+**Rule: anything on a timer must use `_adbAsync`, never `_adb`.** And since v0.5.4 the same goes for
+anything that runs on every reconnect or that VAs trigger all day (the charge probe, the policy push,
+upload-to-gallery, the meta reply after a profile switch) — "rare" turned out to mean forty times an
+hour on a busy computer. The only synchronous adb left is behind genuinely rare owner actions: pairing
+(`getprop`), creating or renaming profiles, and the full "refresh everything" button.
+`tools/test-nonblocking.js` and `tools/test-freeze-paths.js` enforce this.
 
 ---
 
@@ -84,6 +87,7 @@ Download page for a fresh install: <https://phonedesk.map-mgt.com/download/>
 
 | Version | What changed |
 |---|---|
+| **v0.5.4** | **No more frozen video from reconnects, uploads and profile switches.** Measured 2026-10-20 on PC 2: one Pixel 8a with a flaky USB link reconnected 36 times in 29 minutes and every reconnect ran the synchronous charge probe (~1.1 s) plus the backend's policy re-push (~1.7 s more), 27 profile switches each ended in a blocking meta reply, and three gallery uploads sat in 8 s adb timeouts — the single thread that relays all 20 phones' video on that computer was frozen for minutes per half hour, which VAs saw as screens going black and phones "disconnecting". Now: the charge probe is async and cached per serial across reconnects (zero adb calls on a reconnect), an identical policy push is skipped, every meta reply and the whole upload-to-gallery path use the async adb helper, the blocking readers are deleted, a phone is only dropped after missing from two consecutive `adb devices` scans (with the reason logged), and every socket close logs its code. Also: after a profile switch the agent sets stay-awake-while-plugged and a 30-minute screen timeout on the new profile (`Keep screen on: PASS/FAIL`), because a fresh profile's 30 s default is what made the Pixel 8s "go black" after a switch. Tests: `npm run test:freeze` (`tools/test-nonblocking.js` + `tools/test-freeze-paths.js`) |
 | **v0.5.3** | Owner-window fix only, no agent/phone logic touched. In v0.5.2 the Instagram diagnostic panel was appended to `<body>` *after* `.app`, and `.app` is `height:100%` of a fixed 480x660 window - so on a computer with more than ~11 phones the list was taller than the window and the panel was painted on top of phones 29-33 ("Instagram diagnostic (advanced)" text across the rows, white input boxes over the list). Its body also carried an inline `display:flex`, which beats the `.hide` class, so it was never collapsed. And its phone picker asked the main process for a *separate* phone list via a synchronous `adb devices`; whenever adb was busy the picker stayed empty and "Run diagnostic" could only say "Pick a phone". Now: the panel lives inside the phones step below "Reset pairings", `.app` grows with the list (`min-height`), hide/show is done with id-level rules, the controls are dark-themed, and the picker is filled from the same 2 s status snapshot that draws the list (same names, same order, "- not connected" suffix for unplugged phones). Also hides the update bar properly - the same id-beats-class flaw left an empty bar with a blue pill at the bottom of every window since v0.4.3 |
 | **v0.5.2** | Profile switch now *verifies* the airplane-mode cycle (Airplane ON / OFF / mobile-network recovery each reported PASS or FAIL via telephony state, not just ping), the read-only Instagram status diagnostic (`tools/ig-status-diagnose.js`, manual launcher in the owner window, and the `ig_diagnostic` RPC op so the backend can trigger it) and the monitoring fixtures/classifier tests |
 | **v0.5.1** | Ships the WebRTC-capable agent, dormant by default. The WebRTC path is a proof of concept: no TURN, unvalidated on real hardware - do not switch it on for the farm |
@@ -121,23 +125,44 @@ moved 18 phones without anyone touching the owner's machine.
 **Eighteen phones all connect within a second of each other**, so anything on a per-phone timer fires
 in one burst unless it is staggered. That burst is what made the blocking calls so visible.
 
-**The connect-time charge probe is still synchronous, and it is a fleet-wide outage waiting to
-happen (2026-10-16).** On every socket `open`, `_applyChargePolicy` runs from the saved policy: about
-five `_adb` (execFileSync) calls — `_nodeExists` for the firmware nodes and each gate, then `_hasRoot`
-— ~1.1 s per phone. The `_rooted` cache does not help because `_dropDevice` deletes the device object
-on every reconnect. The backend then re-pushes `set_charge_policy` on connect and `setChargePolicy`
-runs the whole thing again plus a synchronous `_metaPayload`. Sixteen phones reconnecting in the same
-second = the event loop frozen ~30 s, which exceeded the server's 20 s ping timeout, which dropped
-all sixteen again: a self-sustaining reconnect spiral in which no `open_stream` is answered inside the
-viewer's 10 s window, so every phone on that computer shows Online with a blank screen and the row's
-Refresh (which only reconnects the socket) cannot help. It was triggered by one `spawnSync` gallery
-upload timing out (`upload 8.MOV failed: ... ETIMEDOUT`). Mitigated on the server (uvicorn
-`--ws-ping-timeout 120`, see the backend README, Diagnostics). **The fix that belongs here:** move
-`_nodeExists` / `_hasRoot` / `_restoreCharging` and `setChargePolicy`'s meta reply onto `_adbAsync`,
-keep `_rooted` in the token file so a reconnect does not re-probe, and make `uploadMedia` use
-`execFile` with a timeout instead of `spawnSync`. Charge limiting is "unavailable (phone is not
-rooted)" on every phone in the fleet today, so until then the cheapest relief is to not re-push the
-policy on connect at all.
+**The connect-time charge probe used to be synchronous, and it froze whole computers (2026-10-16,
+again 2026-10-20; fixed in v0.5.4).** On every socket `open`, `_applyChargePolicy` ran from the saved
+policy: about five `_adb` (execFileSync) calls — `_nodeExists` for the firmware nodes and each gate,
+then `_hasRoot` — ~1.1 s per phone. The `_rooted` cache did not help because `_dropDevice` deleted
+the device object on every reconnect. The backend then re-pushes `set_charge_policy` on connect and
+`setChargePolicy` ran the whole thing again plus a synchronous `_metaPayload` (~1.7 s). On
+2026-10-16 sixteen phones reconnecting in the same second froze the loop ~30 s, longer than the
+server's 20 s ping timeout, so all sixteen dropped again: a self-sustaining spiral, every screen on
+that computer blank (mitigated on the server with uvicorn `--ws-ping-timeout 120`). On 2026-10-20 the
+same mechanism ran at a smaller scale all shift long on PC 2: ONE Pixel 8a with a flaky USB link
+reconnected 36 times in 29 minutes (83 charge probes, 41 policy pushes), plus 27 profile switches each
+ending in the blocking meta reply, plus three gallery uploads whose `_adb` calls hit the 8 s cap
+(`spawnSync ... ETIMEDOUT`). Add it up and the relay was frozen for a few minutes out of every half
+hour, in 1–10 s bites — which VAs on the other 19 phones reported as "the screen keeps going black"
+and "the phones keep disconnecting", while every phone showed Online.
+
+What v0.5.4 changed, in `src/core.js`: the probe (`_probeChargeNodes`, `_hasRootAsync`,
+`_writeNodeAsync`) is async and its result is cached **per serial in `this._chargeProbe`**, which
+survives `_dropDevice` — so a reconnect costs zero adb calls, and an incomplete probe (adb failed) is
+never cached. `setChargePolicy` compares the push with `dev.chargeApplied` and skips an identical one
+(`... unchanged ... not re-probing` in the log). Every "reply with meta" goes through `_sendMeta`
+(the async reader); the blocking `_metaPayload` / `_batteryAndCharging` / `_listUsers` /
+`_currentUser` were deleted so nobody reaches for them again. Upload-to-gallery runs every adb call
+through `_adbAsync` (the pushes were already async; the `content insert/query`, `mkdir`, `rm`, scan
+broadcast were not). And `reconcile()` only drops a phone after it has been missing from **two**
+consecutive `adb devices` scans (a USB hiccup is one), logging why:
+`<serial>: adb reports it "offline" for 2 scans - dropping (USB cable/hub?)`. The socket close handler
+now logs `phone-home socket closed (code N) - reconnecting in X ms` or `- dropped by this app`, so a
+"keeps disconnecting" phone can be told apart from a bad cable by grep alone. The server-side ping
+timeout stays as belt-and-braces.
+
+**A profile switch now also keeps the new profile's screen on (v0.5.4).** Each Android profile has
+its own screen timeout and a freshly created one defaults to 30 s; scrcpy mirrors a sleeping phone as
+black, so a VA switched onto a new profile saw the phone "go black" half a minute later. After a
+successful switch the agent sets `stay_on_while_plugged_in=7` (global, what Developer options "Stay
+awake" sets) and that profile's `screen_off_timeout` to 30 minutes, then reads it back and logs
+`Keep screen on: PASS/FAIL` next to the airplane-cycle lines. Phones that are not charging still sleep
+after 30 idle minutes; the VA's power button in the viewer wakes them.
 
 **One shared ws-scrcpy serves every phone**, and it is single-threaded too. If CPU ever becomes the
 limit, sharding phones across several ws-scrcpy processes is the next move — the dashboard's
@@ -170,8 +195,14 @@ phone is alone, because guessing high is what makes video freeze. See `backend/R
 ## Tests
 
 ```bash
-node tools/test-nonblocking.js
+npm run test:freeze        # = node tools/test-nonblocking.js && node tools/test-freeze-paths.js
 ```
 
-Proves the recurring pollers never reach the blocking adb helper — the property that caused the worst
-bug in this codebase, pinned so it cannot come back.
+`test-nonblocking.js` proves the recurring pollers never reach the blocking adb helper — the property
+that caused the worst bug in this codebase, pinned so it cannot come back. `test-freeze-paths.js`
+(v0.5.4) does the same for the paths that run on every reconnect and every VA action: the charge
+probe (async, cached across a `_dropDevice`, an unreachable phone is not cached), the skipped
+identical policy push, upload-to-gallery, the two-scan drop debounce in `reconcile()`, and the
+profile switch (keep-screen-on commands with `--user` before `put`, meta reply via the async reader).
+Both stub adb entirely; no phone needed, about ten seconds (the switch test waits out the real
+airplane-cycle delays).

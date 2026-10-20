@@ -1,6 +1,6 @@
 {
   "name": "phonedesk-agent",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "private": true,
   "description": "PhoneDesk owner agent - installs on the owner's PC/Mac, runs ws-scrcpy, and brings the phone online for VAs.",
   "author": "PhoneDesk",
@@ -11,6 +11,7 @@
     "core": "node agent.js",
     "webrtc-diagnose": "node tools/webrtc-diagnose.js",
     "test:rtp": "node tools/test_rtp.js",
+    "test:freeze": "node tools/test-nonblocking.js && node tools/test-freeze-paths.js",
     "dist:win": "electron-builder --win",
     "dist:mac": "electron-builder --mac",
     "test:airplane": "node tools/test_airplane.js",
