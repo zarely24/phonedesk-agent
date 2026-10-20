@@ -30,6 +30,10 @@ extraResources:
     to: "ws-scrcpy"
   - from: "resources/adb"
     to: "adb"
+  # scrcpy-server 5.0.1 (upstream release jar, sha256 764eb6f7...3bc536): the modern server the WebRTC
+  # path launches for H.265 (src/scrcpy-capture.js). Lives beside ws-scrcpy, never replaces it.
+  - from: "resources/scrcpy"
+    to: "scrcpy"
 # The release feed electron-updater reads (latest.yml lives on these GitHub Releases).
 publish:
   provider: github

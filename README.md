@@ -57,7 +57,10 @@ Up to **30 phones per computer**.
 | `src/main.js` | Electron shell, window, auto-update, the 2s reconcile timer |
 | `src/core.js` | everything else: adb, pairing, sockets, tunnels, profiles, charge limiting |
 | `src/renderer/` | the small setup UI the owner sees |
-| `resources/` | bundled adb and ws-scrcpy, shipped via `extraResources` |
+| `src/webrtc.js` | the dormant WebRTC sender (POC): offers H.264, or H.265 + H.264 when `WEBRTC_CODEC=h265`, and starts the matching capture once the browser answers |
+| `src/h264-rtp.js` / `src/h265-rtp.js` | Annex-B NAL parsing + RTP packetization (RFC 6184 / RFC 7798). Pure code, no hardware, unit-tested |
+| `src/scrcpy-capture.js` | raw video capture from the bundled **scrcpy 5.0.1** server (the one that can do `video_codec=h265`); the legacy 1.19-ws7 jar stays H.264-only |
+| `resources/` | bundled adb, ws-scrcpy (with its 1.19-ws7 scrcpy jar) and `resources/scrcpy/scrcpy-server-v5.0.1`, shipped via `extraResources` |
 
 Pairings are stored in `agent.json` under Electron's `userData`
 (`%APPDATA%\PhoneDesk` on Windows), **not** in the program folder — so updates and reinstalls keep
@@ -87,6 +90,7 @@ Download page for a fresh install: <https://phonedesk.map-mgt.com/download/>
 
 | Version | What changed |
 |---|---|
+| **unreleased (2026-10-20)** | **H.265 over WebRTC, still dormant.** The WebRTC POC could only send H.264 because the only scrcpy server we shipped (1.19-ws7, ws-scrcpy's) predates codec selection. The agent now also bundles the upstream **scrcpy-server 5.0.1** (`resources/scrcpy/`, sha256 `764eb6f7…3bc536`, pushed to the phone as `/data/local/tmp/scrcpy-server-pd5.jar` so it never collides with ws-scrcpy's jar) and can ask it for `video_codec=h265`. `src/scrcpy-capture.js` speaks the 5.x wire protocol (dummy byte, 64-byte device name, u32 codec id, 12-byte session/media records told apart by the top bit); `src/h265-rtp.js` packetizes HEVC per RFC 7798 (single-NAL + FU type 49, VPS/SPS/PPS re-sent with every IRAP). **Nothing changes unless two env vars are set on the owner's machine:** `WEBRTC_ENABLED=1` (as before) and `WEBRTC_CODEC=h265`. With both, the SDP offer lists H.265 first and H.264 second; the capture starts only after the browser answers, using whichever codec it accepted, so a browser without HEVC decode (Edge, old Chrome, no hardware decoder) silently gets the old H.264 path and a browser that accepts neither makes the agent close the session so the page falls back to the legacy stream. `WEBRTC_CODEC=h265-only` removes the H.264 safety net for experiments. Verified without a phone: `npm run test:rtp` (76 checks), `node tools/test_webrtc_negotiation.js` (14 checks, a werift peer plays the browser), and `node tools/rtp-ffmpeg-check.js <clip.h265>` (our RTP into ffmpeg's own RFC 7798 depacketizer + decoder: 180/180 frames). **Not yet verified on a phone** — `npm run webrtc-diagnose -- --codec both` on the farm host is the next step; see `docs/webrtc-hardware-validation.md` rows B1–B5 |
 | **v0.5.4** | **No more frozen video from reconnects, uploads and profile switches.** Measured 2026-10-20 on PC 2: one Pixel 8a with a flaky USB link reconnected 36 times in 29 minutes and every reconnect ran the synchronous charge probe (~1.1 s) plus the backend's policy re-push (~1.7 s more), 27 profile switches each ended in a blocking meta reply, and three gallery uploads sat in 8 s adb timeouts — the single thread that relays all 20 phones' video on that computer was frozen for minutes per half hour, which VAs saw as screens going black and phones "disconnecting". Now: the charge probe is async and cached per serial across reconnects (zero adb calls on a reconnect), an identical policy push is skipped, every meta reply and the whole upload-to-gallery path use the async adb helper, the blocking readers are deleted, a phone is only dropped after missing from two consecutive `adb devices` scans (with the reason logged), and every socket close logs its code. Also: after a profile switch the agent sets stay-awake-while-plugged and a 30-minute screen timeout on the new profile (`Keep screen on: PASS/FAIL`), because a fresh profile's 30 s default is what made the Pixel 8s "go black" after a switch. Tests: `npm run test:freeze` (`tools/test-nonblocking.js` + `tools/test-freeze-paths.js`) |
 | **v0.5.3** | Owner-window fix only, no agent/phone logic touched. In v0.5.2 the Instagram diagnostic panel was appended to `<body>` *after* `.app`, and `.app` is `height:100%` of a fixed 480x660 window - so on a computer with more than ~11 phones the list was taller than the window and the panel was painted on top of phones 29-33 ("Instagram diagnostic (advanced)" text across the rows, white input boxes over the list). Its body also carried an inline `display:flex`, which beats the `.hide` class, so it was never collapsed. And its phone picker asked the main process for a *separate* phone list via a synchronous `adb devices`; whenever adb was busy the picker stayed empty and "Run diagnostic" could only say "Pick a phone". Now: the panel lives inside the phones step below "Reset pairings", `.app` grows with the list (`min-height`), hide/show is done with id-level rules, the controls are dark-themed, and the picker is filled from the same 2 s status snapshot that draws the list (same names, same order, "- not connected" suffix for unplugged phones). Also hides the update bar properly - the same id-beats-class flaw left an empty bar with a blue pill at the bottom of every window since v0.4.3 |
 | **v0.5.2** | Profile switch now *verifies* the airplane-mode cycle (Airplane ON / OFF / mobile-network recovery each reported PASS or FAIL via telephony state, not just ping), the read-only Instagram status diagnostic (`tools/ig-status-diagnose.js`, manual launcher in the owner window, and the `ig_diagnostic` RPC op so the backend can trigger it) and the monitoring fixtures/classifier tests |
@@ -206,3 +210,32 @@ identical policy push, upload-to-gallery, the two-scan drop debounce in `reconci
 profile switch (keep-screen-on commands with `--user` before `put`, meta reply via the async reader).
 Both stub adb entirely; no phone needed, about ten seconds (the switch test waits out the real
 airplane-cycle delays).
+
+### WebRTC codec plumbing (no phone needed)
+
+```bash
+npm run test:rtp                          # H.264 (42 checks) + H.265 (34 checks) parse/packetize, synthetic NALs
+node tools/test_webrtc_negotiation.js     # offer/answer against a werift peer: H.265 chosen, H.264 fallback, rejection
+npm run rtp-check -- path/to/clip.h265    # our RTP -> ffmpeg's depacketizer+decoder; PASS = every frame decoded
+```
+
+The third one is the closest thing to a real receiver without hardware: ffmpeg implements RFC 7798 /
+RFC 6184 independently of us, so if it decodes every frame our fragmentation, headers and markers are
+right. Make a clip with ffmpeg itself (`testsrc2`, `libx265`, `keyint=30:repeat-headers=1:bframes=0`,
+`-f hevc`); the command is in the tool's header. Note the tool replays the first GOP after the clip: RTP
+has no end-of-stream and ffmpeg holds its last ~20 decoded frames until more data arrives, so without
+that tail the count was always 160/180 and looked like a packetizer bug (it was not — both codecs lost
+exactly the same frames).
+
+### WebRTC on a real phone (owner's machine)
+
+```bash
+npm install
+npm run webrtc-diagnose -- --codec both --seconds 8      # add --serial <serial> to pick a phone
+```
+
+Runs the legacy H.264 capture and then the scrcpy 5 H.265 capture on the same phone, prints PASS/FAIL
+per step (server start, socket, VPS/SPS/PPS, IRAP, fps) plus the bitrate each codec used for the same
+seconds of screen. Scroll something on the phone while it runs — a still screen makes both numbers
+tiny and meaningless. The `list_encoders` line tells you whether the phone has a hardware HEVC encoder
+at all (Pixel/Tensor: `c2.exynos.hevc.encoder`). Paste the whole output back; it contains no secrets.
