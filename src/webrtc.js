@@ -45,12 +45,28 @@ const PROFILES = {
   thumbnail:{ maxSize: 540,  bitRate: 800000,  maxFps: 15 },
 };
 
-/** What to offer, from WEBRTC_CODEC (see header). Returns 'h264' | 'h265' | 'h265-only'. */
-function codecMode() {
-  const v = String(process.env.WEBRTC_CODEC || '').trim().toLowerCase();
-  if (v === 'h265' || v === 'hevc') return 'h265';
-  if (v === 'h265-only' || v === 'hevc-only') return 'h265-only';
-  return 'h264';
+/** What to offer: 'h264' | 'h265' | 'h265-only'. WEBRTC_CODEC in the owner's environment wins when
+    set; otherwise the `codec` the backend put in `open_webrtc` (its WEBRTC_CODEC setting, since
+    v0.5.5 - so the switch lives on the server, not on the farm computer); otherwise H.264. */
+function codecMode(msg) {
+  const parse = (raw) => {
+    const v = String(raw || '').trim().toLowerCase();
+    if (v === 'h265' || v === 'hevc') return 'h265';
+    if (v === 'h265-only' || v === 'hevc-only') return 'h265-only';
+    if (v === 'h264' || v === 'avc') return 'h264';
+    return null;
+  };
+  return parse(process.env.WEBRTC_CODEC) || parse(msg && msg.codec) || 'h264';
+}
+
+/** Is WebRTC allowed on this computer? WEBRTC_ENABLED in the owner's environment decides when it is
+    set at all (truthy = on, anything else = off, an explicit owner veto). When it is NOT set, the
+    backend's `enabled: true` in `open_webrtc` is enough (v0.5.5): the backend only sends that for
+    phones in its WEBRTC_DEVICE_IDS, so the fleet stays dormant until someone opts a phone in there. */
+function webrtcAllowed(msg) {
+  const raw = String(process.env.WEBRTC_ENABLED || '').trim();
+  if (raw) return /^(1|true|yes|on)$/i.test(raw);
+  return !!(msg && msg.enabled === true);
 }
 
 /** werift codec descriptions. The browser answers with the first one it can decode. Chrome offers HEVC
@@ -153,8 +169,7 @@ async function open(agent, ws, serial, msg) {
   // WebRTC is OPT-IN and dormant by default — it runs ONLY when WEBRTC_ENABLED is explicitly
   // truthy (1/true/yes/on). Absent or anything else => dormant (spec: WebRTC OFF by default).
   // WEBRTC_TEST_DEVICE then pins WebRTC to ONE phone's serial.
-  const enabled = /^(1|true|yes|on)$/i.test(String(process.env.WEBRTC_ENABLED || '').trim());
-  if (!enabled) { log(agent, 'WEBRTC disabled by default (WEBRTC_ENABLED not set truthy) — ignoring open_webrtc'); return; }
+  if (!webrtcAllowed(msg)) { log(agent, 'WEBRTC disabled (no WEBRTC_ENABLED here and the backend did not send enabled:true) — ignoring open_webrtc'); return; }
   const testSerial = process.env.WEBRTC_TEST_DEVICE || '';
   if (testSerial && serial !== testSerial) { log(agent, `open_webrtc for ${serial} ignored — not the test device (${testSerial})`); return; }
   if (!werift) { try { werift = require('werift'); } catch (e) { log(agent, 'werift not installed — run `npm i werift`'); return; } }
@@ -240,7 +255,7 @@ function startH265(agent, s, sessionId) {
 
 async function _open(agent, ws, serial, msg, sessionId) {
   const { RTCPeerConnection, MediaStreamTrack } = werift;
-  const mode = codecMode();
+  const mode = codecMode(msg);
   const iceServers = (msg.iceServers || []).map((s) => ({ urls: s.urls, username: s.username, credential: s.credential }));
   const pc = new RTCPeerConnection({ iceServers, codecs: { video: codecParams(mode) } });
 
@@ -306,4 +321,4 @@ function close(agent, msg) {
 }
 function sendSig(ws, obj) { try { ws && ws.readyState === 1 && ws.send(JSON.stringify(obj)); } catch (e) {} }
 
-module.exports = { open, answer, ice, close, sessions, PROFILES, startCapture, bundledJar, SCRCPY_VERSION, codecMode, codecParams };
+module.exports = { open, answer, ice, close, sessions, PROFILES, startCapture, bundledJar, SCRCPY_VERSION, codecMode, webrtcAllowed, codecParams };
