@@ -91,7 +91,8 @@ Download page for a fresh install: <https://phonedesk.map-mgt.com/download/>
 Some jobs are faster done **on the farm PC itself** than through the dashboard, because every phone
 on that PC is on USB and one adb loop reaches all of them. The scripts in `tools/` are for the person
 sitting at (or remoted into) the PC. They use the agent's **own bundled adb.exe**
-(`%LOCALAPPDATA%\Programs\PhoneDeskesourcesdb\windb.exe`); that is deliberate - a different
+(`%LOCALAPPDATA%\Programs\PhoneDesk\resources\adb\win\adb.exe`); that is deliberate - a different
+esourcesdb\windb.exe`); that is deliberate - a different
 adb version restarts the adb server, which kicks every live VA stream on that PC for a few seconds.
 
 ### Install an app on every phone and every profile - `tools/install-app-everywhere.ps1`
