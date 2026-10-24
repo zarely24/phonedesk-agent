@@ -1,5 +1,5 @@
 'use strict';
-// v0.5.6 - unit test for the fleet-app ops in AgentCore: list_apps, install_apps, export_app,
+// v0.5.6/v0.5.7 - unit test for the fleet-app ops in AgentCore: list_apps, install_apps, export_app,
 // install_app, uninstall_app, update_now. Exercises the REAL methods with a scripted adb (_adbLong /
 // _adbPull), a fake backend (_download / _upload) and a fake socket. No device, no network.
 // Run: node tools/test_fleet_apps.js
@@ -30,6 +30,7 @@ function makePhone({ users = [0, 10], pk = {}, failInstall = null } = {}) {
     }
     if (/^install-multiple -r /.test(cmd)) {
       const pkg = /pd_fleet_([A-Za-z0-9_-]+)/.exec(cmd) ? 'com.openai.chatgpt' : 'x';
+      if (phone.hang) { const e = new Error('Command failed: adb -s S1 ' + cmd); e.killed = true; throw e; }
       if (phone.failInstall) return 'Performing Streamed Install\n' + phone.failInstall;
       phone.pk[pkg] = phone.users.slice(0, phone.installAllUsers === false ? 1 : phone.users.length);   // Android: all users
       return 'Performing Streamed Install\nSuccess';
@@ -139,6 +140,45 @@ async function run() {
     await core.installApp('S1', { request_id: 'r4d', package: 'com.openai.chatgpt', app_id: 'app000001', files: FILES }, ws);
     const r = lastReply(ws);
     ok(r.ok === false && r.state === 'failed' && /INSUFFICIENT_STORAGE/.test(r.error), 'failed + reason', r);
+  }
+  // 4e) the phone already has this exact version everywhere: no push, no download, seconds
+  {
+    cleanCache();
+    const phone = makePhone({ users: [0, 10], pk: { 'com.openai.chatgpt': [0, 10] } });
+    const core = makeCore(phone); const ws = fakeWs();
+    await core.installApp('S1', { request_id: 'r4f', package: 'com.openai.chatgpt', app_id: 'app000001', files: FILES, version_code: 1234 }, ws);
+    const r = lastReply(ws);
+    ok(r.ok && r.state === 'installed' && r.already === true, 'same version already there -> installed, already=true', r);
+    ok(!phone.calls.some((c) => c.startsWith('install-multiple')) && core.__downloaded.length === 0, 'no install-multiple and no download for it', phone.calls);
+  }
+  // 4f) same version but a profile lacks it: install-existing only
+  {
+    const phone = makePhone({ users: [0, 10, 11], pk: { 'com.openai.chatgpt': [0] } });
+    const core = makeCore(phone); const ws = fakeWs();
+    await core.installApp('S1', { request_id: 'r4g', package: 'com.openai.chatgpt', app_id: 'app000001', files: FILES, version_code: 1234 }, ws);
+    const r = lastReply(ws);
+    ok(r.ok && r.state === 'installed' && r.already === true && phone.calls.includes('shell pm install-existing --user 10 com.openai.chatgpt') && phone.calls.includes('shell pm install-existing --user 11 com.openai.chatgpt'), 'missing profiles filled with install-existing, no push', r);
+    ok(!phone.calls.some((c) => c.startsWith('install-multiple')), 'still no install-multiple');
+  }
+  // 4g) a different version on the phone is a real install
+  {
+    const phone = makePhone({ users: [0], pk: { 'com.openai.chatgpt': [0] } });
+    const core = makeCore(phone); const ws = fakeWs();
+    await core.installApp('S1', { request_id: 'r4h', package: 'com.openai.chatgpt', app_id: 'app000001', files: FILES, version_code: 1235 }, ws);
+    ok(lastReply(ws).ok && lastReply(ws).already === false && phone.calls.some((c) => c.startsWith('install-multiple')), 'other version -> install-multiple runs');
+  }
+  // 4h) adb never finishing is reported as a timeout, not as 300 characters of command line
+  {
+    const phone = makePhone({ users: [0], pk: {} }); phone.hang = true;
+    const core = makeCore(phone); const ws = fakeWs();
+    await core.installApp('S1', { request_id: 'r4i', package: 'com.openai.chatgpt', app_id: 'app000001', files: FILES }, ws);
+    const r = lastReply(ws);
+    ok(r.ok === false && r.state === 'failed' && /no answer in 25 min/.test(r.error) && !/Command failed/.test(r.error), 'timeout -> "adb gave no answer in 25 min"', r);
+  }
+  // 4i) _adbWhy strips the command line and keeps adb's reason
+  {
+    const why = AgentCore._adbWhy(new Error('Command failed: C:\\x\\adb.exe -s S1 install-multiple -r C:\\Temp\\0_base.apk\nPerforming Streamed Install\nadb: failed to finalize session\nFailure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: signatures do not match]'), 0);
+    ok(/^Failure \[INSTALL_FAILED_UPDATE_INCOMPATIBLE/.test(why), 'reason = adb\'s last line', why);
   }
   // 4d) bad input never touches adb
   {

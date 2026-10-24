@@ -67,6 +67,10 @@ function postBytes(url, buf, headers, timeoutMs = 60000) {
   });
 }
 
+/** adb install-multiple limit. The farm's USB trees manage ~2 Mbit/s per phone while 18 phones stream;
+    a 110 MB app took 8 minutes on a Pixel 6a. 10 min (v0.5.6) cut the first install off. */
+const INSTALL_LIMIT_MS = 25 * 60 * 1000;
+
 class AgentCore extends EventEmitter {
   constructor(opts = {}) {
     super();
@@ -700,19 +704,13 @@ class AgentCore extends EventEmitter {
     const dev = this.devices[serial];
     const pkg = m && m.package, appId = m && String(m.app_id || '');
     const files = (m && Array.isArray(m.files)) ? m.files : [];
+    const want = parseInt(m && m.version_code, 10) || 0;
     if (!AgentCore._validPkg(pkg) || !/^[A-Za-z0-9_-]{6,80}$/.test(appId) || !files.length) return this._rpcReply(ws, m, { ok: false, state: 'bad_request', error: 'package/app_id/files' });
     if (!dev) return this._rpcReply(ws, m, { ok: false, state: 'failed', error: 'phone not connected' });
     const token = dev.token || (this._loadTokens()[serial] || {}).device_token || '';
     const t0 = Date.now();
-    try {
-      const local = await this._fleetFiles(appId, files, token);
-      this.emit('log', `install_app (${serial}) ${pkg}: ${local.length} file(s), installing`);
-      const out = await this._adbLong(serial, ['install-multiple', '-r', ...local], 10 * 60 * 1000).catch((e) => String((e && e.message) || e));
-      if (!/Success/.test(out)) {
-        const why = String(out || '').split('\n').map((s) => s.trim()).filter(Boolean).pop() || 'install failed';
-        this.emit('log', `install_app ${pkg} FAILED: ${why}`);
-        return this._rpcReply(ws, m, { ok: false, state: 'failed', error: why.slice(0, 300), seconds: Math.round((Date.now() - t0) / 1000) });
-      }
+    const secs = () => Math.round((Date.now() - t0) / 1000);
+    const finish = async (already) => {
       // Belt and braces: Android installs for all users without --user, but verify and repair.
       let { per_user, missing } = await this._installedPerUser(serial, pkg);
       for (const uid of missing) {
@@ -722,11 +720,30 @@ class AgentCore extends EventEmitter {
       try { dev._metaCache = null; } catch {}
       const ver = await this._pkgVersion(serial, pkg);
       const state = missing.length ? 'partial' : 'installed';
-      this.emit('log', `install_app ${pkg}: ${state} on ${Object.values(per_user).filter(Boolean).length}/${Object.keys(per_user).length} profiles in ${Math.round((Date.now() - t0) / 1000)}s`);
-      this._rpcReply(ws, m, { ok: !missing.length, state, per_user, missing, ...ver, seconds: Math.round((Date.now() - t0) / 1000) });
+      this.emit('log', `install_app ${pkg}: ${state}${already ? ' (already had this version)' : ''} on ${Object.values(per_user).filter(Boolean).length}/${Object.keys(per_user).length} profiles in ${secs()}s`);
+      this._rpcReply(ws, m, { ok: !missing.length, state, per_user, missing, ...ver, already: !!already, seconds: secs() });
+    };
+    try {
+      // The phone already has exactly this version (the phone the app was copied from, a re-run after
+      // a new profile was created, a VA who installed it by hand): no 110 MB push over a slow USB
+      // tree, just make sure every profile has it. Seconds instead of minutes.
+      if (want && (await this._pkgVersion(serial, pkg)).version_code === want) {
+        this.emit('log', `install_app (${serial}) ${pkg}: already at version ${want}, checking profiles only`);
+        return await finish(true);
+      }
+      const local = await this._fleetFiles(appId, files, token);
+      this.emit('log', `install_app (${serial}) ${pkg}: ${local.length} file(s), installing`);
+      // 25 min: the farm's USB trees push ~2 Mbit/s with 18 phones streaming, 110 MB took 8 minutes.
+      const r = await this._adbLong(serial, ['install-multiple', '-r', ...local], INSTALL_LIMIT_MS).then((out) => ({ out }), (e) => ({ e }));
+      if (r.e || !/Success/.test(r.out)) {
+        const why = r.e ? AgentCore._adbWhy(r.e, INSTALL_LIMIT_MS) : AgentCore._adbWhy(new Error(r.out), 0);
+        this.emit('log', `install_app ${pkg} FAILED after ${secs()}s: ${why}`);
+        return this._rpcReply(ws, m, { ok: false, state: 'failed', error: why.slice(0, 300), seconds: secs() });
+      }
+      await finish(false);
     } catch (e) {
       this.emit('log', `install_app ${pkg} error: ${(e && e.message) || e}`);
-      this._rpcReply(ws, m, { ok: false, state: 'failed', error: String((e && e.message) || e).slice(0, 300) });
+      this._rpcReply(ws, m, { ok: false, state: 'failed', error: AgentCore._adbWhy(e, 0).slice(0, 300), seconds: secs() });
     }
   }
 
@@ -1434,8 +1451,21 @@ class AgentCore extends EventEmitter {
   _adbLong(serial, args, ms) {
     return new Promise((resolve, reject) => {
       execFile(this.adbPath, ['-s', serial, ...args], { encoding: 'utf8', timeout: ms || 30000, maxBuffer: 12 * 1024 * 1024 },
-        (err, stdout, stderr) => { if (err) reject(new Error(String(stderr || err.message || '').trim())); else resolve(String(stdout || '').trim()); });
+        (err, stdout, stderr) => {
+          if (!err) return resolve(String(stdout || '').trim());
+          const e = new Error(String(stderr || err.message || '').trim());
+          e.killed = !!(err.killed || err.signal);   // hit the timeout: adb never finished
+          reject(e);
+        });
     });
+  }
+  /** One human line out of an adb failure: adb's own reason, never the command line (which is
+      300 characters of paths). A timeout says so - a slow USB tree, a dialog on the phone. */
+  static _adbWhy(e, limitMs) {
+    if (e && e.killed) return `adb gave no answer in ${Math.round((limitMs || 0) / 60000)} min (USB too slow, or the phone is waiting for a tap) - try again`;
+    const msg = String((e && e.message) || e || '');
+    const lines = msg.split('\n').map((l) => l.trim()).filter((l) => l && !/^Command failed:/.test(l) && !/^Performing (Streamed|Incremental) Install$/.test(l));
+    return lines.pop() || 'install failed';
   }
   async _userExists(serial, uid) {
     const out = await this._adbLong(serial, ['shell', 'pm', 'list', 'users'], 8000);
