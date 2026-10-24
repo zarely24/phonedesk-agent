@@ -86,6 +86,65 @@ Download page for a fresh install: <https://phonedesk.map-mgt.com/download/>
 
 ---
 
+## Fleet chores from the farm PC (no release needed)
+
+Some jobs are faster done **on the farm PC itself** than through the dashboard, because every phone
+on that PC is on USB and one adb loop reaches all of them. The scripts in `tools/` are for the person
+sitting at (or remoted into) the PC. They use the agent's **own bundled adb.exe**
+(`%LOCALAPPDATA%\Programs\PhoneDeskesourcesdb\windb.exe`); that is deliberate - a different
+adb version restarts the adb server, which kicks every live VA stream on that PC for a few seconds.
+
+### Install an app on every phone and every profile - `tools/install-app-everywhere.ps1`
+
+Why it exists (2026-10-24): the owner asked for ChatGPT and X on all 38 phones in all profiles. Doing
+that by hand is Play Store -> Install, per phone, per profile - hours. The dashboard's per-phone
+"Add apps to profiles" button cannot do it either: it only *clones* an app that is already on that
+phone into its other profiles, and (until the agent ships `list_apps`/`install_apps`) the fleet agent
+does not answer it at all. The script does the whole thing in one go, from one phone that has the app:
+
+1. `pm path <pkg>` on a phone that already has the app (the "source"; auto-detected, or `-Source <serial>`)
+   lists its APK files - Play Store apps are a base APK plus split APKs (CPU, screen density, language).
+2. `adb pull` each of them to `%TEMP%`. Pulling a Play-installed APK needs no root.
+3. On every other phone: `adb install-multiple -r <all the splits>`. **Without `--user`, `pm install`
+   targets all users** (`INSTALL_ALL_USERS`), so every existing profile gets it in this one step.
+4. Then `pm list packages --user <id>` for each profile from `pm list users`, and `pm install-existing
+   --user <id> <pkg>` for any profile that still lacks it (the same command bulk profile creation uses -
+   no download, it just enables the already-present code for that profile).
+5. A summary table per package x phone: `ok`, `PARTIAL` (some profile refused), `FAILED` (install
+   error, e.g. `INSTALL_FAILED_INSUFFICIENT_STORAGE`), or `SKIPPED - no source phone`.
+
+Run it from a PowerShell window on the farm PC:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install-app-everywhere.ps1                                   # ChatGPT + X
+powershell -ExecutionPolicy Bypass -File install-app-everywhere.ps1 -Packages com.openai.chatgpt      # one app
+powershell -ExecutionPolicy Bypass -File install-app-everywhere.ps1 -Only SERIAL1,SERIAL2             # some phones
+```
+
+Facts worth knowing:
+
+- **Install the app from the Play Store on ONE phone first** (any profile). No phone has it -> the
+  script says so and skips that package. Copying from a phone, not from an APK site, keeps Google's
+  signature, so Play Store updates on the other 37 keep working.
+- The whole fleet is Pixel 6a / 8 / 8a (all arm64, same density class), so one phone's split set fits
+  every other phone. If a model with a different screen density ever joins, pull from a phone of that
+  model (`-Source`) for those.
+- **Safe to re-run**: phones and profiles that already have the app are skipped; a half-finished run
+  just continues.
+- Run it **while the agent is running** - it shares the agent's adb server. Each full install moves
+  ~100-200 MB over USB and takes 20-40 s; the VA on that phone sees nothing except a slower stream
+  for that moment. 38 phones x 2 apps is roughly 20-30 minutes per PC, hands-off.
+- Profiles created *later* get the app the normal way: bulk profile creation already runs
+  `pm install-existing` for its package, and the dashboard button handles the rest once the agent
+  learns the op.
+- Package names: ChatGPT `com.openai.chatgpt`, X `com.twitter.android`, Instagram
+  `com.instagram.android`, TikTok `com.zhiliaoapp.musically`.
+- It was tested against a simulated adb (3 phones, mixed profile counts, one failing install, an
+  already-complete re-run), not yet on the farm. First real run: watch the first phone's row before
+  walking away.
+
+---
+
 ## Release history
 
 | Version | What changed |
