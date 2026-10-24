@@ -70,6 +70,10 @@ the phones paired.
 
 ## Releasing
 
+**Since v0.5.6 the dashboard can finish a release:** "Fleet apps -> Update agents now" tells each
+computer to restart into a downloaded update (or to check GitHub right away). The click at the PC is
+only needed for computers still on 0.5.5 or older.
+
 Any `v*` tag builds Windows and macOS installers and publishes a GitHub Release:
 
 ```bash
@@ -92,7 +96,6 @@ Some jobs are faster done **on the farm PC itself** than through the dashboard, 
 on that PC is on USB and one adb loop reaches all of them. The scripts in `tools/` are for the person
 sitting at (or remoted into) the PC. They use the agent's **own bundled adb.exe**
 (`%LOCALAPPDATA%\Programs\PhoneDesk\resources\adb\win\adb.exe`); that is deliberate - a different
-esourcesdb\windb.exe`); that is deliberate - a different
 adb version restarts the adb server, which kicks every live VA stream on that PC for a few seconds.
 
 ### Install an app on every phone and every profile - `tools/install-app-everywhere.ps1`
@@ -150,6 +153,7 @@ Facts worth knowing:
 
 | Version | What changed |
 |---|---|
+| **v0.5.6** | **Fleet apps: the dashboard can install or remove any app on every phone, in every profile.** Six RPC ops: `list_apps` / `install_apps` (the per-phone "Add apps to profiles" button finally gets an answer - it had been timing out since the backend shipped it), `export_app` (pull a Play-installed app's base + split APKs off this phone with `pm path` + `adb pull`, PUT them to the backend with the device token), `install_app` (download the set ONCE per computer into `%TEMP%\pd_fleet_<id>`, `adb install-multiple -r` = every existing profile, then verify each profile and `pm install-existing` any that was missed; one install at a time per computer), `uninstall_app` (`pm uninstall`, all profiles), `update_now` (restart into a downloaded update, or check GitHub right now - so no release after this one needs anyone at the PC). The meta beat now carries `agent_version`. All async (`_adbLong` / spawn): the video relay never blocks. `tools/test_fleet_apps.js` (30 checks). |
 | **v0.5.5** | **H.265 over WebRTC, dormant until the backend opts a phone in.** The WebRTC POC could only send H.264 because the only scrcpy server we shipped (1.19-ws7, ws-scrcpy's) predates codec selection. The agent now also bundles the upstream **scrcpy-server 5.0.1** (`resources/scrcpy/`, sha256 `764eb6f7…3bc536`, pushed to the phone as `/data/local/tmp/scrcpy-server-pd5.jar` so it never collides with ws-scrcpy's jar) and can ask it for `video_codec=h265`. `src/scrcpy-capture.js` speaks the 5.x wire protocol (dummy byte, 64-byte device name, u32 codec id, 12-byte session/media records told apart by the top bit); `src/h265-rtp.js` packetizes HEVC per RFC 7798 (single-NAL + FU type 49, VPS/SPS/PPS re-sent with every IRAP). **Nothing changes unless two env vars are set on the owner's machine:** `WEBRTC_ENABLED=1` (as before) and `WEBRTC_CODEC=h265`. With both, the SDP offer lists H.265 first and H.264 second; the capture starts only after the browser answers, using whichever codec it accepted, so a browser without HEVC decode (Edge, old Chrome, no hardware decoder) silently gets the old H.264 path and a browser that accepts neither makes the agent close the session so the page falls back to the legacy stream. `WEBRTC_CODEC=h265-only` removes the H.264 safety net for experiments. Verified without a phone: `npm run test:rtp` (76 checks), `node tools/test_webrtc_negotiation.js` (14 checks, a werift peer plays the browser), and `node tools/rtp-ffmpeg-check.js <clip.h265>` (our RTP into ffmpeg's own RFC 7798 depacketizer + decoder: 180/180 frames). **Not yet verified on a phone** — `npm run webrtc-diagnose -- --codec both` on the farm host is the next step; see `docs/webrtc-hardware-validation.md` rows B1–B5 | **v0.5.5 also moves the switch to the server:** `open_webrtc` from a backend that sends `enabled: true` (it only does so for phones in its `WEBRTC_DEVICE_IDS`) is enough to run a session, and its `codec` field (the server's `WEBRTC_CODEC`) picks what is offered — so nobody has to set `WEBRTC_ENABLED` / `WEBRTC_CODEC` on the farm computer any more. Those variables still win when they exist (`WEBRTC_ENABLED=0` is an owner veto). The backend also now hands the agent the same TURN credentials it gives the browser, which the farm's Starlink CGNAT needs. Tests: `npm run test:webrtc` (negotiation + the switch rules), `npm run test:rtp`.
 | **v0.5.4** | **No more frozen video from reconnects, uploads and profile switches.** Measured 2026-10-20 on PC 2: one Pixel 8a with a flaky USB link reconnected 36 times in 29 minutes and every reconnect ran the synchronous charge probe (~1.1 s) plus the backend's policy re-push (~1.7 s more), 27 profile switches each ended in a blocking meta reply, and three gallery uploads sat in 8 s adb timeouts — the single thread that relays all 20 phones' video on that computer was frozen for minutes per half hour, which VAs saw as screens going black and phones "disconnecting". Now: the charge probe is async and cached per serial across reconnects (zero adb calls on a reconnect), an identical policy push is skipped, every meta reply and the whole upload-to-gallery path use the async adb helper, the blocking readers are deleted, a phone is only dropped after missing from two consecutive `adb devices` scans (with the reason logged), and every socket close logs its code. Also: after a profile switch the agent sets stay-awake-while-plugged and a 30-minute screen timeout on the new profile (`Keep screen on: PASS/FAIL`), because a fresh profile's 30 s default is what made the Pixel 8s "go black" after a switch. Tests: `npm run test:freeze` (`tools/test-nonblocking.js` + `tools/test-freeze-paths.js`) |
 | **v0.5.3** | Owner-window fix only, no agent/phone logic touched. In v0.5.2 the Instagram diagnostic panel was appended to `<body>` *after* `.app`, and `.app` is `height:100%` of a fixed 480x660 window - so on a computer with more than ~11 phones the list was taller than the window and the panel was painted on top of phones 29-33 ("Instagram diagnostic (advanced)" text across the rows, white input boxes over the list). Its body also carried an inline `display:flex`, which beats the `.hide` class, so it was never collapsed. And its phone picker asked the main process for a *separate* phone list via a synchronous `adb devices`; whenever adb was busy the picker stayed empty and "Run diagnostic" could only say "Pick a phone". Now: the panel lives inside the phones step below "Reset pairings", `.app` grows with the list (`min-height`), hide/show is done with id-level rules, the controls are dark-themed, and the picker is filled from the same 2 s status snapshot that draws the list (same names, same order, "- not connected" suffix for unplugged phones). Also hides the update bar properly - the same id-beats-class flaw left an empty bar with a blue pill at the bottom of every window since v0.4.3 |
@@ -166,6 +170,32 @@ Facts worth knowing:
 | v0.3.4 | Repointed at `phonedesk.map-mgt.com` after the backend left Render |
 
 ---
+
+## Fleet apps ops (v0.5.6)
+
+The dashboard's "Fleet apps" section (backend README, same heading) drives these over the normal
+phone-home socket as request/response ops (`request_id` in, `rpc_result` out):
+
+| op | in | does | out |
+|---|---|---|---|
+| `list_apps` | - | `pm list packages -3 --user <id>` per profile | `by_user {uid: [pkg]}` |
+| `install_apps` | `user_ids, packages` | `pm install-existing --user` per pair (clone an app the phone has into other profiles) | `results [{uid, package, ok, error}]`, fresh `by_user` |
+| `export_app` | `app_id, package` | `pm path` -> `adb pull` each APK -> `PUT /api/fleet-apps/{app_id}/files/{idx}?token=<device token>` | `files [{idx,name,size}]`, `version_name`, `version_code`; `not_installed` if the phone lacks it |
+| `install_app` | `app_id, package, files` | download the set once per computer (cached 24 h in `%TEMP%\pd_fleet_<app_id>`), `adb install-multiple -r <files>` (no `--user` = all profiles), verify per profile, `pm install-existing` the missed ones | `state installed / partial / failed`, `per_user`, `missing`, adb's reason, `seconds` |
+| `uninstall_app` | `package` | `pm uninstall <pkg>` (all profiles) | `removed / absent / failed` |
+| `update_now` | - | main.js: `quitAndInstall()` if an update is downloaded, else `checkForUpdates()` now | `restarting / downloading / checking / dev_build`; old agents never answer |
+
+Rules that matter here:
+
+- **Everything is async** (`_adbLong`, `spawn`). The relay is this event loop; a 150 MB
+  `install-multiple` through `execFileSync` would freeze every phone's video for a minute.
+- **Installs and uninstalls on one computer run one at a time** (`_fleetSerial`). Eighteen phones share
+  one USB tree and one CPU; the backend also dispatches one phone per computer, this is the local guard.
+- **Package names are validated** (`[A-Za-z0-9_.]{3,200}`) before anything reaches adb; `app_id` too.
+- **Pulling a Play-installed APK needs no root** (`/data/app/~~*/<pkg>-*/` is world-readable). A
+  system app or an app protected by a device policy would fail the pull - the reply says why.
+- Reinstalling over a different signature (sideloaded APKMirror build over a Play build, or the other
+  way round) fails with `INSTALL_FAILED_UPDATE_INCOMPATIBLE`; the row shows that text.
 
 ## Gotchas
 

@@ -178,9 +178,26 @@ app.whenReady().then(() => {
     nodeBin: process.execPath,                 // Electron binary...
     runAsNodeEnv: { ELECTRON_RUN_AS_NODE: '1' }, // ...run as plain Node to launch ws-scrcpy
     maxDevices: 30,                            // up to 30 phones per computer
+    appVersion: app.getVersion(),              // reported to the dashboard (fleet 'Update agents' panel)
   });
   core.on('status', (s) => { fileLog('status:', JSON.stringify(s)); if (win && !win.isDestroyed()) win.webContents.send('status', s); });
   core.on('log', (m) => fileLog('[core]', m));
+  // Dashboard "Update agents now" (v0.5.6). If an update is already downloaded, restart into it - the
+  // admin asked for exactly that, so no dialog. Otherwise check GitHub right now instead of waiting
+  // for the 30-minute tick; the usual notification/dialog follows once the download lands.
+  core.on('update_now', (req) => {
+    const reply = (r) => { try { req.reply(r); } catch {} };
+    if (!app.isPackaged) return reply({ ok: false, state: 'dev_build', version: app.getVersion() });
+    if (pendingUpdate && pendingUpdate.ready) {
+      reply({ ok: true, state: 'restarting', version: app.getVersion(), to: pendingUpdate.version });
+      fileLog('update_now: restarting into', pendingUpdate.version);
+      setTimeout(() => { try { require('electron-updater').autoUpdater.quitAndInstall(); } catch (e) { fileLog('quitAndInstall:', e && e.message); } }, 800);
+      return;
+    }
+    if (process.platform === 'darwin') { checkMacUpdate(); return reply({ ok: true, state: 'checking', version: app.getVersion(), mac: true }); }
+    try { require('electron-updater').autoUpdater.checkForUpdates().catch(() => {}); } catch {}
+    reply({ ok: true, state: pendingUpdate ? 'downloading' : 'checking', version: app.getVersion(), to: pendingUpdate && pendingUpdate.version });
+  });
 
   try { core.reconcile(); } catch (e) { fileLog('reconcile error:', e && e.stack); }  // launch ws-scrcpy + reconnect paired phones
   createWindow();

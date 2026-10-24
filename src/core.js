@@ -71,6 +71,7 @@ class AgentCore extends EventEmitter {
   constructor(opts = {}) {
     super();
     this.backend = opts.backend || 'http://localhost:8080';
+    this.appVersion = opts.appVersion || '';   // reported in every meta beat so the dashboard knows who still runs an old agent
     this.wsBase = this.backend.replace(/^http/, 'ws');
     this.adbPath = opts.adbPath || 'adb';
     this.wsScrcpyDist = opts.wsScrcpyDist;
@@ -183,11 +184,11 @@ class AgentCore extends EventEmitter {
     const bc = await this._batteryAndChargingAsync(serial);
     const cs = dev && dev.chargeStatus;
     if (!full && dev && dev._metaCache) {
-      return { battery: bc.battery, charging: bc.charging, charge_status: cs, host: this._hostStats(), ...dev._metaCache };
+      return { battery: bc.battery, charging: bc.charging, charge_status: cs, host: this._hostStats(), agent_version: this.appVersion, ...dev._metaCache };
     }
     const cache = { users: await this._listUsersAsync(serial), current_user: await this._currentUserAsync(serial) };
     if (dev) dev._metaCache = cache;
-    return { battery: bc.battery, charging: bc.charging, charge_status: cs, host: this._hostStats(), ...cache };
+    return { battery: bc.battery, charging: bc.charging, charge_status: cs, host: this._hostStats(), agent_version: this.appVersion, ...cache };
   }
   /** Health of the computer the phones are plugged into.
       Reported on every heartbeat so we can see the machine instead of guessing about it. Free to
@@ -507,7 +508,7 @@ class AgentCore extends EventEmitter {
     try { ws && ws.send(JSON.stringify({ op: 'upload_result', transfer_id: transferId, results })); } catch {}
   }
   /** Stream a URL to a local file (Node http/https; no fetch in the Electron main process). */
-  _download(url, dest) {
+  _download(url, dest, ms) {
     return new Promise((resolve, reject) => {
       let u; try { u = new URL(url); } catch (e) { return reject(e); }
       const lib = u.protocol === 'https:' ? https : http;
@@ -521,10 +522,242 @@ class AgentCore extends EventEmitter {
         file.on('finish', () => file.close((err) => err ? reject(err) : resolve()));
       });
       req.on('error', reject);
-      req.setTimeout(120000, () => req.destroy(new Error('download timed out')));
+      req.setTimeout(ms || 120000, () => req.destroy(new Error('download timed out')));
     });
   }
   /** adb push with NO 8s cap (unlike _adb) - a large video can take a while over USB. */
+  // ---- Fleet apps (v0.5.6) -------------------------------------------------------------------
+  // Install / remove an app on this phone, in EVERY profile, driven from the dashboard. The APK set
+  // (base + split APKs) lives on the backend: either exported from a phone that already has the app
+  // (`export_app`, below) or uploaded by the admin. Everything here is ASYNC (`_adbLong`, spawn) -
+  // this process is also the video relay, so nothing may block the event loop (README, first section).
+  // Installs on one computer run ONE AT A TIME (`_fleetQueue`): 18 phones share one USB tree and one
+  // CPU, and `adb install-multiple` of a 150 MB app is the heaviest thing we ever push over it.
+
+  /** Which third-party apps each profile has: { uid: [pkg, ...] }. Used by the per-phone
+      "Add apps to profiles" picker (list_apps) and as the fleet source-app picker. */
+  async _thirdPartyByUser(serial) {
+    const users = await this._listUsersAsync(serial);
+    const by = {};
+    for (const u of users) {
+      try {
+        const out = await this._adbLong(serial, ['shell', 'pm', 'list', 'packages', '-3', '--user', String(u.id)], 15000);
+        by[u.id] = out.split('\n').map((l) => l.trim()).filter((l) => l.startsWith('package:')).map((l) => l.slice(8)).sort();
+      } catch { by[u.id] = []; }
+    }
+    return by;
+  }
+  static _validPkg(p) { return typeof p === 'string' && /^[A-Za-z0-9_.]{3,200}$/.test(p); }
+
+  async listApps(serial, m, ws) {
+    try { this._rpcReply(ws, m, { ok: true, by_user: await this._thirdPartyByUser(serial) }); }
+    catch (e) { this._rpcReply(ws, m, { ok: false, state: 'error', error: String((e && e.message) || e) }); }
+  }
+
+  /** install_apps: clone apps already on the phone into the given profiles (pm install-existing). */
+  async installApps(serial, m, ws) {
+    const uids = (Array.isArray(m.user_ids) ? m.user_ids : []).map((u) => parseInt(u, 10)).filter((u) => u >= 0);
+    const pkgs = (Array.isArray(m.packages) ? m.packages : []).filter((p) => AgentCore._validPkg(p));
+    const results = [];
+    try {
+      for (const uid of uids) {
+        const exists = await this._userExists(serial, uid);
+        for (const pkg of pkgs) {
+          if (!exists) { results.push({ uid, package: pkg, ok: false, error: 'PROFILE_NOT_FOUND' }); continue; }
+          try {
+            const out = await this._adbLong(serial, ['shell', 'pm', 'install-existing', '--user', String(uid), pkg], 30000);
+            const ok = /installed for user/i.test(out) || await this._pkgInstalledForUser(serial, uid, pkg);
+            results.push({ uid, package: pkg, ok, error: ok ? undefined : (out || 'unknown').split('\n').pop() });
+          } catch (e) { results.push({ uid, package: pkg, ok: false, error: String((e && e.message) || e).split('\n').pop() }); }
+        }
+      }
+      try { this.devices[serial]._metaCache = null; } catch {}
+      this._rpcReply(ws, m, { ok: true, results, by_user: await this._thirdPartyByUser(serial) });
+    } catch (e) { this._rpcReply(ws, m, { ok: false, state: 'error', error: String((e && e.message) || e), results }); }
+  }
+
+  /** `pm path <pkg>` -> the APK files that make up the app (base + splits), or []. */
+  async _apkPaths(serial, pkg) {
+    try {
+      const out = await this._adbLong(serial, ['shell', 'pm', 'path', pkg], 15000);
+      return out.split('\n').map((l) => l.trim()).filter((l) => l.startsWith('package:')).map((l) => l.slice(8));
+    } catch { return []; }
+  }
+  async _pkgVersion(serial, pkg) {
+    try {
+      const out = await this._adbLong(serial, ['shell', 'dumpsys', 'package', pkg], 20000);
+      const vn = /versionName=(\S+)/.exec(out), vc = /versionCode=(\d+)/.exec(out);
+      return { version_name: vn ? vn[1] : '', version_code: vc ? parseInt(vc[1], 10) : 0 };
+    } catch { return { version_name: '', version_code: 0 }; }
+  }
+  /** adb pull with no 8s cap: a base APK can be 100+ MB. */
+  _adbPull(serial, remote, local) {
+    return new Promise((resolve, reject) => {
+      const p = spawn(this.adbPath, ['-s', serial, 'pull', remote, local], { stdio: ['ignore', 'ignore', 'pipe'] });
+      let err = '';
+      if (p.stderr) p.stderr.on('data', (d) => { err += d.toString(); });
+      p.on('error', reject);
+      p.on('close', (code) => code === 0 ? resolve() : reject(new Error('adb pull exit ' + code + (err ? ': ' + err.trim() : ''))));
+    });
+  }
+  /** PUT one local file to the backend (raw body). Node http/https, same as _download. */
+  _upload(url, file, headers) {
+    return new Promise((resolve, reject) => {
+      let u; try { u = new URL(url); } catch (e) { return reject(e); }
+      const size = fs.statSync(file).size;
+      const lib = u.protocol === 'https:' ? https : http;
+      const req = lib.request(u, { method: 'PUT', headers: Object.assign({ 'Content-Type': 'application/vnd.android.package-archive', 'Content-Length': size }, headers || {}) }, (res) => {
+        let body = ''; res.on('data', (c) => { body += c; });
+        res.on('end', () => res.statusCode === 200 ? resolve(body) : reject(new Error('upload HTTP ' + res.statusCode + ' ' + body.slice(0, 200))));
+      });
+      req.on('error', reject);
+      req.setTimeout(10 * 60 * 1000, () => req.destroy(new Error('upload timed out')));
+      fs.createReadStream(file).pipe(req);
+    });
+  }
+
+  /** export_app: pull an installed app's APK set off THIS phone and hand it to the backend, which
+      stores it as a fleet app. {package, app_id}. Reply: files [{idx,name,size}] + version. */
+  async exportApp(serial, m, ws) {
+    const dev = this.devices[serial];
+    const pkg = m && m.package, appId = m && String(m.app_id || '');
+    if (!AgentCore._validPkg(pkg) || !/^[A-Za-z0-9_-]{6,80}$/.test(appId)) return this._rpcReply(ws, m, { ok: false, state: 'bad_request', error: 'package/app_id' });
+    const tmp = path.join(os.tmpdir(), `pd_export_${appId}`);
+    try {
+      const paths = await this._apkPaths(serial, pkg);
+      if (!paths.length) return this._rpcReply(ws, m, { ok: false, state: 'not_installed', error: `${pkg} is not on this phone` });
+      fs.mkdirSync(tmp, { recursive: true });
+      const token = dev && dev.token || (this._loadTokens()[serial] || {}).device_token || '';
+      const files = [];
+      this.emit('log', `export_app (${serial}) ${pkg}: ${paths.length} file(s)`);
+      for (let idx = 0; idx < paths.length; idx++) {
+        const name = path.basename(paths[idx]).replace(/[^\w.\-]/g, '_');
+        const local = path.join(tmp, `${idx}_${name}`);
+        await this._adbPull(serial, paths[idx], local);
+        const size = fs.statSync(local).size;
+        await this._upload(`${this.backend}/api/fleet-apps/${appId}/files/${idx}?token=${encodeURIComponent(token)}`, local, { 'X-File-Name': name });
+        files.push({ idx, name, size });
+        this.emit('log', `export_app ${pkg}: uploaded ${name} (${Math.round(size / 1048576)} MB)`);
+      }
+      const ver = await this._pkgVersion(serial, pkg);
+      this._rpcReply(ws, m, { ok: true, files, ...ver });
+    } catch (e) {
+      this.emit('log', `export_app ${pkg} failed: ${(e && e.message) || e}`);
+      this._rpcReply(ws, m, { ok: false, state: 'error', error: String((e && e.message) || e) });
+    } finally { try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {} }
+  }
+
+  /** The APK set for one fleet app, fetched ONCE per computer and shared by every phone on it
+      (18 phones must not download the same 150 MB eighteen times). Files are checked by size. */
+  async _fleetFiles(appId, files, token) {
+    const dir = path.join(os.tmpdir(), `pd_fleet_${appId}`);
+    fs.mkdirSync(dir, { recursive: true });
+    const out = [];
+    for (const f of files) {
+      const local = path.join(dir, `${f.idx}_${String(f.name || 'part.apk').replace(/[^\w.\-]/g, '_')}`);
+      let have = false; try { have = fs.statSync(local).size === f.size; } catch {}
+      if (!have) await this._download(`${this.backend}/api/fleet-apps/${appId}/files/${f.idx}?token=${encodeURIComponent(token)}`, local, 15 * 60 * 1000);
+      out.push(local);
+    }
+    try { fs.utimesSync(dir, new Date(), new Date()); } catch {}
+    this._pruneFleetCache();
+    return out;
+  }
+  _pruneFleetCache() {
+    try {
+      const t = os.tmpdir(), cutoff = Date.now() - 24 * 3600 * 1000;
+      for (const n of fs.readdirSync(t)) {
+        if (!n.startsWith('pd_fleet_')) continue;
+        const p = path.join(t, n);
+        try { if (fs.statSync(p).mtimeMs < cutoff) fs.rmSync(p, { recursive: true, force: true }); } catch {}
+      }
+    } catch {}
+  }
+  /** Serialise the heavy fleet jobs on this computer. */
+  _fleetSerial(fn) {
+    const run = (this._fleetQueue || Promise.resolve()).then(fn, fn);
+    this._fleetQueue = run.catch(() => {});
+    return run;
+  }
+  /** Is the app installed for every profile? -> { per_user: {uid: bool}, missing: [uid] } */
+  async _installedPerUser(serial, pkg) {
+    const users = await this._listUsersAsync(serial);
+    const per_user = {}, missing = [];
+    for (const u of users) {
+      const ok = await this._pkgInstalledForUser(serial, u.id, pkg);
+      per_user[u.id] = ok; if (!ok) missing.push(u.id);
+    }
+    return { per_user, missing };
+  }
+
+  /** install_app: {app_id, package, files:[{idx,name,size}]}. Download the APK set (once per PC),
+      `adb install-multiple -r` (no --user => every existing profile), then verify each profile and
+      `pm install-existing` any that was missed. Reply: state installed | partial | failed. */
+  installApp(serial, m, ws) {
+    return this._fleetSerial(() => this._installAppNow(serial, m, ws));
+  }
+  async _installAppNow(serial, m, ws) {
+    const dev = this.devices[serial];
+    const pkg = m && m.package, appId = m && String(m.app_id || '');
+    const files = (m && Array.isArray(m.files)) ? m.files : [];
+    if (!AgentCore._validPkg(pkg) || !/^[A-Za-z0-9_-]{6,80}$/.test(appId) || !files.length) return this._rpcReply(ws, m, { ok: false, state: 'bad_request', error: 'package/app_id/files' });
+    if (!dev) return this._rpcReply(ws, m, { ok: false, state: 'failed', error: 'phone not connected' });
+    const token = dev.token || (this._loadTokens()[serial] || {}).device_token || '';
+    const t0 = Date.now();
+    try {
+      const local = await this._fleetFiles(appId, files, token);
+      this.emit('log', `install_app (${serial}) ${pkg}: ${local.length} file(s), installing`);
+      const out = await this._adbLong(serial, ['install-multiple', '-r', ...local], 10 * 60 * 1000).catch((e) => String((e && e.message) || e));
+      if (!/Success/.test(out)) {
+        const why = String(out || '').split('\n').map((s) => s.trim()).filter(Boolean).pop() || 'install failed';
+        this.emit('log', `install_app ${pkg} FAILED: ${why}`);
+        return this._rpcReply(ws, m, { ok: false, state: 'failed', error: why.slice(0, 300), seconds: Math.round((Date.now() - t0) / 1000) });
+      }
+      // Belt and braces: Android installs for all users without --user, but verify and repair.
+      let { per_user, missing } = await this._installedPerUser(serial, pkg);
+      for (const uid of missing) {
+        try { await this._adbLong(serial, ['shell', 'pm', 'install-existing', '--user', String(uid), pkg], 30000); } catch {}
+      }
+      if (missing.length) ({ per_user, missing } = await this._installedPerUser(serial, pkg));
+      try { dev._metaCache = null; } catch {}
+      const ver = await this._pkgVersion(serial, pkg);
+      const state = missing.length ? 'partial' : 'installed';
+      this.emit('log', `install_app ${pkg}: ${state} on ${Object.values(per_user).filter(Boolean).length}/${Object.keys(per_user).length} profiles in ${Math.round((Date.now() - t0) / 1000)}s`);
+      this._rpcReply(ws, m, { ok: !missing.length, state, per_user, missing, ...ver, seconds: Math.round((Date.now() - t0) / 1000) });
+    } catch (e) {
+      this.emit('log', `install_app ${pkg} error: ${(e && e.message) || e}`);
+      this._rpcReply(ws, m, { ok: false, state: 'failed', error: String((e && e.message) || e).slice(0, 300) });
+    }
+  }
+
+  /** uninstall_app: {package}. `pm uninstall` without --user removes it for every profile. */
+  uninstallApp(serial, m, ws) {
+    return this._fleetSerial(() => this._uninstallAppNow(serial, m, ws));
+  }
+  async _uninstallAppNow(serial, m, ws) {
+    const pkg = m && m.package;
+    if (!AgentCore._validPkg(pkg)) return this._rpcReply(ws, m, { ok: false, state: 'bad_request', error: 'package' });
+    try {
+      if (!(await this._apkPaths(serial, pkg)).length) return this._rpcReply(ws, m, { ok: true, state: 'absent' });
+      const out = await this._adbLong(serial, ['shell', 'pm', 'uninstall', pkg], 120000).catch((e) => String((e && e.message) || e));
+      const gone = !(await this._apkPaths(serial, pkg)).length;
+      try { this.devices[serial]._metaCache = null; } catch {}
+      this.emit('log', `uninstall_app (${serial}) ${pkg}: ${gone ? 'removed' : 'FAILED ' + out}`);
+      this._rpcReply(ws, m, gone ? { ok: true, state: 'removed' } : { ok: false, state: 'failed', error: String(out || 'uninstall failed').split('\n').pop().slice(0, 300) });
+    } catch (e) { this._rpcReply(ws, m, { ok: false, state: 'failed', error: String((e && e.message) || e).slice(0, 300) }); }
+  }
+
+  /** update_now: the dashboard asks this computer to install a downloaded agent update (restart) or,
+      if none is downloaded yet, to check for one right now instead of at the next 30-minute tick.
+      The decision lives in main.js (it owns electron-updater); core only relays. */
+  updateNow(serial, m, ws) {
+    let answered = false;
+    const reply = (r) => { if (!answered) { answered = true; this._rpcReply(ws, m, r); } };
+    if (this.listenerCount('update_now') === 0) return reply({ ok: false, state: 'unsupported', version: this.appVersion || '' });
+    this.emit('update_now', { reply, version: this.appVersion || '' });
+    setTimeout(() => reply({ ok: false, state: 'no_answer', version: this.appVersion || '' }), 15000);
+  }
+
   _adbPush(serial, local, remote) {
     return new Promise((resolve, reject) => {
       const p = spawn(this.adbPath, ['-s', serial, 'push', local, remote], { stdio: ['ignore', 'ignore', 'pipe'] });
@@ -884,6 +1117,13 @@ class AgentCore extends EventEmitter {
       else if (m.op === 'create_profiles') this.createProfiles(serial, m.count, m.package, m.name_prefix, ws);
       else if (m.op === 'upload_media') this.uploadMedia(serial, m, ws);   // push photos/videos to the gallery
       else if (m.op === 'set_label') this.setLabel(serial, m);   // dashboard name/order -> owner app
+      // Fleet apps (v0.5.6): install/remove an app in every profile, driven from the dashboard.
+      else if (m.op === 'list_apps') this.listApps(serial, m, ws);
+      else if (m.op === 'install_apps') this.installApps(serial, m, ws);
+      else if (m.op === 'export_app') this.exportApp(serial, m, ws);
+      else if (m.op === 'install_app') this.installApp(serial, m, ws);
+      else if (m.op === 'uninstall_app') this.uninstallApp(serial, m, ws);
+      else if (m.op === 'update_now') this.updateNow(serial, m, ws);
       // Account monitoring + shortcuts (request/response over this same socket; reply carries request_id).
       else if (m.op === 'check_apps_installed') this.checkAppsInstalled(serial, m, ws);
       else if (m.op === 'launch_app') this.launchApp(serial, m, ws);
