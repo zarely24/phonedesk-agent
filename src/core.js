@@ -67,8 +67,8 @@ function postBytes(url, buf, headers, timeoutMs = 60000) {
   });
 }
 
-/** adb install-multiple limit. The farm's USB trees manage ~2 Mbit/s per phone while 18 phones stream;
-    a 110 MB app took 8 minutes on a Pixel 6a. 10 min (v0.5.6) cut the first install off. */
+/** adb install-multiple limit. A fresh 110 MB install takes ~45 s on the farm, but re-installing over a
+    copy the phone already had took 8-13 min on two Pixel 6a; 10 min (v0.5.6) cut the first one off. */
 const INSTALL_LIMIT_MS = 25 * 60 * 1000;
 
 class AgentCore extends EventEmitter {
@@ -733,7 +733,7 @@ class AgentCore extends EventEmitter {
       }
       const local = await this._fleetFiles(appId, files, token);
       this.emit('log', `install_app (${serial}) ${pkg}: ${local.length} file(s), installing`);
-      // 25 min: the farm's USB trees push ~2 Mbit/s with 18 phones streaming, 110 MB took 8 minutes.
+      // 25 min: ~45 s for a fresh install, but 8-13 min was seen when re-installing over an existing copy.
       const r = await this._adbLong(serial, ['install-multiple', '-r', ...local], INSTALL_LIMIT_MS).then((out) => ({ out }), (e) => ({ e }));
       if (r.e || !/Success/.test(r.out)) {
         const why = r.e ? AgentCore._adbWhy(r.e, INSTALL_LIMIT_MS) : AgentCore._adbWhy(new Error(r.out), 0);
