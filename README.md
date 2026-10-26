@@ -34,6 +34,59 @@ hour on a busy computer. The only synchronous adb left is behind genuinely rare 
 
 ---
 
+## The second thing to understand: the congestion valve (v0.5.8)
+
+**Until v0.5.8 nothing on the video path ever dropped a frame.** The phone encodes at whatever the
+viewer's page asked for; this process forwards every frame into its WebSocket to the backend; the
+backend forwards every frame to the viewer. So when the farm's upload could not carry what the phones
+were producing - a Starlink dip, a keyframe burst, one more viewer than the budget assumed - the
+frames did not get smaller, they **queued**: first in this process's socket buffer, then in the
+Windows kernel's send buffer (which autotunes to megabytes = many seconds at 120 kbit/s). The VA saw
+the picture freeze, then fast-forward, then freeze again, and the delay only grew until something
+reconnected. That is why VAs reloaded the phone page a hundred times an hour: a reload was the only
+thing that emptied the queue. The 2026-10-25 shift had both computers on the bottom rung of the
+ladder (120 kbit/s, 256 px) for eight hours and it *still* lagged, because a fixed bitrate cannot
+follow a line that moves.
+
+`src/congestion.js` is the valve, one `TunnelGovernor` per stream, wired into `openTunnel`:
+
+1. **It watches the queue.** `tunnel.bufferedAmount` (bytes handed to the socket and not yet
+   written) divided by the rate frames are arriving = how late the viewer is about to be. Plus a ws
+   **ping every second** on the tunnel: the pong waits behind everything queued in the kernel, which
+   `bufferedAmount` cannot see, so pong time above the best RTT seen = kernel queue.
+2. **Over the threshold (600 ms of video, or 96 KB, or 800 ms of pong lag) it stops forwarding
+   video.** The viewer's picture simply holds still. Device messages (clipboard, rotation) and text
+   are never held. Nothing new enters the queue, so it drains at line speed - typically under a second.
+3. **Once drained, it asks the phone for a keyframe** - a decoder cannot resume on a P-frame. It
+   replays the viewer's own `TYPE_CHANGE_STREAM_PARAMETERS` command (captured as it passed through,
+   including from the pre-open buffer where the first one always is) with the bitrate lowered by
+   **1 bit/s** (alternating -1/-2 so consecutive forces still differ). ws-scrcpy's server restarts
+   the encoder on any settings change, and a restart begins with SPS/PPS/IDR. Rate-limited to one
+   request per 1.5 s. If no settings command has been seen yet it logs that and waits for the natural
+   keyframe (up to `iFrameInterval` away).
+4. **It resumes on the first SPS/PPS/IDR** - with zero accumulated delay.
+5. **It tells the backend** (`{"op":"congestion"}` on the phone-home socket, at most once per 5 s per
+   computer). The backend owns bitrates: it cuts that computer's budget (to 70 %, or 85 % of what is
+   actually arriving) and the stream pages follow within a poll, so the congestion does not simply
+   recur. The agent never picks a bitrate itself - two controllers on one encoder would oscillate.
+
+Every meta beat's `host` block now carries `congestion: {streams, dropping_streams, events_5m,
+max_queue_ms, pong_lag_ms, rtt_ms, dropped_frames}` for the dashboard. Log lines to look for:
+`uplink congested - holding the picture still until the queue drains (queue N ms, pong lag N ms, …)`
+and `video resumed after N ms congestion (dropped N frames / N KB total, peak queue N ms)`.
+
+What a VA sees now: a brief still picture (about a second) instead of ten seconds of growing lag,
+and the picture comes back *current*. Smooth is the goal; sharp is what the budget can afford.
+
+Everything in the governor is synchronous and allocation-free per frame on purpose - it runs on the
+relay's event loop for every video message of every phone. `npm run test:congestion`
+(`tools/test_congestion.js`, 64 checks) covers the frame classification, the settings-frame
+capture/nudge, the state machine, the pong accounting and the real `openTunnel` wiring over fake
+sockets. **Not yet verified on a real phone** at the time of release - the first real shift is the
+test; the `[congestion]` lines in the backend's per-phone log view are the evidence.
+
+---
+
 ## What it does
 
 - Detects plugged-in phones via adb, pairs each one with a code from the dashboard
@@ -153,6 +206,7 @@ Facts worth knowing:
 
 | Version | What changed |
 |---|---|
+| **v0.5.8** | **The congestion valve: video is held still and resumed on a fresh keyframe instead of lagging.** Nothing on the path ever dropped a frame before, so a line that could not carry the phones' output queued it (socket buffer, then the kernel's) and VAs saw freeze / fast-forward / growing delay until they reloaded - the 2026-10-25 shift lagged all day on the bottom rung. Now each tunnel has a `TunnelGovernor` (`src/congestion.js`): it measures the queue (`bufferedAmount` / arrival rate, plus a 1 s ws ping whose pong lag exposes the kernel buffer), stops forwarding video past 600 ms / 96 KB / 800 ms pong lag, lets the queue drain, forces a keyframe by replaying the viewer's settings command with the bitrate nudged by 1 bit/s (ws-scrcpy restarts the encoder on any change), resumes on the SPS/PPS/IDR, and reports `{"op":"congestion"}` to the backend (≤ 1 per 5 s per computer) so the budget is cut and the pages ask for less. Device messages and text are never held. `host.congestion` in the meta beat. `npm run test:congestion` (64 checks). See "The second thing to understand" above. Not yet seen on a real phone at release time. |
 | **v0.5.7** | **Fleet apps, after the first real run (2026-10-24, ChatGPT on PC 1).** What the farm taught us: a fresh install of a 110 MB app takes **40-55 s per phone**, but the two phones that *already had* ChatGPT took 8 and 13 minutes to be re-installed over (the first of them, which also downloaded the set, hit the 10-minute cap and was killed as "failed"). Three changes: (1) the install limit is **25 min** (`INSTALL_LIMIT_MS`; the backend waits 45); (2) **a phone that already has this exact `version_code` is not pushed again** - the agent only checks every profile and `pm install-existing`s the missing ones, seconds instead of minutes (the phone the app was copied from, a re-run after a new profile was created, phones where a VA installed it by hand), reply carries `already: true`; (3) **failures show adb's reason, not the command line** - `_adbWhy()` drops the `Command failed: C:\...\adb.exe ...` prefix and keeps adb's last line, and a timeout says "adb gave no answer in 25 min". `tools/test_fleet_apps.js` is at 37 checks. |
 | **v0.5.6** | **Fleet apps: the dashboard can install or remove any app on every phone, in every profile.** Six RPC ops: `list_apps` / `install_apps` (the per-phone "Add apps to profiles" button finally gets an answer - it had been timing out since the backend shipped it), `export_app` (pull a Play-installed app's base + split APKs off this phone with `pm path` + `adb pull`, PUT them to the backend with the device token), `install_app` (download the set ONCE per computer into `%TEMP%\pd_fleet_<id>`, `adb install-multiple -r` = every existing profile, then verify each profile and `pm install-existing` any that was missed; one install at a time per computer), `uninstall_app` (`pm uninstall`, all profiles), `update_now` (restart into a downloaded update, or check GitHub right now - so no release after this one needs anyone at the PC). The meta beat now carries `agent_version`. All async (`_adbLong` / spawn): the video relay never blocks. `tools/test_fleet_apps.js` (30 checks). |
 | **v0.5.5** | **H.265 over WebRTC, dormant until the backend opts a phone in.** The WebRTC POC could only send H.264 because the only scrcpy server we shipped (1.19-ws7, ws-scrcpy's) predates codec selection. The agent now also bundles the upstream **scrcpy-server 5.0.1** (`resources/scrcpy/`, sha256 `764eb6f7…3bc536`, pushed to the phone as `/data/local/tmp/scrcpy-server-pd5.jar` so it never collides with ws-scrcpy's jar) and can ask it for `video_codec=h265`. `src/scrcpy-capture.js` speaks the 5.x wire protocol (dummy byte, 64-byte device name, u32 codec id, 12-byte session/media records told apart by the top bit); `src/h265-rtp.js` packetizes HEVC per RFC 7798 (single-NAL + FU type 49, VPS/SPS/PPS re-sent with every IRAP). **Nothing changes unless two env vars are set on the owner's machine:** `WEBRTC_ENABLED=1` (as before) and `WEBRTC_CODEC=h265`. With both, the SDP offer lists H.265 first and H.264 second; the capture starts only after the browser answers, using whichever codec it accepted, so a browser without HEVC decode (Edge, old Chrome, no hardware decoder) silently gets the old H.264 path and a browser that accepts neither makes the agent close the session so the page falls back to the legacy stream. `WEBRTC_CODEC=h265-only` removes the H.264 safety net for experiments. Verified without a phone: `npm run test:rtp` (76 checks), `node tools/test_webrtc_negotiation.js` (14 checks, a werift peer plays the browser), and `node tools/rtp-ffmpeg-check.js <clip.h265>` (our RTP into ffmpeg's own RFC 7798 depacketizer + decoder: 180/180 frames). **Not yet verified on a phone** — `npm run webrtc-diagnose -- --codec both` on the farm host is the next step; see `docs/webrtc-hardware-validation.md` rows B1–B5 | **v0.5.5 also moves the switch to the server:** `open_webrtc` from a backend that sends `enabled: true` (it only does so for phones in its `WEBRTC_DEVICE_IDS`) is enough to run a session, and its `codec` field (the server's `WEBRTC_CODEC`) picks what is offered — so nobody has to set `WEBRTC_ENABLED` / `WEBRTC_CODEC` on the farm computer any more. Those variables still win when they exist (`WEBRTC_ENABLED=0` is an owner veto). The backend also now hands the agent the same TURN credentials it gives the browser, which the farm's Starlink CGNAT needs. Tests: `npm run test:webrtc` (negotiation + the switch rules), `npm run test:rtp`.

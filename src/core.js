@@ -13,6 +13,7 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const instagram = require('./instagram');   // Instagram account-status classifier (pure/testable)
+const congestion = require('./congestion'); // v0.5.8: per-tunnel queue watchdog (drop stale video, force a keyframe)
 
 // Electron's main process (Node 20) has no global WebSocket; fall back to the `ws` package.
 const WebSocket = globalThis.WebSocket || require('ws');
@@ -253,6 +254,10 @@ class AgentCore extends EventEmitter {
       // bandwidth next to its CPU. The backend records probes itself; this is only for display.
       uplink_bps: (this._lastUplink || {}).bps || null,
       uplink_at: (this._lastUplink || {}).at || null,
+      // v0.5.8: is this computer's upload keeping up with what its phones send? Counts of tunnels
+      // currently holding their picture still, congestion events in the last 5 min, the deepest
+      // queue seen and the ws pong lag (kernel buffer) - the dashboard shows these next to `uplink`.
+      congestion: this._congestionStats(now),
       uptime_h: Math.round(os.uptime() / 360) / 10,
     };
     this._hostCache = stats;
@@ -1313,20 +1318,117 @@ class AgentCore extends EventEmitter {
     // buf only holds frames during the brief window before `to` opens. If `to` never opens (or stalls
     // in CLOSING/CLOSED), don't let high-bitrate video pile up unbounded in memory - tear the tunnel down.
     const MAX_BUF = 1024;
-    const link = (from, to, buf) => {
+    // `filter(data, buffering)` -> false means "do not forward this message". While `to` is still
+    // opening the message is buffered instead, and the filter is told so (`buffering` = true): the
+    // viewer's FIRST settings command usually arrives in that window and must still be captured.
+    const link = (from, to, buf, filter) => {
       from.addEventListener('message', (e) => {
-        if (to.readyState === 1) to.send(e.data);
-        else if (buf.length < MAX_BUF) buf.push(e.data);
+        if (to.readyState === 1) { if (!filter || filter(e.data, false)) to.send(e.data); }
+        else if (buf.length < MAX_BUF) { if (!filter || filter(e.data, true)) buf.push(e.data); }
         else { try { from.close(); } catch {} try { to.close(); } catch {} }
       });
       from.addEventListener('close', () => { try { to.close(); } catch {} });
       from.addEventListener('error', () => { try { to.close(); } catch {} });
     };
     tunnel.addEventListener('close', uncount); tunnel.addEventListener('error', uncount);
-    link(tunnel, local, lBuf); link(local, tunnel, tBuf);
+
+    // ---- v0.5.8: the congestion valve. See src/congestion.js for the why. ------------------------
+    // Viewer -> phone: remember the viewer's stream-settings command so we can replay it (bitrate
+    // nudged by 1 bit/s) to make the encoder restart on a keyframe when we need one.
+    const gov = new congestion.TunnelGovernor();
+    this._governors = this._governors || new Set();
+    this._governors.add(gov);
+    let settingsFrame = null;
+    const sid = streamId.slice(0, 8);
+    link(tunnel, local, lBuf, (data) => {
+      const f = congestion.captureSettingsFrame(data);
+      if (f) settingsFrame = f;
+      return true;
+    });
+    // Phone -> viewer: every video frame passes the governor; device messages and text never wait.
+    link(local, tunnel, tBuf, (data, buffering) => {
+      if (buffering) return true;                          // tunnel not open yet: nothing queued, nothing to judge
+      const u8 = congestion.toU8(data);
+      if (!u8 || !congestion.isVideoFrame(u8)) return true;
+      const now = Date.now();
+      const r = gov.onVideo(u8.byteLength, tunnel.bufferedAmount, () => congestion.isResyncFrame(u8), now);
+      if (r.entered) {
+        this._noteCongestion(serial, sid, gov, now);
+      }
+      if (r.force) {
+        const msg = congestion.forceKeyframeMessage(settingsFrame, gov.forces - 1);   // 1st force: -1, 2nd: -2, ...
+        if (msg && local.readyState === 1) { try { local.send(msg); } catch {} }
+        else if (!settingsFrame) this.emit('log', `stream ${sid} (${serial}): congested and no settings frame seen yet - waiting for the phone's next natural keyframe`);
+      }
+      if (r.left) {
+        const s = gov.stats(now);
+        this.emit('log', `stream ${sid} (${serial}): video resumed after ${now - gov.enteredAt} ms congestion ` +
+                         `(dropped ${s.dropped_frames} frames / ${Math.round(s.dropped_bytes / 1024)} KB total, peak queue ${s.max_queue_ms} ms)`);
+      }
+      return r.send;
+    });
+    // ws ping/pong on the tunnel (only the `ws` package has it; Electron's main process does): a pong
+    // waits behind everything queued in the kernel, which bufferedAmount cannot see.
+    let pingTimer = null;
+    if (typeof tunnel.ping === 'function' && typeof tunnel.on === 'function') {
+      tunnel.on('pong', () => gov.onPong(Date.now()));
+      pingTimer = setInterval(() => {
+        if (tunnel.readyState !== 1) return;
+        if (!gov.pingDue()) return;                        // the previous one has not come back yet
+        try { gov.onPingSent(Date.now()); tunnel.ping(); } catch {}
+      }, 1000);
+    }
+    const cleanup = () => { if (pingTimer) { clearInterval(pingTimer); pingTimer = null; } this._governors.delete(gov); };
+    tunnel.addEventListener('close', cleanup); tunnel.addEventListener('error', cleanup);
+    local.addEventListener('close', cleanup);
+    // ------------------------------------------------------------------------------------------------
+
     local.addEventListener('open', () => { while (lBuf.length) local.send(lBuf.shift()); });
     tunnel.addEventListener('open', () => { while (tBuf.length) tunnel.send(tBuf.shift()); });
     this.emit('log', `stream ${streamId.slice(0, 8)} (${serial}) -> ?${q.slice(0, 56)}`);
+  }
+
+  /** A tunnel just started dropping video because its queue to the backend filled up. Log it (at
+      most once per 5 s per computer, or a busy shift would drown the log) and tell the backend, which
+      owns the bitrate: it lowers this computer's budget so the pages ask the phones for less. */
+  _noteCongestion(serial, sid, gov, now) {
+    this._congestionEvents = (this._congestionEvents || []).filter((t) => now - t < 5 * 60 * 1000);
+    this._congestionEvents.push(now);
+    const s = gov.stats(now);
+    if (!this._lastCongestionLogAt || now - this._lastCongestionLogAt >= 5000) {
+      this._lastCongestionLogAt = now;
+      this.emit('log', `stream ${sid} (${serial}): uplink congested - holding the picture still until the queue drains ` +
+                       `(queue ${s.max_queue_ms} ms, pong lag ${s.pong_lag_ms} ms, ${this._congestionEvents.length} event(s) in 5 min)`);
+    }
+    if (!this._lastCongestionReportAt || now - this._lastCongestionReportAt >= 5000) {
+      this._lastCongestionReportAt = now;
+      const dev = this.devices[serial];
+      const ws = dev && dev.ws;
+      if (ws && ws.readyState === 1) {
+        try {
+          ws.send(JSON.stringify({ op: 'congestion', stream_id: sid, queue_ms: s.max_queue_ms, pong_lag_ms: s.pong_lag_ms,
+                                   rate_bps: Math.round(gov.rateBps(now) * 8), streams_open: this._openTunnels || 0,
+                                   events_5m: this._congestionEvents.length }));
+        } catch {}
+      }
+    }
+  }
+
+  /** Aggregate of the live tunnels' governors, for the host block of every meta beat. */
+  _congestionStats(now) {
+    const govs = this._governors ? Array.from(this._governors) : [];
+    const events5m = (this._congestionEvents || []).filter((t) => now - t < 5 * 60 * 1000).length;
+    let dropping = 0, maxQueue = 0, pongLag = 0, rtt = null, dropped = 0;
+    for (const g of govs) {
+      const s = g.stats(now);
+      if (s.dropping) dropping++;
+      if (s.max_queue_ms > maxQueue) maxQueue = s.max_queue_ms;
+      if (s.pong_lag_ms > pongLag) pongLag = s.pong_lag_ms;
+      if (s.rtt_ms !== null && (rtt === null || s.rtt_ms < rtt)) rtt = s.rtt_ms;
+      dropped += s.dropped_frames;
+    }
+    return { streams: govs.length, dropping_streams: dropping, events_5m: events5m, max_queue_ms: maxQueue,
+             pong_lag_ms: pongLag, rtt_ms: rtt, dropped_frames: dropped };
   }
 
   /** Switch the phone's active Android user (profile), then VERIFY each step of the airplane cycle
