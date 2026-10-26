@@ -333,7 +333,11 @@ busiest-core reading is how you would know.
 **Stream quality is decided by the backend, applied by the VA's browser, and never here.** Since
 2026-09-07 the backend divides the farm's upload budget by however many streams are live on THIS
 computer and hands each viewer a rung off a ladder; the browser then tells the phone what to encode.
-No change in this repo can make the video sharper or smoother by itself.
+No change in this repo can make the video sharper or smoother by itself. (The ladder's shape is the
+backend README's business. For orientation: since 2026-10-27 every rung from 1.5 Mbit/s upward is
+720 wide, sized so that with all 38 phones watched at once - 18 on the 40 Mbit/s computer, 20 on the
+100 Mbit/s one - every stream is still 720p; the only thing that pulls a computer below that is a
+real congestion cut, i.e. this repo's valve reporting that the line itself stopped draining.)
 
 **This repo does measure the line, though.** Every ~20 minutes `_uplinkProbe` pushes a 256 KB burst
 of random bytes at `POST /api/uplink-probe` and the backend times its arrival — that is the farm's
