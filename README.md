@@ -87,6 +87,14 @@ test; the `[congestion]` lines in the backend's per-phone log view are the evide
 
 ---
 
+**Its browser-side twin (backend, 2026-10-26).** The valve ends *lag* (queued video). A phone that
+*froze and needed a refresh* is a different failure and lives in the browser: ws-scrcpy's WebCodecs
+player stops for good on any decoder error (Chrome reclaiming the decoder of a hidden tab, a damaged
+chunk, a dead connection). The stream page now runs a watchdog that notices a dead decoder, a quit
+player or a silent chain (it asks for a keyframe the same way this valve does, by replaying the
+settings frame with its lowest bitrate bit flipped) and reloads itself. See the backend README,
+"Freezes that needed a refresh". Nothing in the agent changed for it.
+
 ## What it does
 
 - Detects plugged-in phones via adb, pairs each one with a code from the dashboard
