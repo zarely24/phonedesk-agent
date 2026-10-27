@@ -14,6 +14,7 @@ const os = require('os');
 const crypto = require('crypto');
 const instagram = require('./instagram');   // Instagram account-status classifier (pure/testable)
 const congestion = require('./congestion'); // v0.5.8: per-tunnel queue watchdog (drop stale video, force a keyframe)
+const igpost = require('./igpost');         // v0.5.9: post a reel / read the username on the phone itself (pure, data-driven steps)
 
 // Electron's main process (Node 20) has no global WebSocket; fall back to the `ws` package.
 const WebSocket = globalThis.WebSocket || require('ws');
@@ -1152,6 +1153,9 @@ class AgentCore extends EventEmitter {
       else if (m.op === 'open_url') this.openUrl(serial, m, ws);
       else if (m.op === 'check_account_status') this.checkAccountStatus(serial, m, ws);
       else if (m.op === 'ig_diagnostic') this.igDiagnostic(serial, m, ws);   // Phase-1 remote diagnostic
+      // Scheduled posting (v0.5.9): the backend's planner sends one post at a time per phone.
+      else if (m.op === 'ig_post') this.igPost(serial, m, ws);              // switch profile, drop the clip in, share it
+      else if (m.op === 'ig_whoami') this.igWhoami(serial, m, ws);          // which account is logged in, in this profile
       // Physical device controls (real, deterministic: PhoneDesk button -> here -> adb -> phone).
       else if (m.op === 'input_key') this.inputKey(serial, m, ws);        // Power/Vol/Back/Home/Recent...
       else if (m.op === 'input_text') this.inputText(serial, m, ws);      // keyboard text into the focused field
@@ -1756,6 +1760,196 @@ class AgentCore extends EventEmitter {
     let m = out.match(/(?:mResumedActivity|topResumedActivity)[^\n]*\bu(\d+)\s+([A-Za-z0-9_.]+)\//);
     if (!m) { out = await this._adbLong(serial, ['shell', 'dumpsys', 'window'], 10000).catch(() => ''); m = out.match(/mCurrentFocus[^\n]*\bu(\d+)\s+([A-Za-z0-9_.]+)\//); }
     return m ? { uid: parseInt(m[1], 10), pkg: m[2] } : null;
+  }
+
+  // ===========================================================================================
+  // Scheduled posting (v0.5.9, 2026-10-28). The backend plans a calendar of posts a month ahead
+  // (per phone, per profile, random minute inside a window) and sends ONE `ig_post` at a time per
+  // phone. Everything that touches the phone is here; everything that decides what a screen means
+  // is in src/igpost.js (pure, tested without a phone). Rules that do not bend:
+  //   * a person watching the phone wins: refused before, aborted during (the stream check);
+  //   * one post per phone at a time (`_posting`), a second request answers device_busy;
+  //   * the profile is switched exactly as the dashboard's switch does it (airplane cycle = fresh
+  //     mobile IP for that account) unless the job says `fresh_ip:false`, and switched BACK after;
+  //   * `mode:'capture'` runs the flow up to - never through - the Share button and returns what
+  //     every screen showed (texts + ids, sanitized), which is how the selectors get tuned;
+  //   * the reply says what was OBSERVED: `shared` only when the confirm step saw the post go.
+  // ===========================================================================================
+  _igDriver(serial, username) {
+    const self = this;
+    return {
+      dump: () => self._uiDump(serial),
+      tap: (x, y) => self._adbLong(serial, ['shell', 'input', 'tap', String(Math.round(x)), String(Math.round(y))], 8000),
+      type: async (text) => {
+        // `input text` in chunks: one long argument trips the device shell's line limit and %s
+        // spaces are expanded per chunk. ASCII only (igpost.captionForDevice already stripped the rest).
+        const safe = igpost.captionForDevice(text, 2000);
+        for (let i = 0; i < safe.length; i += 120) {
+          const enc = safe.slice(i, i + 120).replace(/ /g, '%s').replace(/(["\\$`&;<>|()*?~#!'])/g, '\\$1');
+          await self._adbLong(serial, ['shell', 'input', 'text', enc], 10000);
+        }
+      },
+      key: (name) => {
+        const KEYS = { back: 4, home: 3, enter: 66, tab: 61 };
+        return self._adbLong(serial, ['shell', 'input', 'keyevent', String(KEYS[name] || 4)], 8000);
+      },
+      wait: (ms) => new Promise((r) => setTimeout(r, ms)),
+      screenshot: async () => { try { return await self._adbBinary(serial, ['exec-out', 'screencap', '-p'], 15000); } catch { return null; } },
+      username,
+    };
+  }
+
+  /** Switch the phone to a profile for an unattended job. Same mechanics as switchUser (am
+      switch-user, verify, keep the screen on) with the airplane cycle optional. Returns the
+      previous user id so the caller can put the phone back. */
+  async _igSwitchTo(serial, uid, freshIp, log) {
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    const before = (await this._adbLong(serial, ['shell', 'am', 'get-current-user'], 6000).catch(() => '')).trim();
+    if (before === String(uid)) { log(`already on profile ${uid}`); return before; }
+    await this._adbLong(serial, ['shell', 'am', 'switch-user', String(uid)], 12000).catch(() => {});
+    await wait(2500);
+    const cur = (await this._adbLong(serial, ['shell', 'am', 'get-current-user'], 6000).catch(() => '')).trim();
+    if (cur !== String(uid)) throw new Error(`profile switch to ${uid} did not take (phone is on ${cur || '?'})`);
+    log(`switched ${before || '?'} -> ${uid}`);
+    if (freshIp) {
+      await this._setAirplane(serial, true); await wait(1500);
+      await this._setAirplane(serial, false); await wait(1500);
+      await this._adbLong(serial, ['shell', 'svc', 'data', 'enable'], 6000).catch(() => {});
+      const net = await this._waitForNetwork(serial, 20000);
+      log(`airplane cycle: network ${net ? 'back (' + net + ')' : 'NOT back after 20 s'}`);
+      if (!net) throw new Error('no network after the airplane cycle');
+    }
+    await this._keepScreenOn(serial, uid);
+    await this._adbLong(serial, ['shell', 'input', 'keyevent', '224'], 5000).catch(() => {});   // KEYCODE_WAKEUP
+    return before;
+  }
+
+  async igPost(serial, m, ws) {
+    const uid = parseInt(m.uid != null ? m.uid : -1, 10);
+    const mode = m.mode === 'capture' ? 'capture' : 'post';
+    const pkg = 'com.instagram.android';
+    const username = String(m.username || '');
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    const t0 = Date.now();
+    const secs = () => Math.round((Date.now() - t0) / 1000);
+    const log = (x) => this.emit('log', `[post ${serial} u${uid}] ${x}`);
+    const reply = (obj) => this._rpcReply(ws, m, Object.assign({ seconds: secs(), mode }, obj));
+    if (!this._posting) this._posting = new Set();
+    if (!(uid >= 0)) return reply({ ok: false, state: 'bad_request', error: 'uid missing' });
+    if (this._posting.has(serial)) return reply({ ok: false, state: 'device_busy', error: 'another post is running on this phone' });
+    if (this._checking && this._checking.has(serial)) return reply({ ok: false, state: 'device_busy', error: 'an account check is running on this phone' });
+    this._posting.add(serial);
+    let previous = null, tmp = null, driver = null;
+    const viewerOpened = async () => this._scrcpyRunning(serial);
+    try {
+      if (await viewerOpened()) return reply({ ok: false, state: 'device_busy', error: 'someone is watching this phone' });
+      if (!(await this._userExists(serial, uid))) return reply({ ok: false, state: 'profile_not_found', error: 'PROFILE_NOT_FOUND' });
+      if (!(await this._pkgInstalledForUser(serial, uid, pkg))) return reply({ ok: false, state: 'app_not_installed', error: 'Instagram is not installed in this profile' });
+      // 1) the profile
+      previous = await this._igSwitchTo(serial, uid, m.fresh_ip !== false, log);
+      // 2) the clip, into THIS profile's gallery (newest item = what the gallery step picks)
+      let landed = '';
+      // The backend names the file by PATH; this computer adds its own device token (the same one
+      // upload_media uses) - the token never travels in a job and never sits in a database row.
+      const fileUrl = m.file_url ? String(m.file_url)
+        : (m.file_path ? `${this.backend}${m.file_path}?token=${encodeURIComponent((this._loadTokens()[serial] || {}).device_token || (this.devices[serial] || {}).token || '')}` : '');
+      if (fileUrl) {
+        const name = String(m.file_name || 'reel.mp4').replace(/[\/\\\0]/g, '_');
+        tmp = path.join(os.tmpdir(), `pd_post_${Date.now()}_${name}`);
+        await this._download(fileUrl, tmp, 300000);
+        landed = await this._pushToGallery(serial, tmp, name, uid);
+        log(`clip in gallery: ${landed}`);
+        await wait(1500);
+      }
+      if (await viewerOpened()) return reply({ ok: false, state: 'device_busy', error: 'a viewer opened during the post' });
+      // 3) Instagram, in this profile: straight to the audio page when the job carries one
+      const audio = String(m.audio_url || '').trim();
+      if (audio && /^https?:\/\/(www\.)?instagram\.com\//i.test(audio)) {
+        // Instagram's own link handler first (keeps the link inside the app); a plain VIEW as the fallback.
+        const r = await this._adbLong(serial, ['shell', 'am', 'start', '--user', String(uid), '-n', `${pkg}/com.instagram.url.UrlHandlerActivity`, '-d', audio], 10000).catch(() => 'Error');
+        if (/error|exception|unable|does not exist/i.test(r)) {
+          await this._adbLong(serial, ['shell', 'am', 'start', '--user', String(uid), '-a', 'android.intent.action.VIEW', '-d', audio], 10000).catch(() => {});
+        }
+        log('opened the audio link');
+      } else {
+        const comp = await this._resolveLauncher(serial, uid, pkg);
+        if (comp) await this._adbLong(serial, ['shell', 'am', 'start', '--user', String(uid), '-n', comp], 10000).catch(() => {});
+        else await this._adbLong(serial, ['shell', 'monkey', '-p', pkg, '--user', String(uid), '-c', 'android.intent.category.LAUNCHER', '1'], 10000).catch(() => {});
+      }
+      await wait(4000);
+      // 4) the flow
+      driver = this._igDriver(serial, username);
+      const flow = audio ? igpost.FLOW_REEL_WITH_AUDIO : igpost.FLOW_REEL;
+      const caption = igpost.captionForDevice(m.caption || '', 2000);
+      const result = await igpost.run(driver, flow, {
+        caption, mode, username,
+        onStep: (step, label) => log(`step ${step.name}: ${label}`),
+        abort: () => false,   // the stream check is async; checked between phases above and below instead
+      });
+      delete result.nodes;
+      if (await viewerOpened() && result.state !== 'shared') result.state = 'aborted';
+      const out = { ok: result.ok, state: result.state, step: result.step, why: result.why || '', trace: result.trace, screen: result.screen, flow: audio ? 'audio' : 'gallery', gallery: landed };
+      if (mode === 'capture') out.screens = result.screens;
+      if ((!result.ok || mode === 'capture') && m.evidence !== false) {
+        const png = await driver.screenshot();
+        if (png && png.length) out.screenshot_b64 = png.toString('base64');
+      }
+      log(`-> ${out.state}${out.why ? ' (' + out.why + ')' : ''} at step ${out.step} in ${secs()} s`);
+      return reply(out);
+    } catch (e) {
+      const err = String((e && e.message) || e);
+      log(`failed: ${err}`);
+      const out = { ok: false, state: 'failed', why: 'exception', error: err.slice(0, 300) };
+      try { if (driver && m.evidence !== false) { const png = await driver.screenshot(); if (png && png.length) out.screenshot_b64 = png.toString('base64'); } } catch {}
+      return reply(out);
+    } finally {
+      try { if (tmp) fs.unlinkSync(tmp); } catch {}
+      try { await this._adbLong(serial, ['shell', 'input', 'keyevent', 'KEYCODE_HOME'], 5000); } catch {}
+      // Put the phone back on the profile it was on, so a VA who opens it next sees what they left.
+      if (previous && m.restore_user !== false && previous !== String(uid)) {
+        try { await this._adbLong(serial, ['shell', 'am', 'switch-user', String(previous)], 12000); log(`restored profile ${previous}`); } catch {}
+      }
+      try { this.devices[serial] && (this.devices[serial]._metaCache = null); } catch {}
+      this._sendMeta(serial, ws);
+      this._posting.delete(serial);
+    }
+  }
+
+  /** Which Instagram account lives in this profile. Opens the app for that user, taps the profile
+      tab, reads the title. Switches the phone's current user only if it has to (the app of a
+      background user cannot be brought to the front), and back again. */
+  async igWhoami(serial, m, ws) {
+    const uid = parseInt(m.uid != null ? m.uid : -1, 10);
+    const pkg = 'com.instagram.android';
+    const t0 = Date.now();
+    const log = (x) => this.emit('log', `[whoami ${serial} u${uid}] ${x}`);
+    const reply = (obj) => this._rpcReply(ws, m, Object.assign({ seconds: Math.round((Date.now() - t0) / 1000), uid }, obj));
+    if (!this._posting) this._posting = new Set();
+    if (!(uid >= 0)) return reply({ ok: false, state: 'bad_request', error: 'uid missing' });
+    if (this._posting.has(serial)) return reply({ ok: false, state: 'device_busy', error: 'another job is running on this phone' });
+    this._posting.add(serial);
+    let previous = null;
+    try {
+      if (await this._scrcpyRunning(serial)) return reply({ ok: false, state: 'device_busy', error: 'someone is watching this phone' });
+      if (!(await this._userExists(serial, uid))) return reply({ ok: false, state: 'profile_not_found', error: 'PROFILE_NOT_FOUND' });
+      if (!(await this._pkgInstalledForUser(serial, uid, pkg))) return reply({ ok: true, state: 'app_not_installed', username: '', status: 'APP_ERROR' });
+      previous = await this._igSwitchTo(serial, uid, false, log);
+      const comp = await this._resolveLauncher(serial, uid, pkg);
+      if (comp) await this._adbLong(serial, ['shell', 'am', 'start', '--user', String(uid), '-n', comp], 10000).catch(() => {});
+      await new Promise((r) => setTimeout(r, 3500));
+      const driver = this._igDriver(serial, '');
+      const r = await igpost.run(driver, igpost.FLOW_WHOAMI, { mode: 'post' });
+      const status = instagram.classify(await driver.dump().catch(() => '')).status;
+      const username = r.ok && r.nodes ? igpost.usernameFrom(r.nodes) : '';
+      log(`-> ${username ? '@' + username : 'no username'} (${status}, step ${r.step})`);
+      return reply({ ok: true, state: username ? 'found' : 'not_found', username, status, step: r.step, why: r.why || '', screen: r.screen });
+    } catch (e) {
+      return reply({ ok: false, state: 'failed', error: String((e && e.message) || e).slice(0, 300) });
+    } finally {
+      try { await this._adbLong(serial, ['shell', 'input', 'keyevent', 'KEYCODE_HOME'], 5000); } catch {}
+      if (previous && previous !== String(uid)) { try { await this._adbLong(serial, ['shell', 'am', 'switch-user', String(previous)], 12000); } catch {} }
+      this._posting.delete(serial);
+    }
   }
 
   /** Phase-1 REMOTE Instagram diagnostic (triggered from the web dashboard via the backend RPC). READ-

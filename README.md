@@ -215,6 +215,7 @@ Facts worth knowing:
 | Version | What changed |
 |---|---|
 | **v0.5.8** | **The congestion valve: video is held still and resumed on a fresh keyframe instead of lagging.** Nothing on the path ever dropped a frame before, so a line that could not carry the phones' output queued it (socket buffer, then the kernel's) and VAs saw freeze / fast-forward / growing delay until they reloaded - the 2026-10-25 shift lagged all day on the bottom rung. Now each tunnel has a `TunnelGovernor` (`src/congestion.js`): it measures the queue (`bufferedAmount` / arrival rate, plus a 1 s ws ping whose pong lag exposes the kernel buffer), stops forwarding video past 600 ms / 96 KB / 800 ms pong lag, lets the queue drain, forces a keyframe by replaying the viewer's settings command with the bitrate nudged by 1 bit/s (ws-scrcpy restarts the encoder on any change), resumes on the SPS/PPS/IDR, and reports `{"op":"congestion"}` to the backend (≤ 1 per 5 s per computer) so the budget is cut and the pages ask for less. Device messages and text are never held. `host.congestion` in the meta beat. `npm run test:congestion` (64 checks). See "The second thing to understand" above. Not yet seen on a real phone at release time. |
+| **v0.5.9** | **Scheduled posting: `ig_post` and `ig_whoami`.** The backend's planner (backend README, "Scheduled posting") sends one post at a time per phone: switch to the profile (airplane cycle unless `fresh_ip:false`), fetch the clip by path with this computer's device token and drop it into THAT profile's gallery, open Instagram (the audio link first when the job carries a sound), tap through the composer by resource-id / text / content-desc from `uiautomator dump` (`src/igpost.js`, pure and data-driven: the FLOW_* step lists are the selectors), type the caption, Share, wait for the confirmation, Home, switch back. `mode:'capture'` stops before Share and returns every screen's texts + ids (sanitized) plus a screenshot - the tuning loop, because the selectors are PROVISIONAL until confirmed on a farm phone. `ig_whoami` opens the profile tab and reads the username for the backend's account scan. A person watching the phone wins (refused / aborted); one job per phone at a time. `npm run test:igpost` (40 checks). |
 | **v0.5.7** | **Fleet apps, after the first real run (2026-10-24, ChatGPT on PC 1).** What the farm taught us: a fresh install of a 110 MB app takes **40-55 s per phone**, but the two phones that *already had* ChatGPT took 8 and 13 minutes to be re-installed over (the first of them, which also downloaded the set, hit the 10-minute cap and was killed as "failed"). Three changes: (1) the install limit is **25 min** (`INSTALL_LIMIT_MS`; the backend waits 45); (2) **a phone that already has this exact `version_code` is not pushed again** - the agent only checks every profile and `pm install-existing`s the missing ones, seconds instead of minutes (the phone the app was copied from, a re-run after a new profile was created, phones where a VA installed it by hand), reply carries `already: true`; (3) **failures show adb's reason, not the command line** - `_adbWhy()` drops the `Command failed: C:\...\adb.exe ...` prefix and keeps adb's last line, and a timeout says "adb gave no answer in 25 min". `tools/test_fleet_apps.js` is at 37 checks. |
 | **v0.5.6** | **Fleet apps: the dashboard can install or remove any app on every phone, in every profile.** Six RPC ops: `list_apps` / `install_apps` (the per-phone "Add apps to profiles" button finally gets an answer - it had been timing out since the backend shipped it), `export_app` (pull a Play-installed app's base + split APKs off this phone with `pm path` + `adb pull`, PUT them to the backend with the device token), `install_app` (download the set ONCE per computer into `%TEMP%\pd_fleet_<id>`, `adb install-multiple -r` = every existing profile, then verify each profile and `pm install-existing` any that was missed; one install at a time per computer), `uninstall_app` (`pm uninstall`, all profiles), `update_now` (restart into a downloaded update, or check GitHub right now - so no release after this one needs anyone at the PC). The meta beat now carries `agent_version`. All async (`_adbLong` / spawn): the video relay never blocks. `tools/test_fleet_apps.js` (30 checks). |
 | **v0.5.5** | **H.265 over WebRTC, dormant until the backend opts a phone in.** The WebRTC POC could only send H.264 because the only scrcpy server we shipped (1.19-ws7, ws-scrcpy's) predates codec selection. The agent now also bundles the upstream **scrcpy-server 5.0.1** (`resources/scrcpy/`, sha256 `764eb6f7…3bc536`, pushed to the phone as `/data/local/tmp/scrcpy-server-pd5.jar` so it never collides with ws-scrcpy's jar) and can ask it for `video_codec=h265`. `src/scrcpy-capture.js` speaks the 5.x wire protocol (dummy byte, 64-byte device name, u32 codec id, 12-byte session/media records told apart by the top bit); `src/h265-rtp.js` packetizes HEVC per RFC 7798 (single-NAL + FU type 49, VPS/SPS/PPS re-sent with every IRAP). **Nothing changes unless two env vars are set on the owner's machine:** `WEBRTC_ENABLED=1` (as before) and `WEBRTC_CODEC=h265`. With both, the SDP offer lists H.265 first and H.264 second; the capture starts only after the browser answers, using whichever codec it accepted, so a browser without HEVC decode (Edge, old Chrome, no hardware decoder) silently gets the old H.264 path and a browser that accepts neither makes the agent close the session so the page falls back to the legacy stream. `WEBRTC_CODEC=h265-only` removes the H.264 safety net for experiments. Verified without a phone: `npm run test:rtp` (76 checks), `node tools/test_webrtc_negotiation.js` (14 checks, a werift peer plays the browser), and `node tools/rtp-ffmpeg-check.js <clip.h265>` (our RTP into ffmpeg's own RFC 7798 depacketizer + decoder: 180/180 frames). **Not yet verified on a phone** — `npm run webrtc-diagnose -- --codec both` on the farm host is the next step; see `docs/webrtc-hardware-validation.md` rows B1–B5 | **v0.5.5 also moves the switch to the server:** `open_webrtc` from a backend that sends `enabled: true` (it only does so for phones in its `WEBRTC_DEVICE_IDS`) is enough to run a session, and its `codec` field (the server's `WEBRTC_CODEC`) picks what is offered — so nobody has to set `WEBRTC_ENABLED` / `WEBRTC_CODEC` on the farm computer any more. Those variables still win when they exist (`WEBRTC_ENABLED=0` is an owner veto). The backend also now hands the agent the same TURN credentials it gives the browser, which the farm's Starlink CGNAT needs. Tests: `npm run test:webrtc` (negotiation + the switch rules), `npm run test:rtp`.
@@ -233,6 +234,40 @@ Facts worth knowing:
 | v0.3.4 | Repointed at `phonedesk.map-mgt.com` after the backend left Render |
 
 ---
+
+## Scheduled posting ops (v0.5.9)
+
+Both are request/response over the phone-home socket (`request_id` -> `rpc_result`), like the
+account-monitoring ops, and both target an explicit Android user.
+
+`ig_post` `{uid, file_path, file_name, caption, audio_url, mode:'post'|'capture', fresh_ip, evidence,
+restore_user, username}` -> `{ok, state, step, why, trace:[{name, ok, matched, ms}], screen:{texts,
+ids}, screens?, screenshot_b64?, flow:'audio'|'gallery', gallery, seconds}`. `state` is what was
+OBSERVED: `shared` only when the confirm step saw the "sharing" screen; `failed` with `why`
+(`element_not_found` at `step`, `login_required`, `account_blocked`, `challenge`, `app_crash`,
+`share_failed`, `exception`); `captured` in capture mode; `device_busy` when someone is watching
+(before) or opened the phone (during -> `aborted`); `profile_not_found`, `app_not_installed`.
+`file_path` is a backend path - this computer appends `?token=<its device token>`, so the token
+never rides in a job. The clip lands via `_pushToGallery` (MediaStore for secondary profiles), so
+the "newest gallery item" the flow taps is the one just pushed.
+
+`ig_whoami` `{uid}` -> `{ok, state:'found'|'not_found'|'app_not_installed', username, status, step,
+screen}`. Opens Instagram in that profile, taps the profile tab, reads the action-bar title (or the
+first handle-like text in the header); never guesses.
+
+**Where the selectors live and how to tune them.** `src/igpost.js`: `FLOW_REEL` (create -> Reel ->
+gallery -> Next -> Next -> caption -> Share -> confirm), `FLOW_REEL_WITH_AUDIO` (Use audio ->
+gallery -> ...), `FLOW_WHOAMI`, `DISMISS` (pop-ups tapped away when a step's target is missing),
+`FATAL` (texts that end the job with a reason). A step lists its candidates in priority order
+(resource-id tail, exact text, content-desc); `optional` steps are skipped after a short wait (a
+build that goes straight to the gallery has no "Reel" chooser). Run a Test run from the Posting
+page, open the job's details, read the `[step] texts | ids` lines of the screen where it stopped,
+add the real id/text to that step's `find`, release. The runner is pure: `tools/test_igpost.js`
+drives it with scripted screens, so a selector change is tested without a phone.
+
+**What it never does.** Posts while a stream is open on the phone; two jobs on one phone; retries
+a Share by itself; types non-ASCII (`adb input text` cannot - the caption is filtered); leaves the
+phone on the posting profile (`restore_user` switches back, without an airplane cycle).
 
 ## Fleet apps ops (v0.5.6)
 
