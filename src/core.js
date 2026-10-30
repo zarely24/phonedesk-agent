@@ -19,6 +19,15 @@ const igpost = require('./igpost');         // v0.5.9: post a reel / read the us
 // Electron's main process (Node 20) has no global WebSocket; fall back to the `ws` package.
 const WebSocket = globalThis.WebSocket || require('ws');
 const SCREEN_OFF_TIMEOUT_MS = 30 * 60 * 1000;   // per-profile screen timeout set after a profile switch
+// The airplane cycle of a profile switch (v0.5.10): how long one airplane command may take before it
+// counts as failed, how many verified attempts it gets, how long after a switch the watchdog waits
+// before it judges a phone, how often the watchdog looks, and the window in which a repeat of a
+// switch that passed is a no-op.
+const AIRPLANE_CMD_MS = 15000;
+const AIRPLANE_ATTEMPTS = 3;
+const SWITCH_SETTLE_MS = 30000;
+const AIRPLANE_WATCHDOG_MS = 45000;
+const SWITCH_REPEAT_WINDOW_MS = 60000;
 const http = require('http');
 const https = require('https');
 
@@ -108,6 +117,8 @@ class AgentCore extends EventEmitter {
     this._wsRespawnTimer = null;
     this._chargeProbe = {};   // serial -> { rooted, nodes }: what the phone's sysfs offers, probed ONCE (v0.5.4)
     this._stopped = false;    // set on shutdown() so ws-scrcpy isn't resurrected as the app quits
+    this._switches = {};      // serial -> { running, next, last }: one profile switch at a time per phone (v0.5.10)
+    this._airplaneWatchdogTimer = null;
   }
 
   /** Tear down ONE device: stop its timers, close its socket, forget it. Used everywhere we drop a
@@ -189,12 +200,14 @@ class AgentCore extends EventEmitter {
     const dev = this.devices[serial];
     const bc = await this._batteryAndChargingAsync(serial);
     const cs = dev && dev.chargeStatus;
+    // The last profile switch's verdict and the airplane watchdog's last action ride along (v0.5.10).
+    const sw = { switch_status: (dev && dev.switchStatus) || null, airplane_watchdog: (dev && dev.airplaneWatchdog) || null };
     if (!full && dev && dev._metaCache) {
-      return { battery: bc.battery, charging: bc.charging, charge_status: cs, host: this._hostStats(), agent_version: this.appVersion, ...dev._metaCache };
+      return { battery: bc.battery, charging: bc.charging, charge_status: cs, host: this._hostStats(), agent_version: this.appVersion, ...sw, ...dev._metaCache };
     }
     const cache = { users: await this._listUsersAsync(serial), current_user: await this._currentUserAsync(serial) };
     if (dev) dev._metaCache = cache;
-    return { battery: bc.battery, charging: bc.charging, charge_status: cs, host: this._hostStats(), agent_version: this.appVersion, ...cache };
+    return { battery: bc.battery, charging: bc.charging, charge_status: cs, host: this._hostStats(), agent_version: this.appVersion, ...sw, ...cache };
   }
   /** Health of the computer the phones are plugged into.
       Reported on every heartbeat so we can see the machine instead of guessing about it. Free to
@@ -1025,6 +1038,7 @@ class AgentCore extends EventEmitter {
     this._refreshDevices();   // async; detectAll() below reads the cache it keeps warm
     this.startWsScrcpy();
     this._startUplinkProbes();
+    this._startAirplaneWatchdog();
     const tokens = this._loadTokens();
     const plugged = {}; this.detectAll().forEach((d) => { if (d.state === 'ready') plugged[d.serial] = true; });
     Object.keys(tokens).forEach((serial) => {
@@ -1231,6 +1245,8 @@ class AgentCore extends EventEmitter {
     this._stopped = true;             // block any pending/future respawn
     try { clearInterval(this._uplinkTimer); } catch {}
     this._uplinkTimer = null;
+    try { clearInterval(this._airplaneWatchdogTimer); } catch {}
+    this._airplaneWatchdogTimer = null;
     Object.keys(this.devices).forEach((serial) => this._dropDevice(serial));
     this._killWsScrcpy();
   }
@@ -1439,18 +1455,64 @@ class AgentCore extends EventEmitter {
       that gives the profile a fresh mobile IP (v0.5.2). Everything here is ASYNC (`_adbLong`) so the
       single-event-loop video relay is never frozen — a slow/failing phone can't stall the others, and
       the whole thing is wrapped so one phone's error is isolated. Honest PASS/FAIL logs; the airplane
-      cycle is SKIPPED if the profile switch itself didn't take. No IPs or network details are logged. */
-  async switchUser(serial, userId, ws) {
+      cycle is SKIPPED if the profile switch itself didn't take. No IPs or network details are logged.
+
+      v0.5.10 — ONE SWITCH AT A TIME PER PHONE. A switch that arrives while one is running waits for
+      it, and only the LAST request made while waiting is run: a VA who clicked three profiles in a
+      row gets the third, not three airplane cycles fighting each other (one of them turning airplane
+      ON after another turned it OFF was one way a phone got left in airplane mode). A repeat of a
+      switch that fully passed less than a minute ago is a no-op. Every switch ends with a verdict
+      (`switch_status` in the next meta beat: ok / which step failed) that the device page shows. */
+  switchUser(serial, userId, ws) {
     const id = parseInt(userId, 10);
-    if (isNaN(id) || !serial) return;
+    if (isNaN(id) || !serial) return Promise.resolve();
+    const st = this._switchState(serial);
+    st.next = { id, ws };
+    if (st.running) return st.running;
+    st.running = (async () => {
+      while (st.next) {
+        const n = st.next; st.next = null;
+        try { await this._switchUserNow(serial, n.id, n.ws); } catch {}
+      }
+    })().finally(() => { st.running = null; });
+    return st.running;
+  }
+  _switchState(serial) {
+    if (!this._switches) this._switches = {};
+    return this._switches[serial] || (this._switches[serial] = { running: null, next: null, last: null });
+  }
+  /** Is this phone mid-switch, just out of one, or inside an unattended job that cycles airplane
+      itself? The airplane watchdog keeps its hands off such a phone. */
+  _switchBusy(serial) {
+    const st = this._switches && this._switches[serial];
+    if (st && (st.running || st.next)) return true;
+    if (st && st.last && Date.now() - st.last.at < SWITCH_SETTLE_MS) return true;   // radios still settling
+    if (this._posting && this._posting.has(serial)) return true;
+    if (this._igDiag && this._igDiag.has(serial)) return true;
+    return false;
+  }
+  async _switchUserNow(serial, id, ws) {
+    const st = this._switchState(serial);
+    const dev = this.devices && this.devices[serial];
     const log = (m) => this.emit('log', `[switch ${serial}->${id}] ${m}`);
     const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-    const R = { user_switch: false, airplane_on: null, airplane_off: false, network: false };
+    const R = { user_switch: false, airplane_on: null, airplane_off: false, network: false, screen: null };
+    const t0 = Date.now();
+    if (st.last && st.last.id === id && st.last.ok && t0 - st.last.at < SWITCH_REPEAT_WINDOW_MS) {
+      log(`already on profile ${id} (switched ${Math.round((t0 - st.last.at) / 1000)} s ago, every step passed) - nothing to do`);
+      this._sendMeta(serial, ws);
+      return;
+    }
     try {
-      // 1) Switch the Android user, then confirm it actually took.
+      // 1) Switch the Android user, then confirm it actually took (a busy phone can need more than
+      //    the 2.5 s the first read allows, so a miss gets one more look before it counts as FAIL).
       await this._adbLong(serial, ['shell', 'am', 'switch-user', String(id)], 12000).catch(() => {});
       await wait(2500);
-      const cur = (await this._adbLong(serial, ['shell', 'am', 'get-current-user'], 6000).catch(() => '')).trim();
+      let cur = (await this._adbLong(serial, ['shell', 'am', 'get-current-user'], 6000).catch(() => '')).trim();
+      if (cur !== String(id)) {
+        await wait(3000);
+        cur = (await this._adbLong(serial, ['shell', 'am', 'get-current-user'], 6000).catch(() => '')).trim();
+      }
       R.user_switch = cur === String(id);
       log(`Profile switch: ${R.user_switch ? 'PASS' : 'FAIL'}`);
       if (!R.user_switch) {
@@ -1458,20 +1520,28 @@ class AgentCore extends EventEmitter {
         // no reason on a phone that's still on the wrong profile.
         log('Airplane cycle: SKIPPED (profile switch did not complete)');
       } else {
-        // 2) Airplane ON, then verify the setting actually flipped.
-        await this._setAirplane(serial, true);
-        await wait(1500);
-        R.airplane_on = await this._airplaneOn(serial);
-        log(`Airplane ON: ${R.airplane_on === true ? 'PASS' : R.airplane_on === false ? 'FAIL' : 'UNKNOWN'}`);
+        // 2) Airplane ON, verified (retried inside _setAirplane).
+        R.airplane_on = await this._setAirplane(serial, true);
+        log(`Airplane ON: ${R.airplane_on ? 'PASS' : 'FAIL'}`);
         await wait(4000);
-        // 3) Airplane OFF, verify, and re-enable mobile data.
-        await this._setAirplane(serial, false);
-        await wait(1500);
-        R.airplane_off = (await this._airplaneOn(serial)) === false;
+        // 3) Airplane OFF, verified, and re-enable mobile data. OFF is sent even when ON could not be
+        //    confirmed: the ON command may well have landed without our seeing it.
+        R.airplane_off = await this._setAirplane(serial, false);
         log(`Airplane OFF: ${R.airplane_off ? 'PASS' : 'FAIL'}`);
         await this._adbLong(serial, ['shell', 'svc', 'data', 'enable'], 6000).catch(() => {});
         // 4) Wait for the mobile network to actually come back (a reachability probe, no IP logged).
         R.network = await this._waitForNetwork(serial, 14000);
+        if (!R.network) {
+          // Not back after 14 s. A Pixel 8 can take longer to re-register, so look again - and if
+          // the phone still reads airplane ON, turn it off once more first (the earlier OFF may have
+          // landed on a phone that was still busy with the user switch).
+          if ((await this._airplaneOn(serial)) !== false) {
+            log('Airplane still ON after the cycle - turning it off again');
+            R.airplane_off = await this._setAirplane(serial, false);
+            await this._adbLong(serial, ['shell', 'svc', 'data', 'enable'], 6000).catch(() => {});
+          }
+          R.network = await this._waitForNetwork(serial, 16000);
+        }
         log(`Mobile network recovery: ${R.network ? 'PASS (' + R.network + ')' : 'FAIL'}`);
         // 5) The new profile's screen timeout + stay awake while plugged in (see _keepScreenOn).
         R.screen = await this._keepScreenOn(serial, id);
@@ -1480,6 +1550,16 @@ class AgentCore extends EventEmitter {
     } catch (e) {
       log(`switch_user isolated error: ${(e && e.message) || e}`);
     }
+    // The verdict. "ok" means the VA has the profile they asked for, airplane mode is OFF and mobile
+    // data is back - the three things a switch is for. Everything else is a problem in plain words.
+    const ok = R.user_switch && R.airplane_off && !!R.network;
+    const problem = !R.user_switch ? 'the profile switch did not complete'
+      : !R.airplane_off ? 'airplane mode would not turn off'
+        : !R.network ? 'mobile data did not come back' : '';
+    const seconds = Math.round((Date.now() - t0) / 1000);
+    st.last = { id, ok, at: Date.now() };
+    if (dev) dev.switchStatus = { user: id, ok, problem, seconds, at: Math.floor(Date.now() / 1000), steps: R };
+    log(ok ? `Switch done in ${seconds} s` : `Switch FAILED after ${seconds} s: ${problem}`);
     this._sendMeta(serial, ws);
   }
   /** Keep the profile we just switched to from going dark. Every Android profile has its OWN
@@ -1496,14 +1576,31 @@ class AgentCore extends EventEmitter {
     } catch { return false; }
   }
 
-  /** Set airplane mode on/off. Android 11+ path first; older devices get the settings+broadcast
-      fallback. Async so it never blocks the video relay. */
+  /** Set airplane mode on/off and VERIFY it by reading the setting back (v0.5.10). Up to three
+      attempts: `cmd connectivity airplane-mode` (Android 11+), the same again, then the old
+      settings+broadcast path. A command that times out (15 s now - a Mac driving 22 phones through
+      hubs answers adb slower than 6 s at busy moments, and a timeout used to be swallowed as success)
+      or answers with an error counts as a failed attempt, not as done. Returns true when the setting
+      reads what was asked, false after three attempts. Async so it never blocks the video relay. */
   async _setAirplane(serial, on) {
-    const r = await this._adbLong(serial, ['shell', 'cmd', 'connectivity', 'airplane-mode', on ? 'enable' : 'disable'], 6000).catch(() => 'err');
-    if (/unknown|error|not found|usage|exception/i.test(r)) {
-      await this._adbLong(serial, ['shell', 'settings', 'put', 'global', 'airplane_mode_on', on ? '1' : '0'], 6000).catch(() => {});
-      await this._adbLong(serial, ['shell', 'am', 'broadcast', '-a', 'android.intent.action.AIRPLANE_MODE', '--ez', 'state', on ? 'true' : 'false'], 6000).catch(() => {});
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    for (let attempt = 1; attempt <= AIRPLANE_ATTEMPTS; attempt++) {
+      let viaSettings = attempt === AIRPLANE_ATTEMPTS;
+      if (!viaSettings) {
+        const r = await this._adbLong(serial, ['shell', 'cmd', 'connectivity', 'airplane-mode', on ? 'enable' : 'disable'], AIRPLANE_CMD_MS)
+          .catch((e) => 'error: ' + (e && e.killed ? 'timed out' : ((e && e.message) || 'adb failed')));
+        if (/unknown|error|not found|usage|exception/i.test(r)) viaSettings = true;   // the command itself failed: old path, same attempt
+      }
+      if (viaSettings) {
+        await this._adbLong(serial, ['shell', 'settings', 'put', 'global', 'airplane_mode_on', on ? '1' : '0'], AIRPLANE_CMD_MS).catch(() => {});
+        await this._adbLong(serial, ['shell', 'am', 'broadcast', '-a', 'android.intent.action.AIRPLANE_MODE', '--ez', 'state', on ? 'true' : 'false'], AIRPLANE_CMD_MS).catch(() => {});
+      }
+      await wait(1500);
+      const st = await this._airplaneOn(serial);
+      if (st === on) return true;
+      this.emit('log', `${serial}: airplane ${on ? 'ON' : 'OFF'} attempt ${attempt}/${AIRPLANE_ATTEMPTS}${viaSettings ? ' (settings path)' : ''} did not take (setting reads ${st === null ? 'nothing' : st ? '1' : '0'})`);
     }
+    return false;
   }
 
   /** true = airplane on, false = off, null = couldn't read. Reads the global setting (source of truth). */
@@ -1512,6 +1609,41 @@ class AgentCore extends EventEmitter {
     if (v === '1') return true;
     if (v === '0') return false;
     return null;
+  }
+
+  /** The airplane watchdog (v0.5.10). Every 45 s, one phone at a time, read the airplane setting of
+      every connected phone that is not mid-switch, just out of one, or inside a posting job. A phone
+      found ON on two consecutive looks (so not someone's deliberate quick toggle on the screen) gets
+      airplane turned OFF and mobile data re-enabled, and the dashboard is told through the next
+      meta beat (`airplane_watchdog`). This is the net under the switch: whatever left a phone in
+      airplane mode, it is out of it within about two minutes. PD_AIRPLANE_WATCHDOG=0 turns it off.
+      One `settings get` per phone per 45 s is nothing on the USB tree; it runs on the async helper. */
+  _startAirplaneWatchdog() {
+    if (this._airplaneWatchdogTimer || process.env.PD_AIRPLANE_WATCHDOG === '0') return;
+    this._airplaneWatchdogTimer = setInterval(() => { this._airplaneWatchdogTick().catch(() => {}); }, AIRPLANE_WATCHDOG_MS);
+  }
+  async _airplaneWatchdogTick() {
+    if (this._airplaneWatchdogBusy) return;
+    this._airplaneWatchdogBusy = true;
+    try {
+      for (const serial of Object.keys(this.devices || {})) {
+        const dev = this.devices[serial];
+        if (!dev || !dev.ws || dev.ws.readyState !== 1) continue;
+        if (this._switchBusy(serial)) { dev.airplaneSeenOn = 0; continue; }
+        const st = await this._airplaneOn(serial);
+        if (st !== true) { dev.airplaneSeenOn = 0; continue; }
+        dev.airplaneSeenOn = (dev.airplaneSeenOn || 0) + 1;
+        if (dev.airplaneSeenOn < 2) continue;
+        if (this._switchBusy(serial)) continue;   // a switch began while we were reading
+        this.emit('log', `${serial}: airplane watchdog - airplane mode has been ON outside a profile switch for ~${Math.round(AIRPLANE_WATCHDOG_MS / 1000)} s, turning it off`);
+        const off = await this._setAirplane(serial, false);
+        await this._adbLong(serial, ['shell', 'svc', 'data', 'enable'], 6000).catch(() => {});
+        dev.airplaneSeenOn = 0;
+        dev.airplaneWatchdog = { at: Math.floor(Date.now() / 1000), ok: off, fixes: ((dev.airplaneWatchdog && dev.airplaneWatchdog.fixes) || 0) + 1 };
+        this.emit('log', `${serial}: airplane watchdog - ${off ? 'airplane is OFF again' : 'could NOT turn airplane off (three attempts) - the phone needs a look'}`);
+        this._sendMeta(serial, dev.ws);
+      }
+    } finally { this._airplaneWatchdogBusy = false; }
   }
 
   /** Is the phone's mobile data back after the airplane cycle? Returns which signal confirmed it
@@ -1812,8 +1944,10 @@ class AgentCore extends EventEmitter {
     if (cur !== String(uid)) throw new Error(`profile switch to ${uid} did not take (phone is on ${cur || '?'})`);
     log(`switched ${before || '?'} -> ${uid}`);
     if (freshIp) {
-      await this._setAirplane(serial, true); await wait(1500);
-      await this._setAirplane(serial, false); await wait(1500);
+      if (!(await this._setAirplane(serial, true))) log('airplane ON did not verify (three attempts) - carrying on to OFF');
+      await wait(1500);
+      if (!(await this._setAirplane(serial, false))) log('airplane OFF did not verify (three attempts)');
+      await wait(1500);
       await this._adbLong(serial, ['shell', 'svc', 'data', 'enable'], 6000).catch(() => {});
       const net = await this._waitForNetwork(serial, 20000);
       log(`airplane cycle: network ${net ? 'back (' + net + ')' : 'NOT back after 20 s'}`);

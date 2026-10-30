@@ -215,6 +215,7 @@ Facts worth knowing:
 | Version | What changed |
 |---|---|
 | **v0.5.8** | **The congestion valve: video is held still and resumed on a fresh keyframe instead of lagging.** Nothing on the path ever dropped a frame before, so a line that could not carry the phones' output queued it (socket buffer, then the kernel's) and VAs saw freeze / fast-forward / growing delay until they reloaded - the 2026-10-25 shift lagged all day on the bottom rung. Now each tunnel has a `TunnelGovernor` (`src/congestion.js`): it measures the queue (`bufferedAmount` / arrival rate, plus a 1 s ws ping whose pong lag exposes the kernel buffer), stops forwarding video past 600 ms / 96 KB / 800 ms pong lag, lets the queue drain, forces a keyframe by replaying the viewer's settings command with the bitrate nudged by 1 bit/s (ws-scrcpy restarts the encoder on any change), resumes on the SPS/PPS/IDR, and reports `{"op":"congestion"}` to the backend (≤ 1 per 5 s per computer) so the budget is cut and the pages ask for less. Device messages and text are never held. `host.congestion` in the meta beat. `npm run test:congestion` (64 checks). See "The second thing to understand" above. Not yet seen on a real phone at release time. |
+| **v0.5.10** | **Phones left in airplane mode after a profile switch: fixed three ways.** Seen 2026-10-30 on the Mac's phones (19-40): a switch ended with airplane mode still ON and no stream. The OFF half of the cycle had a 6 s adb limit, a timeout was swallowed as success (the catch returned a string the error check did not match), nothing retried or re-checked, and two switches on one phone could run at once. Now (1) **every airplane command is verified** - `_setAirplane` reads the setting back and tries up to three times (the modern command twice, 15 s each, then the old settings+broadcast path), and a switch whose network does not come back looks again and turns airplane off once more; (2) **one switch at a time per phone** - a request that arrives mid-switch waits and only the LAST one made while waiting runs, a repeat of a switch that passed under a minute ago is a no-op; (3) **the airplane watchdog** - every 45 s, one phone at a time, any connected phone that is not mid-switch or in a posting job and reads airplane ON on two consecutive looks is turned OFF and data re-enabled (`PD_AIRPLANE_WATCHDOG=0` disables it). Every switch ends with a verdict in the meta beat (`switch_status`: ok / "airplane mode would not turn off" / "mobile data did not come back" / "the profile switch did not complete", seconds taken) that the device page shows to the VA, and `airplane_watchdog` says when the watchdog last acted. `npm run test:airplane` (42 checks). **The Mac cannot update itself**: download the new dmg from the release and drag it over Applications. |
 | **v0.5.9** | **Scheduled posting: `ig_post` and `ig_whoami`.** The backend's planner (backend README, "Scheduled posting") sends one post at a time per phone: switch to the profile (airplane cycle unless `fresh_ip:false`), fetch the clip by path with this computer's device token and drop it into THAT profile's gallery, open Instagram (the audio link first when the job carries a sound), tap through the composer by resource-id / text / content-desc from `uiautomator dump` (`src/igpost.js`, pure and data-driven: the FLOW_* step lists are the selectors), type the caption, Share, wait for the confirmation, Home, switch back. `mode:'capture'` stops before Share and returns every screen's texts + ids (sanitized) plus a screenshot - the tuning loop, because the selectors are PROVISIONAL until confirmed on a farm phone. `ig_whoami` opens the profile tab and reads the username for the backend's account scan. A person watching the phone wins (refused / aborted); one job per phone at a time. `npm run test:igpost` (40 checks). |
 | **v0.5.7** | **Fleet apps, after the first real run (2026-10-24, ChatGPT on PC 1).** What the farm taught us: a fresh install of a 110 MB app takes **40-55 s per phone**, but the two phones that *already had* ChatGPT took 8 and 13 minutes to be re-installed over (the first of them, which also downloaded the set, hit the 10-minute cap and was killed as "failed"). Three changes: (1) the install limit is **25 min** (`INSTALL_LIMIT_MS`; the backend waits 45); (2) **a phone that already has this exact `version_code` is not pushed again** - the agent only checks every profile and `pm install-existing`s the missing ones, seconds instead of minutes (the phone the app was copied from, a re-run after a new profile was created, phones where a VA installed it by hand), reply carries `already: true`; (3) **failures show adb's reason, not the command line** - `_adbWhy()` drops the `Command failed: C:\...\adb.exe ...` prefix and keeps adb's last line, and a timeout says "adb gave no answer in 25 min". `tools/test_fleet_apps.js` is at 37 checks. |
 | **v0.5.6** | **Fleet apps: the dashboard can install or remove any app on every phone, in every profile.** Six RPC ops: `list_apps` / `install_apps` (the per-phone "Add apps to profiles" button finally gets an answer - it had been timing out since the backend shipped it), `export_app` (pull a Play-installed app's base + split APKs off this phone with `pm path` + `adb pull`, PUT them to the backend with the device token), `install_app` (download the set ONCE per computer into `%TEMP%\pd_fleet_<id>`, `adb install-multiple -r` = every existing profile, then verify each profile and `pm install-existing` any that was missed; one install at a time per computer), `uninstall_app` (`pm uninstall`, all profiles), `update_now` (restart into a downloaded update, or check GitHub right now - so no release after this one needs anyone at the PC). The meta beat now carries `agent_version`. All async (`_adbLong` / spawn): the video relay never blocks. `tools/test_fleet_apps.js` (30 checks). |
@@ -301,6 +302,20 @@ Rules that matter here:
   way round) fails with `INSTALL_FAILED_UPDATE_INCOMPATIBLE`; the row shows that text.
 
 ## Gotchas
+
+**A phone that stays in airplane mode after a profile switch (v0.5.10).** The profile switch cycles
+airplane mode for a fresh mobile IP (`switchUser` -> `_setAirplane` in `src/core.js`). Until v0.5.10
+the OFF command had a 6 s limit, a timeout was swallowed (`.catch(() => 'err')`, and `'err'` does not
+match the `/unknown|error|.../` check that chooses the fallback), nothing retried, nothing looked
+again later, and two switches on one phone ran at the same time. On a Mac driving 22 phones through
+hubs, adb answers slower than 6 s at busy moments, so phones 19-40 were the ones left ON. Now the
+command is verified and retried, switches are one at a time per phone, and a watchdog turns airplane
+off on any idle phone found ON twice in a row. The log tells the story per phone: `Airplane OFF:
+PASS/FAIL`, `airplane OFF attempt N/3 did not take`, `Airplane still ON after the cycle - turning it
+off again`, `Switch done in N s` / `Switch FAILED after N s: <why>`, and `airplane watchdog - ...`.
+A phone the watchdog cannot fix (`could NOT turn airplane off (three attempts)`) needs a look at the
+cable or a Refresh. By hand on the Mac, for every phone at once:
+`A=/Applications/PhoneDesk.app/Contents/Resources/adb/mac/adb; for s in $($A devices | awk 'NR>1 && $2=="device"{print $1}'); do $A -s $s shell cmd connectivity airplane-mode disable; done`.
 
 **The owner window is a fixed 480x660 and `.app` is `height:100%`** (`src/renderer/style.css`). Anything
 you append to `<body>` after `.app` is laid out at the 660 px mark - which, once the phone list is longer
@@ -407,6 +422,17 @@ identical policy push, upload-to-gallery, the two-scan drop debounce in `reconci
 profile switch (keep-screen-on commands with `--user` before `put`, meta reply via the async reader).
 Both stub adb entirely; no phone needed, about ten seconds (the switch test waits out the real
 airplane-cycle delays).
+
+```bash
+npm run test:airplane      # = node tools/test_airplane.js
+```
+
+`test_airplane.js` runs the REAL `switchUser` against a scripted adb: the verified ON/OFF/network
+steps (v0.5.2), and since v0.5.10 an OFF that times out once and is retried, the settings fallback
+when the modern command is unknown, an OFF that never lands (three attempts, a verdict in words),
+three quick switches running as first + last, the no-op repeat, the airplane watchdog (two looks,
+mid-switch and disconnected phones skipped, the settle window) and the verdict in the meta beat.
+42 checks; the failing-network cases wait out real timeouts, so about a minute.
 
 ### WebRTC codec plumbing (no phone needed)
 
