@@ -236,6 +236,24 @@ Facts worth knowing:
 
 ---
 
+## Warm-up browsing + phone-assisted connect (backend 2026-11-02, no agent change)
+
+Two backend features added 2026-11-02 drive the phones with ops this agent **already** has, so there
+is no new agent code and no version bump for them:
+
+- **Warm-up browsing** (`app/posting/activity.py`): after a post, daily, or on demand, the backend
+  opens Instagram in a profile and scrolls it like a person using `switch_user`, `launch_app`,
+  `input_swipe`, `input_tap` and `input_key` — the same ops the control page uses. It never follows,
+  comments or types. The backend stops the moment a viewer opens (it watches `presence`), so the
+  agent needs no new safety logic.
+- **Phone-assisted API connect** (`/api/igapi/connect/on-phone`): the backend sends `open_url`
+  `{uid, url}` with a Meta OAuth authorize link, so the account is authorized in the profile it is
+  already logged into. Relies on `open_url` opening in the given Android user's default browser,
+  which it already does.
+
+If either misbehaves, it is the backend's step logic or these ops, not a new op — check the backend
+logs, not a new agent build.
+
 ## Scheduled posting ops (v0.5.9)
 
 Both are request/response over the phone-home socket (`request_id` -> `rpc_result`), like the
