@@ -25,6 +25,7 @@ function makeCore(MAX) {
   let nextId = 12;
   core.users = users;
   core.calls = [];
+  core.installed = {};
   core._adbAsync = (args) => {
     const sh = args.slice(3);                 // after -s SER1 shell
     const cmd = sh.join(' ');
@@ -38,7 +39,12 @@ function makeCore(MAX) {
       users.push({ id, name: sh[2].replace(/^'|'$/g, '') });
       return Promise.resolve(`Success: created user id ${id}`);
     }
-    if (sh[0] === 'pm' && sh[1] === 'install-existing') return Promise.resolve(`Package ${sh[4]} installed for user: ${sh[3]}`);
+    if (sh[0] === 'pm' && sh[1] === 'install-existing') { (core.installed[sh[3]] = core.installed[sh[3]] || []).push(sh[4]); return Promise.resolve(`Package ${sh[4]} installed for user: ${sh[3]}`); }
+    if (sh[0] === 'pm' && sh[1] === 'list' && sh[2] === 'packages' && sh[3] === '-U') {
+      const uid = parseInt(sh[5], 10);
+      return Promise.resolve((core.installed[sh[5]] || []).map((p, k) => `package:${p} uid:${uid * 100000 + 10100 + k}`).join('\n'));
+    }
+    if (cmd === 'dumpsys user') return Promise.resolve(users.map((u) => `  UserInfo{${u.id}:${u.name}:410} serialNo=${u.id + 7} creationTime=1`).join('\n'));
     return Promise.resolve('');
   };
   return core;
@@ -80,6 +86,49 @@ function makeCore(MAX) {
   await core._metaPayloadAsync('SER1', true);
   check('the limit is read once per phone, then cached', core.calls.filter((c) => c === 'pm get-max-users').length, 1);
 
-  console.log(fail ? `\n${fail} FAILING` : '\nall checks passed');
+  {
+    const c2 = makeCore(32);
+    await c2.createProfiles('SER1', 1, 'com.instagram.android', 'Profile', null);
+    check('identity: the new profile carries its serial (id + serial)', c2.devices.SER1.profilesJob.created[0].serial, 12 + 7);
+  }
+
+  // ---- profile_status: the parsers --------------------------------------------------------------
+  const L = AgentCore._parseUserList('Users:\n\tUserInfo{0:Owner:c13} running\n\tUserInfo{10:Profile 1:410}\n\tUserInfo{11:Guest:414}\n\tUserInfo{12:Temp:510}');
+  check('user list: ids, names, running', L.map((u) => [u.id, u.name, u.running_flag]), [[0, 'Owner', true], [10, 'Profile 1', false], [11, 'Guest', false], [12, 'Temp', false]]);
+  check('types from the flags', L.map((u) => AgentCore._userType(u.flags)), ['owner', 'full', 'guest', 'ephemeral']);
+  const D = AgentCore._parseDumpsysUser('Users:\n  UserInfo{0:Owner:c13} serialNo=0 isPrimary=true\n    State: RUNNING_UNLOCKED\n    Created: <unknown>\n  UserInfo{10:Profile 1:410} serialNo=14\n    State: -1\n    Created: +2d1h ago');
+  check('dumpsys user: serial + state per user', [D[0].serial, D[0].state, D[10].serial, D[10].created], [0, 'RUNNING_UNLOCKED', 14, '+2d1h ago']);
+  const P = AgentCore._parsePackagesU('package:com.instagram.android uid:1010234\npackage:com.android.vending uid:10045', 10, ['com.instagram.android', 'com.android.vending', 'com.whatsapp']);
+  check('packages: installed and the uid belongs to this profile', P['com.instagram.android'], { installed: true, uid: 1010234, owned: true });
+  check('...a uid from another user is flagged', P['com.android.vending'].owned, false);
+  check('...missing is missing', P['com.whatsapp'].installed, false);
+
+  // ---- profile_status: the RPC end to end, read-only ------------------------------------------------
+  {
+    const c3 = makeCore(32);
+    c3.installed['10'] = ['com.instagram.android'];
+    const base = c3._adbAsync;
+    c3._adbAsync = (args) => {
+      const cmd = args.slice(3).join(' ');
+      c3.calls.push(cmd);
+      if (cmd === 'am get-current-user') return Promise.resolve('10');
+      if (cmd.startsWith('settings get --user')) return Promise.resolve(args[6] === '11' ? 'null' : '1');
+      if (cmd.startsWith('pm list packages -3')) return Promise.resolve('package:com.instagram.android');
+      return base(args);
+    };
+    c3._adbLong = (ser, args) => c3._adbAsync(['-s', ser, ...args]);
+    const replies = [];
+    await c3.profileStatus('SER1', { request_id: 'r1' }, { readyState: 1, send: (x) => replies.push(JSON.parse(x)) });
+    const r = replies[0];
+    check('rpc answered with every profile', [r.op, r.ok, r.profiles.map((x) => x.id)], ['rpc_result', true, [0, 10, 11]]);
+    const p10 = r.profiles.find((x) => x.id === 10), p11 = r.profiles.find((x) => x.id === 11);
+    check('profile 10: current, serial, setup, Instagram owned', [p10.current, p10.serial, p10.setup_complete, p10.apps['com.instagram.android'].owned], [true, 17, true, true]);
+    check('profile 11: setup not complete is reported as a problem', p11.problems.some((x) => /setup not marked complete/.test(x)), true);
+    check('the check changes nothing on the phone',
+          c3.calls.some((x) => /create-user|install-existing|settings put|switch-user|remove-user|stop-user|start-user/.test(x)), false);
+    check('the limit rides along', [r.max_users, r.count], [32, 3]);
+  }
+
+  console.log(fail ? '\n' + fail + ' FAILING' : '\nall checks passed');
   process.exit(fail ? 1 : 0);
 })();

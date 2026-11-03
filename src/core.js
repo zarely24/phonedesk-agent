@@ -539,12 +539,15 @@ class AgentCore extends EventEmitter {
           made.setup = true;
         } catch (e) { this.emit('log', `setup-skip user ${id}: ${(e && e.message) || e}`); }
         for (const a of apps) {
-          try {
-            const r = await sh(['pm', 'install-existing', '--user', String(id), a], 60000);
-            if (/installed for user|Package .* installed/i.test(r) || !/fail|error|not/i.test(r)) made.apps.push(a);
-            else made.apps.push(a + ' (failed)');
-          } catch (e) { made.apps.push(a + ' (failed)'); }
+          try { await sh(['pm', 'install-existing', '--user', String(id), a], 60000); } catch {}
         }
+        if (apps.length) {
+          // verify from Android's own list, not from install-existing's wording
+          let have = {};
+          try { have = AgentCore._parsePackagesU(await sh(['pm', 'list', 'packages', '-U', '--user', String(id)], 20000), id, apps); } catch {}
+          apps.forEach((a) => made.apps.push(have[a] && have[a].installed && have[a].owned ? a : a + ' (failed)'));
+        }
+        try { made.serial = (AgentCore._parseDumpsysUser(await sh(['dumpsys', 'user'], 20000))[id] || {}).serial || null; } catch {}
         // stop it again: only the profile on screen needs to run, and Android caps running users
         try { await sh(['am', 'stop-user', String(id)], 30000); } catch {}
         job.created.push(made);
@@ -636,6 +639,107 @@ class AgentCore extends EventEmitter {
     return by;
   }
   static _validPkg(p) { return typeof p === 'string' && /^[A-Za-z0-9_.]{3,200}$/.test(p); }
+
+  // ---- Per-profile status (v0.5.11) --------------------------------------------------------------
+  // A read-only "check setup" for every profile, all through adb shell (no root):
+  //   identity  = user id + Android's serial number (dumpsys user). Android never reuses a serial, so
+  //               the pair tells a recreated profile from the one it replaced even if the id repeats.
+  //   type      = from the UserInfo flags: full / guest / ephemeral / managed / restricted / ...
+  //   running   = dumpsys user's State (RUNNING_UNLOCKED, ...) or "stopped"
+  //   setup     = settings secure user_setup_complete for that user
+  //   apps      = for each watched package: installed or not, and whether its uid belongs to THIS
+  //               profile (uid / 100000 == user id): `pm list packages -U --user N`
+  // The flag bits and the uid rule follow Android's UserInfo / UserHandle definitions.
+  static _parseUserList(out) {
+    const users = [];
+    String(out || '').split('\n').forEach((l) => {
+      const m = /UserInfo\{(\d+):(.*):([0-9a-fA-F]+)\}(.*)$/.exec(l.trim());
+      if (m) users.push({ id: parseInt(m[1], 10), name: m[2].trim(), flags: parseInt(m[3], 16), running_flag: /running/i.test(m[4] || '') });
+    });
+    return users;
+  }
+  static _userType(flags) {
+    const F = { PRIMARY: 0x1, ADMIN: 0x2, GUEST: 0x4, RESTRICTED: 0x8, MANAGED: 0x20, DEMO: 0x200, EPHEMERAL: 0x100, FULL: 0x400, PROFILE: 0x1000 };
+    if (flags & F.GUEST) return 'guest';
+    if (flags & F.EPHEMERAL) return 'ephemeral';
+    if (flags & F.PROFILE || flags & F.MANAGED) return 'work profile';
+    if (flags & F.RESTRICTED) return 'restricted';
+    if (flags & F.DEMO) return 'demo';
+    if (flags & F.FULL) return flags & F.PRIMARY ? 'owner' : 'full';
+    return 'other';
+  }
+  // dumpsys user: "UserInfo{10:Profile 1:410} serialNo=12 ..." then "State: RUNNING_UNLOCKED" per user
+  static _parseDumpsysUser(out) {
+    const by = {};
+    let cur = null;
+    String(out || '').split('\n').forEach((l) => {
+      const u = /UserInfo\{(\d+):/.exec(l);
+      if (u) {
+        cur = parseInt(u[1], 10);
+        by[cur] = by[cur] || {};
+        const sn = /serialNo=(\d+)/.exec(l);
+        if (sn) by[cur].serial = parseInt(sn[1], 10);
+        return;
+      }
+      if (cur == null) return;
+      const st = /^\s*State:\s*([A-Z_]+)/.exec(l);
+      if (st && !by[cur].state) by[cur].state = st[1];
+      const ct = /Created:\s*(.+)$/.exec(l);
+      if (ct && !by[cur].created) by[cur].created = ct[1].trim();
+    });
+    return by;
+  }
+  // pm list packages -U --user N: "package:com.x uid:1010123" -> {pkg: {installed, uid, owned}}
+  static _parsePackagesU(out, userId, watch) {
+    const res = {};
+    watch.forEach((p) => { res[p] = { installed: false, uid: null, owned: false }; });
+    String(out || '').split('\n').forEach((l) => {
+      const m = /^package:(\S+)\s+uid:(\d+)/.exec(l.trim());
+      if (!m || !(m[1] in res)) return;
+      const uid = parseInt(m[2], 10);
+      res[m[1]] = { installed: true, uid, owned: Math.floor(uid / 100000) === userId };
+    });
+    return res;
+  }
+  async profileStatus(serial, m, ws) {
+    const watch = [...new Set([...(Array.isArray(m.packages) ? m.packages : []), 'com.instagram.android', 'com.google.android.gms', 'com.android.vending']
+      .filter((p) => AgentCore._validPkg(p)))].slice(0, 20);
+    const only = m.user_id != null && /^\d+$/.test(String(m.user_id)) ? parseInt(m.user_id, 10) : null;
+    try {
+      const list = AgentCore._parseUserList(await this._adbLong(serial, ['shell', 'pm', 'list', 'users'], 15000));
+      let dump = {};
+      try { dump = AgentCore._parseDumpsysUser(await this._adbLong(serial, ['shell', 'dumpsys', 'user'], 20000)); } catch {}
+      let current = null;
+      try { current = parseInt((await this._adbLong(serial, ['shell', 'am', 'get-current-user'], 6000)).trim(), 10); } catch {}
+      const lim = await this._userLimitsAsync(serial);
+      const profiles = [];
+      for (const u of list) {
+        if (only != null && u.id !== only) continue;
+        const d = dump[u.id] || {};
+        const row = { id: u.id, name: u.name, serial: d.serial == null ? null : d.serial, type: AgentCore._userType(u.flags),
+                      flags: '0x' + u.flags.toString(16), current: u.id === current,
+                      state: d.state || (u.running_flag ? 'RUNNING' : 'stopped'), created: d.created || null,
+                      setup_complete: null, apps: {}, third_party: null, problems: [] };
+        try {
+          const v = (await this._adbLong(serial, ['shell', 'settings', 'get', '--user', String(u.id), 'secure', 'user_setup_complete'], 8000)).trim();
+          row.setup_complete = v === '1';
+        } catch {}
+        try {
+          const out = await this._adbLong(serial, ['shell', 'pm', 'list', 'packages', '-U', '--user', String(u.id)], 15000);
+          row.apps = AgentCore._parsePackagesU(out, u.id, watch);
+          const tp = await this._adbLong(serial, ['shell', 'pm', 'list', 'packages', '-3', '--user', String(u.id)], 15000);
+          row.third_party = tp.split('\n').filter((l) => l.trim().startsWith('package:')).length;
+        } catch (e) { row.problems.push('could not list apps'); }
+        if (u.id !== 0 && row.type !== 'full') row.problems.push(`not a full profile (${row.type})`);
+        if (row.setup_complete === false && u.id !== 0) row.problems.push('setup not marked complete: a switch may land on the first-run wizard');
+        Object.entries(row.apps).forEach(([pkg, a]) => { if (a.installed && !a.owned) row.problems.push(`${pkg}: uid ${a.uid} is not this profile's`); });
+        profiles.push(row);
+      }
+      this._rpcReply(ws, m, { ok: true, profiles, current_user: current, watched: watch, ...lim, count: list.length });
+    } catch (e) {
+      this._rpcReply(ws, m, { ok: false, state: 'error', error: String((e && e.message) || e) });
+    }
+  }
 
   async listApps(serial, m, ws) {
     try { this._rpcReply(ws, m, { ok: true, by_user: await this._thirdPartyByUser(serial) }); }
@@ -1221,6 +1325,7 @@ class AgentCore extends EventEmitter {
       else if (m.op === 'set_label') this.setLabel(serial, m);   // dashboard name/order -> owner app
       // Fleet apps (v0.5.6): install/remove an app in every profile, driven from the dashboard.
       else if (m.op === 'list_apps') this.listApps(serial, m, ws);
+      else if (m.op === 'profile_status') this.profileStatus(serial, m, ws);   // v0.5.11 read-only per-profile check
       else if (m.op === 'install_apps') this.installApps(serial, m, ws);
       else if (m.op === 'export_app') this.exportApp(serial, m, ws);
       else if (m.op === 'install_app') this.installApp(serial, m, ws);
