@@ -158,12 +158,28 @@ class AgentCore extends EventEmitter {
       the polling alone was ~190 blocking calls a minute; measured at the server that showed up as
       video stalls of 178-672ms in the data arriving from this agent, which is exactly the stutter the
       VAs report. One-off calls triggered by a human action may stay synchronous; recurring ones cannot. */
-  _adbAsync(args) {
+  _adbAsync(args, timeoutMs = 8000) {
     return new Promise((resolve, reject) => {
-      execFile(this.adbPath, args, { encoding: 'utf8', timeout: 8000 }, (err, stdout) => {
+      execFile(this.adbPath, args, { encoding: 'utf8', timeout: timeoutMs }, (err, stdout) => {
         if (err) reject(err); else resolve(String(stdout || '').trim());
       });
     });
+  }
+  /** The phone's own profile ceiling (v0.5.11): `pm get-max-users` ("Maximum supported users: 32")
+      counts the owner too. Set by the OS build (stock Pixel 4; GrapheneOS raises it) or a system
+      property; it only changes with an OS update or reboot, so it is read once per phone and cached.
+      `pm get-max-running-users` (Android 11+) is how many profiles may RUN at once; the rest are
+      stopped in the background, which is fine for a farm that switches to one profile at a time. */
+  async _userLimitsAsync(serial) {
+    const dev = this.devices[serial];
+    if (dev && dev._userLimits) return dev._userLimits;
+    const num = (out) => { const m = /(\d+)\s*$/.exec(String(out || '').trim()); return m ? parseInt(m[1], 10) : null; };
+    let max = null, running = null;
+    try { max = num(await this._adbAsync(['-s', serial, 'shell', 'pm', 'get-max-users'])); } catch {}
+    try { running = num(await this._adbAsync(['-s', serial, 'shell', 'pm', 'get-max-running-users'])); } catch {}
+    const lim = { max_users: max, max_running_users: running };
+    if (dev && max) dev._userLimits = lim;
+    return lim;
   }
   async _batteryAndChargingAsync(serial) {
     try {
@@ -205,7 +221,8 @@ class AgentCore extends EventEmitter {
     if (!full && dev && dev._metaCache) {
       return { battery: bc.battery, charging: bc.charging, charge_status: cs, host: this._hostStats(), agent_version: this.appVersion, ...sw, ...dev._metaCache };
     }
-    const cache = { users: await this._listUsersAsync(serial), current_user: await this._currentUserAsync(serial) };
+    const cache = { users: await this._listUsersAsync(serial), current_user: await this._currentUserAsync(serial),
+                    ...(await this._userLimitsAsync(serial)), profiles_job: (dev && dev.profilesJob) || null };
     if (dev) dev._metaCache = cache;
     return { battery: bc.battery, charging: bc.charging, charge_status: cs, host: this._hostStats(), agent_version: this.appVersion, ...sw, ...cache };
   }
@@ -460,40 +477,88 @@ class AgentCore extends EventEmitter {
       .then((data) => { try { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ op: 'meta', data })); } catch {} })
       .catch(() => {});
   }
-  /** Handle create_profiles: bulk pm create-user + clone an app into each, then report back. */
-  createProfiles(serial, count, pkg, prefix, ws) {
+  /** Handle create_profiles (rewritten v0.5.11): bulk `pm create-user`, mark setup complete, clone
+      the chosen apps into each new profile, and REPORT what happened (op create_profiles_result).
+      - Async adb only. The old loop ran ~5 blocking adb calls per profile on the event loop that also
+        relays every phone's video; 30 profiles froze every stream on this computer for minutes.
+      - Never exceeds the phone's own limit (`pm get-max-users`, owner included): stops early with
+        the reason instead of firing create-user calls Android will refuse.
+      - Never touches an existing profile: it only adds. Names continue after the highest number in
+        use ("Profile 12" exists -> the next is "Profile 13").
+      No root: create-user / start-user / settings --user / install-existing all run as adb shell. */
+  async createProfiles(serial, count, pkg, prefix, ws, packages) {
     count = parseInt(count, 10);
     if (!serial || !this.devices[serial] || !(count >= 1)) return;
+    const dev = this.devices[serial];
+    if (dev.profilesJob && dev.profilesJob.state === 'running') { this.emit('log', `create_profiles (${serial}): already running`); return; }
     prefix = (String(prefix || 'Profile').replace(/[^\w .\-]/g, ' ').replace(/\s+/g, ' ').trim() || 'Profile').slice(0, 24);
-    pkg = String(pkg || '').trim();
-    this.emit('log', `create_profiles (${serial}) -> count=${count} package='${pkg}' prefix='${prefix}'`);
-    const sh = (args) => this._adb(['-s', serial, 'shell', ...args]);
-    let made = 0;
-    for (let i = 0; i < count; i++) {
-      try {
-        const n = this._parseUsers(serial).length;   // next ordinal (owner + any existing)
-        const out = sh(['pm', 'create-user', `'${prefix} ${n}'`]);
-        const m = /id\s+(\d+)/i.exec(out);
-        if (!m) { this.emit('log', `create-user failed: ${out}`); continue; }
-        const id = m[1]; made++;
-        // Make the profile usable headlessly: mark its setup as already complete so switching to it
-        // lands on the home screen instead of the first-run wizard that forces a PIN. No human has to
-        // tap "skip" on each phone. settings/am run under shell (WRITE_SECURE_SETTINGS) - no root.
-        // (GrapheneOS's wizard differs slightly; verify on a real device and adjust if it still prompts.)
-        try {
-          sh(['am', 'start-user', id]);                                       // bring the profile up
-          sh(['settings', 'put', '--user', id, 'secure', 'user_setup_complete', '1']);
-          sh(['settings', 'put', '--user', id, 'secure', 'tv_user_setup_complete', '1']);
-          this.emit('log', `profile ${id}: setup marked complete (no PIN prompt)`);
-        } catch (e) { this.emit('log', `setup-skip user ${id}: ${(e && e.message) || e}`); }
-        if (pkg) {
-          try { sh(['pm', 'install-existing', '--user', id, pkg]); this.emit('log', `cloned ${pkg} -> user ${id}`); }
-          catch (e) { this.emit('log', `install-existing user ${id}: ${(e && e.message) || e}`); }
+    const PKG = /^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$/;
+    const apps = [...new Set([...(Array.isArray(packages) ? packages : []), ...String(pkg || '').split(/[\s,]+/)]
+      .map((x) => String(x || '').trim()).filter((x) => PKG.test(x)))].slice(0, 20);
+    const sh = (args, t) => this._adbAsync(['-s', serial, 'shell', ...args], t);
+    const job = { state: 'running', requested: count, created: [], failed: [], apps, stopped: '', started_at: Date.now(), finished_at: null };
+    dev.profilesJob = job;
+    const report = () => { try { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ op: 'create_profiles_result', data: job })); } catch {} };
+    report();
+    this.emit('log', `create_profiles (${serial}) -> count=${count} apps=${apps.join(',') || '-'} prefix='${prefix}'`);
+    try {
+      dev._userLimits = null;                                    // re-read: an OS update may have changed it
+      const { max_users: maxUsers } = await this._userLimitsAsync(serial);
+      job.max_users = maxUsers;
+      // the highest "<prefix> N" in use, so names never repeat
+      const nameNum = (users) => users.reduce((hi, u) => {
+        const m = new RegExp('^' + prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s+(\\d+)$').exec(u.name || '');
+        return m ? Math.max(hi, parseInt(m[1], 10)) : hi;
+      }, 0);
+      let users = await this._listUsersAsync(serial);
+      let next = Math.max(nameNum(users), users.length - 1) + 1;
+      for (let i = 0; i < count; i++) {
+        if (maxUsers && users.length >= maxUsers) {
+          job.stopped = `the phone's limit is ${maxUsers} profiles including the owner (pm get-max-users); it has ${users.length}`;
+          break;
         }
-      } catch (e) { this.emit('log', `create-user error: ${(e && e.message) || e}`); }
+        const name = `${prefix} ${next++}`;
+        let out = '';
+        try { out = await sh(['pm', 'create-user', `'${name}'`], 60000); }
+        catch (e) { out = String((e && (e.stdout || e.message)) || e); }
+        const m = /created user id\s+(\d+)/i.exec(out) || /id\s+(\d+)/i.exec(out);
+        if (!m) {
+          job.failed.push({ name, error: out.slice(0, 200) || 'no answer from pm create-user' });
+          this.emit('log', `create-user failed: ${out}`);
+          if (/max|limit|maximum/i.test(out)) { job.stopped = 'Android refused: ' + out.slice(0, 160); break; }
+          continue;
+        }
+        const id = parseInt(m[1], 10);
+        const made = { id, name, apps: [], setup: false };
+        // Usable headlessly: setup marked complete so a switch lands on the home screen, not the
+        // first-run wizard. (settings/am run under shell with WRITE_SECURE_SETTINGS - no root.)
+        try {
+          await sh(['am', 'start-user', String(id)], 30000);
+          await sh(['settings', 'put', '--user', String(id), 'secure', 'user_setup_complete', '1']);
+          await sh(['settings', 'put', '--user', String(id), 'secure', 'tv_user_setup_complete', '1']);
+          made.setup = true;
+        } catch (e) { this.emit('log', `setup-skip user ${id}: ${(e && e.message) || e}`); }
+        for (const a of apps) {
+          try {
+            const r = await sh(['pm', 'install-existing', '--user', String(id), a], 60000);
+            if (/installed for user|Package .* installed/i.test(r) || !/fail|error|not/i.test(r)) made.apps.push(a);
+            else made.apps.push(a + ' (failed)');
+          } catch (e) { made.apps.push(a + ' (failed)'); }
+        }
+        // stop it again: only the profile on screen needs to run, and Android caps running users
+        try { await sh(['am', 'stop-user', String(id)], 30000); } catch {}
+        job.created.push(made);
+        users = await this._listUsersAsync(serial);
+        report();
+      }
+    } catch (e) {
+      job.stopped = 'error: ' + ((e && e.message) || e);
     }
-    this.emit('log', `create_profiles done: ${made}/${count} created`);
-    try { this.devices[serial]._metaCache = null; } catch {}   // force a fresh user list next meta
+    job.state = 'done';
+    job.finished_at = Date.now();
+    this.emit('log', `create_profiles done: ${job.created.length}/${count} created${job.stopped ? ' (' + job.stopped + ')' : ''}`);
+    try { dev._metaCache = null; } catch {}   // force a fresh user list next meta
+    report();
     this._sendMeta(serial, ws);
   }
   /** Handle upload_media: fetch each file from the backend and push it into the gallery.
@@ -1151,7 +1216,7 @@ class AgentCore extends EventEmitter {
       else if (m.op === 'unpair') this.unpair(serial);
       else if (m.op === 'refresh') this.refreshOne(serial);   // VA pressed "Refresh phone" on ONE phone's row
       else if (m.op === 'set_charge_policy') this.setChargePolicy(serial, m, ws);   // battery charge limit
-      else if (m.op === 'create_profiles') this.createProfiles(serial, m.count, m.package, m.name_prefix, ws);
+      else if (m.op === 'create_profiles') this.createProfiles(serial, m.count, m.package, m.name_prefix, ws, m.packages);
       else if (m.op === 'upload_media') this.uploadMedia(serial, m, ws);   // push photos/videos to the gallery
       else if (m.op === 'set_label') this.setLabel(serial, m);   // dashboard name/order -> owner app
       // Fleet apps (v0.5.6): install/remove an app in every profile, driven from the dashboard.
