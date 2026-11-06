@@ -15,6 +15,7 @@ const crypto = require('crypto');
 const instagram = require('./instagram');   // Instagram account-status classifier (pure/testable)
 const congestion = require('./congestion'); // v0.5.8: per-tunnel queue watchdog (drop stale video, force a keyframe)
 const igpost = require('./igpost');         // v0.5.9: post a reel / read the username on the phone itself (pure, data-driven steps)
+const igstats = require('./igstats');       // v0.5.12: followers / dashboard views / reel plays in the same whoami visit (pure)
 
 // Electron's main process (Node 20) has no global WebSocket; fall back to the `ws` package.
 const WebSocket = globalThis.WebSocket || require('ws');
@@ -2246,7 +2247,19 @@ class AgentCore extends EventEmitter {
       const status = instagram.classify(await driver.dump().catch(() => '')).status;
       const username = r.ok && r.nodes ? igpost.usernameFrom(r.nodes) : '';
       log(`-> ${username ? '@' + username : 'no username'} (${status}, step ${r.step})`);
-      return reply({ ok: true, state: username ? 'found' : 'not_found', username, status, step: r.step, why: r.why || '', screen: r.screen });
+      // v0.5.12: the backend's Analytics sweep asks for the account's numbers in the same visit
+      // (`stats: true`): header counts, professional-dashboard views, reel plays. Read-only; a
+      // viewer opening the phone stops it. Older backends never send the flag.
+      let stats;
+      if (m.stats && username && status !== 'LOGIN_REQUIRED') {
+        try {
+          stats = await igstats.collect(driver, r.nodes, { username, abort: () => this._scrcpyRunning(serial) });
+          log(`   stats: ${stats.followers} followers, views ${stats.views}, reels ${stats.reels_views}/${stats.reels_counted}${stats.why.length ? ' (' + stats.why.join('; ') + ')' : ''}`);
+        } catch (e) {
+          stats = { error: String((e && e.message) || e).slice(0, 200) };
+        }
+      }
+      return reply({ ok: true, state: username ? 'found' : 'not_found', username, status, step: r.step, why: r.why || '', screen: r.screen, stats });
     } catch (e) {
       return reply({ ok: false, state: 'failed', error: String((e && e.message) || e).slice(0, 300) });
     } finally {
