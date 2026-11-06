@@ -21,6 +21,7 @@ function makeCore(MAX) {
   core.blocking = 0;
   core._adb = () => { core.blocking++; throw new Error('BLOCKING adb used'); };
   core._sendMeta = () => {};
+  core._adbLong = (serial, args, ms) => core._adbAsync(['-s', serial, ...args], ms);   // v0.5.13 _prepProfile
   const users = [{ id: 0, name: 'Owner' }, { id: 10, name: 'Profile 1' }, { id: 11, name: 'Work' }];
   let nextId = 12;
   core.users = users;

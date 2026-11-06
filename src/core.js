@@ -19,6 +19,8 @@ const igstats = require('./igstats');       // v0.5.12: followers / dashboard vi
 
 // Electron's main process (Node 20) has no global WebSocket; fall back to the `ws` package.
 const WebSocket = globalThis.WebSocket || require('ws');
+// Setup wizards that _prepProfile disables in SECONDARY profiles only (Pixel/Google, AOSP, Samsung, Xiaomi).
+const SETUP_WIZARD_PKGS = ['com.google.android.setupwizard', 'com.android.provision', 'com.sec.android.app.SecSetupWizard', 'com.android.provision.xiaomi'];
 const SCREEN_OFF_TIMEOUT_MS = 30 * 60 * 1000;   // per-profile screen timeout set after a profile switch
 // The airplane cycle of a profile switch (v0.5.10): how long one airplane command may take before it
 // counts as failed, how many verified attempts it gets, how long after a switch the watchdog waits
@@ -539,6 +541,10 @@ class AgentCore extends EventEmitter {
           await sh(['settings', 'put', '--user', String(id), 'secure', 'tv_user_setup_complete', '1']);
           made.setup = true;
         } catch (e) { this.emit('log', `setup-skip user ${id}: ${(e && e.message) || e}`); }
+        try {
+          const prep = await this._prepProfile(serial, id, (x) => this.emit('log', `create_profiles (${serial}): ${x}`));
+          made.wizard_off = prep.wizard_off; made.lock = prep.lock;
+        } catch {}
         for (const a of apps) {
           try { await sh(['pm', 'install-existing', '--user', String(id), a], 60000); } catch {}
         }
@@ -1686,6 +1692,11 @@ class AgentCore extends EventEmitter {
       }
       R.user_switch = cur === String(id);
       log(`Profile switch: ${R.user_switch ? 'PASS' : 'FAIL'}`);
+      if (R.user_switch) {
+        // No setup wizard / "Set a PIN" on a new profile; if the wizard was on screen, go home.
+        const prep = await this._prepProfile(serial, id, log);
+        if (prep.wizard_off.length) await this._adbLong(serial, ['shell', 'input', 'keyevent', '3'], 5000).catch(() => {});
+      }
       if (!R.user_switch) {
         // Do NOT toggle airplane mode if the profile switch failed — that would drop the network for
         // no reason on a phone that's still on the wrong profile.
@@ -1732,6 +1743,43 @@ class AgentCore extends EventEmitter {
     if (dev) dev.switchStatus = { user: id, ok, problem, seconds, at: Math.floor(Date.now() / 1000), steps: R };
     log(ok ? `Switch done in ${seconds} s` : `Switch FAILED after ${seconds} s: ${problem}`);
     this._sendMeta(serial, ws);
+  }
+  /** Make a secondary profile skip the first-run setup and its "Set a PIN" step (v0.5.13).
+      A profile made by `pm create-user` still has the setup wizard ENABLED for that user. Marking
+      user_setup_complete=1 (done since v0.5.11) is a hint the wizard usually honours, but not always:
+      its HOME activity can still win the first switch and walk the VA into "Protect your phone / Set a
+      PIN". So for every profile except the owner (uid 0), idempotently:
+        1. user_setup_complete / tv_user_setup_complete = 1 (again: an older agent may have missed it)
+        2. disable the setup-wizard packages FOR THAT USER ONLY (pm disable-user --user N) - the
+           owner's wizard is never touched, and the launcher becomes the home screen
+        3. lock screen = None (`locksettings set-disabled true`) so the profile never shows a keyguard.
+           Android refuses this when someone already set a PIN on that profile - then it stays (we
+           cannot and should not remove a real PIN without knowing it) and the log says so.
+      Returns { wizard_off: [pkgs disabled now], lock: 'none'|'pin set'|'?' }. Best-effort: a failure
+      here never fails a switch or a create. Remembered per phone+profile for this agent run. */
+  async _prepProfile(serial, uid, log) {
+    const out = { wizard_off: [], lock: '?' };
+    uid = parseInt(uid, 10);
+    if (!(uid > 0)) return out;
+    const dev = this.devices && this.devices[serial];
+    if (dev) { dev._preppedUsers = dev._preppedUsers || new Set(); if (dev._preppedUsers.has(uid)) return out; }
+    const sh = (args, t) => this._adbLong(serial, ['shell', ...args], t || 8000)
+      .catch((e) => 'error: ' + ((e && e.killed) ? 'timed out' : ((e && e.message) || 'adb failed')));
+    const u = String(uid);
+    await sh(['settings', 'put', '--user', u, 'secure', 'user_setup_complete', '1']);
+    await sh(['settings', 'put', '--user', u, 'secure', 'tv_user_setup_complete', '1']);
+    const enabled = await sh(['pm', 'list', 'packages', '-e', '--user', u], 15000);
+    for (const pkg of SETUP_WIZARD_PKGS) {
+      if (!String(enabled).split('\n').some((l) => l.trim() === 'package:' + pkg)) continue;   // exact line, not a substring
+      const r = await sh(['pm', 'disable-user', '--user', u, pkg], 15000);
+      if (/disabled/i.test(r) && !/error/i.test(r)) out.wizard_off.push(pkg);
+      else if (log) log(`setup wizard ${pkg} for profile ${uid} not disabled: ${String(r).trim().slice(0, 120)}`);
+    }
+    const lk = await sh(['locksettings', 'set-disabled', '--user', u, 'true']);
+    out.lock = /error|fail|exception|credential|verif|match/i.test(lk) ? 'pin set' : 'none';
+    if (log) log(`profile ${uid} prep: wizard ${out.wizard_off.length ? 'disabled (' + out.wizard_off.join(', ') + ')' : 'already off'}, lock screen ${out.lock === 'none' ? 'none' : 'NOT removed - a PIN is set on this profile'}`);
+    if (dev && !/^error: timed out/.test(lk)) dev._preppedUsers.add(uid);
+    return out;
   }
   /** Keep the profile we just switched to from going dark. Every Android profile has its OWN
       screen timeout and a fresh one defaults to 30 s, so a VA sees the phone "go black" half a
@@ -2114,6 +2162,8 @@ class AgentCore extends EventEmitter {
     const cur = (await this._adbLong(serial, ['shell', 'am', 'get-current-user'], 6000).catch(() => '')).trim();
     if (cur !== String(uid)) throw new Error(`profile switch to ${uid} did not take (phone is on ${cur || '?'})`);
     log(`switched ${before || '?'} -> ${uid}`);
+    const prep = await this._prepProfile(serial, uid, log);
+    if (prep.wizard_off.length) await this._adbLong(serial, ['shell', 'input', 'keyevent', '3'], 5000).catch(() => {});
     if (freshIp) {
       if (!(await this._setAirplane(serial, true))) log('airplane ON did not verify (three attempts) - carrying on to OFF');
       await wait(1500);
