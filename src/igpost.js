@@ -58,7 +58,9 @@ function matches(node, sel) {
   if (!hit(node.text, sel.text)) return false;
   if (!hit(node.desc, sel.desc)) return false;
   if (!hit(node.cls, sel.cls)) return false;
+  if (sel.pkg != null && !hit(node.pkg, sel.pkg)) return false;
   if (sel.clickable != null && node.clickable !== sel.clickable) return false;
+  if (sel.focused != null && node.focused !== sel.focused) return false;
   if (sel.enabled !== false && node.enabled === false) return false;
   return true;
 }
@@ -105,11 +107,32 @@ function redact(s, username) {
 // notifications?", "Share to Facebook?", a new-feature tour). If a step's target is missing and one
 // of these is on screen, it is dismissed and the step looks again. "Not now" first: it is the one
 // that never changes a setting.
+// NOT "Continue" (v0.5.14). The first real post on the farm (2026-11-08, phone 40) met Instagram's
+// promo for its "Edits" app right after the clip was picked; its only button was "Continue", which
+// this list used to tap - and that button opens the Edits page on Google Play, in the browser. The
+// post then failed three screens later at "caption". "Continue" ACCEPTS whatever is offered; it is
+// never a way to make something go away. Android's own "Allow X to send you notifications?" prompt
+// is answered "Don't allow" (the dump writes it with a curly apostrophe).
 const DISMISS = [
-  { text: /^not now$/i }, { desc: /^not now$/i }, { text: /^skip$/i }, { text: /^later$/i }, { text: /^dismiss$/i },
+  { text: /^not now$/i }, { desc: /^not now$/i }, { text: /^skip$/i }, { text: /^later$/i }, { text: /^maybe later$/i },
+  { text: /^no,? thanks$/i }, { text: /^dismiss$/i },
   { text: /^close$/i, clickable: true }, { desc: /^close$/i, clickable: true }, { text: /^got it$/i }, { text: /^ok$/i }, { text: /^okay$/i },
-  { text: /^continue$/i }, { text: /^cancel$/i, clickable: true },
+  { text: /^don.?t allow$/i }, { id: /permission_deny_button/ }, { text: /^deny$/i }, { text: /^cancel$/i, clickable: true },
 ];
+// Screens that only Back closes safely: promos whose buttons all ACCEPT the offer. Back on a bottom
+// sheet or dialog closes it without its action, and Instagram's editor stays where it was.
+const BACK_ON = [
+  { text: /\b(try|get|open|download|install|use|continue in|edit in|made (with|in))\s+edits\b/i, why: 'edits_promo' },
+  { text: /\bedits\b.{0,40}\b(app|by instagram|from instagram|from meta)\b/i, why: 'edits_promo' },
+  { desc: /\b(try|get|open|download)\s+edits\b/i, why: 'edits_promo' },
+];
+const MAX_BACKS = 2;              // per step: more than that and something else is wrong - say so instead
+
+// The package on top of the screen (the first node of a dump belongs to the active window).
+function screenPkg(nodes) {
+  const n = (nodes || []).find((x) => x.pkg);
+  return n ? n.pkg : '';
+}
 // Texts that mean "the app is not where a post can be made" - a login wall, a block, a crash.
 // The classifier in ./instagram.js owns the full taxonomy; this is the short-circuit a post needs.
 const FATAL = [
@@ -156,6 +179,72 @@ const FLOW_REEL_WITH_AUDIO = [
   { name: 'confirm', find: [{ text: /shared|sharing|posted|your reel|uploading|finishing up|reels/i }, { id: /tab_bar|feed_tab/ }], action: 'done', timeout: 120000 },
 ];
 
+// Words Instagram itself writes on the reel (v0.5.14). The owner wanted the text in "instagram's
+// default" font, "anywhere I want", "plain white": that font is Instagram's own and no server may
+// draw it, so the phone does what a VA does in the reel editor - the "Aa" text tool, type, Done
+// (the default style IS plain white, no band), then drag the text to the spot picked on the page.
+// Inserted before the editor's Next when a job carries text (withText). `text-place` waits for the
+// editor to be back (its Next button), then drags from the text's centre to the target.
+const TEXT_STEPS = [
+  { name: 'text-tool', find: [{ desc: /^text$/i }, { text: /^aa$/i }, { desc: /^aa$/i }, { desc: /add text/i }, { text: /^text$/i },
+    { id: /text_overlay_button|add_text|text_tool|clips_text|editor_text_button/ }], action: 'tap', settle: 1800, timeout: 10000 },
+  { name: 'text-type', find: [{ cls: /EditText/, focused: true }, { cls: /EditText/ }], action: 'type-overlay', settle: 600, timeout: 8000 },
+  { name: 'text-done', find: [{ text: /^done$/i }, { desc: /^done$/i }, { id: /text_done|done_button/ }], action: 'tap', settle: 1500, timeout: 8000 },
+  { name: 'text-place', find: [{ text: /^next$/i }, { desc: /^next$/i }, { id: /clips_right_action_button|next_button|right_action_button/ }], action: 'drag-overlay', settle: 1200, timeout: 10000 },
+];
+// A flow with the text steps in it, just before the editor's Next. The built-in flows stay untouched.
+function withText(flow) {
+  const out = flow.slice();
+  const i = out.findIndex((s) => s.name === 'editor-next');
+  out.splice(i >= 0 ? i : out.length, 0, ...TEXT_STEPS);
+  return out;
+}
+// What the phone can type into the text tool: printable ASCII and line breaks (`input text`), at most
+// 8 lines / 300 characters - the same rule the backend applied when the post was made.
+function overlayForDevice(text) {
+  const lines = String(text || '').replace(/\r\n?/g, '\n').replace(/[^\x20-\x7e\n]/g, '').split('\n').map((l) => l.trim());
+  return lines.slice(0, 8).join('\n').replace(/\n{3,}/g, '\n\n').trim().slice(0, 300);
+}
+// The screen's size: the largest box in the dump (the root window).
+function screenSize(nodes) {
+  let w = 0, h = 0;
+  for (const n of nodes || []) if (n.bounds) { w = Math.max(w, n.bounds.r); h = Math.max(h, n.bounds.b); }
+  return { w: w || 1080, h: h || 2400 };
+}
+// Where the reel is drawn in the editor: the biggest video/preview view that is reel-shaped; if the
+// build names it differently, a full-width 9:16 box in the middle of the screen.
+const CANVAS_ID = /clips_video_preview|video_preview|preview_view|media_preview|clips_editor|edit_preview|player_view|video_view|texture_view|surface_view|canvas/i;
+function canvasRect(nodes, size) {
+  const sz = size || screenSize(nodes);
+  let best = null;
+  for (const n of nodes || []) {
+    if (!n.bounds) continue;
+    const w = n.bounds.r - n.bounds.l, h = n.bounds.b - n.bounds.t;
+    if (w < sz.w * 0.5 || h <= 0) continue;
+    const ratio = h / w;
+    if (ratio < 1.3 || ratio > 2.1) continue;
+    if (!(CANVAS_ID.test(n.id) || /TextureView|SurfaceView|VideoView/.test(n.cls))) continue;
+    if (!best || w * h > (best.r - best.l) * (best.b - best.t)) best = n.bounds;
+  }
+  if (best) return { l: best.l, t: best.t, w: best.r - best.l, h: best.b - best.t, found: true };
+  const w = sz.w, h = Math.round(sz.w * 16 / 9);
+  return { l: 0, t: Math.max(0, Math.round((sz.h - h) / 2)), w, h, found: false };
+}
+// The owner's spot (x/y = the centre of the text as a share of the reel) on the screen. Kept inside
+// the same range the backend allows: off the edges, and above Instagram's caption area / trash bin.
+function overlayTarget(rect, x, y) {
+  const cx = Math.min(0.9, Math.max(0.1, Number.isFinite(+x) ? +x : 0.5));
+  const cy = Math.min(0.8, Math.max(0.08, Number.isFinite(+y) ? +y : 0.5));
+  return { x: Math.round(rect.l + cx * rect.w), y: Math.round(rect.t + cy * rect.h) };
+}
+// Where the new text sits before the drag: the node showing its first line when the build exposes it
+// (never the text box it was typed in), else the middle of the reel, where Instagram puts new text.
+function overlayStart(nodes, text, rect) {
+  const first = String(text || '').split('\n').map((l) => l.trim()).find(Boolean) || '';
+  const n = first && (nodes || []).find((x) => x.bounds && !/EditText/.test(x.cls) && (x.text.trim() === first || x.desc.trim() === first));
+  return n ? { x: n.cx, y: n.cy, found: true } : { x: Math.round(rect.l + rect.w / 2), y: Math.round(rect.t + rect.h / 2), found: false };
+}
+
 // Who is logged in: open the profile tab and read the title. The username is the one piece of
 // text the profile screen shows in the action bar on every Instagram build so far.
 const FLOW_WHOAMI = [
@@ -189,6 +278,11 @@ async function run(driver, flow, opts) {
   let nodes = [], xml = '';
   const dump = async () => { xml = await driver.dump(); nodes = parseDump(xml); return nodes; };
   const fail = (step, why, extra) => ({ ok: false, state: 'failed', step: step && step.name, why, trace, screens, screen: describe(nodes, o.username), ...(extra || {}) });
+  // v0.5.14: once Instagram (o.appPkg) has been on screen, another app on top means the flow was
+  // sent away (a promo button opened Google Play in the browser on 2026-11-08). A step never takes
+  // a match from another app's screen; Back is pressed to come home, and if that does not work the
+  // run fails as `left_app` with the package - not three screens later as a puzzling "not found".
+  let seenApp = false;
 
   for (const step of flow) {
     const t0 = now();
@@ -201,20 +295,35 @@ async function run(driver, flow, opts) {
     }
     // Look for a candidate, dismissing pop-ups in between, until the step's timeout.
     const limit = step.timeout || STEP_TIMEOUT_MS;
-    let hit = null, dismissed = 0, fatal = null;
+    let hit = null, dismissed = 0, backs = 0, fatal = null;
     while (true) {
       await dump();
       if (capture) screens.push({ at: step.name, ...describe(nodes, o.username) });
-      hit = findAny(nodes, step.find);
+      const pkgNow = screenPkg(nodes);
+      if (o.appPkg && pkgNow === o.appPkg) seenApp = true;
+      const away = !!(o.appPkg && seenApp && pkgNow && pkgNow !== o.appPkg);
+      // Android's own prompts (a permission question) sit on top of the app: answered, not fled.
+      const sysDialog = away && /permissioncontroller|packageinstaller|^android$|systemui/.test(pkgNow);
+      hit = away ? null : findAny(nodes, step.find);
       if (hit) break;
-      fatal = findAny(nodes, FATAL.map((f) => ({ text: f.text })));
-      if (fatal) { const f = FATAL.find((x) => x.text === fatal.sel.text); return fail(step, f ? f.why : 'blocked'); }
-      const popup = dismissed < 3 ? findAny(nodes, DISMISS) : null;
+      if (!away || sysDialog) {
+        fatal = findAny(nodes, FATAL.map((f) => ({ text: f.text })));
+        if (fatal) { const f = FATAL.find((x) => x.text === fatal.sel.text); return fail(step, f ? f.why : 'blocked'); }
+      }
+      const popup = dismissed < 3 && (!away || sysDialog) ? findAny(nodes, DISMISS) : null;
       if (popup) {
         const t = tapTarget(nodes, popup.node);
         await driver.tap(t.cx, t.cy); dismissed++;
         trace.push({ name: step.name + ':dismiss', ok: true, matched: selLabel(popup.sel) + ' "' + redact(popup.node.text || popup.node.desc, o.username) + '"', ms: now() - t0 });
         await driver.wait(1200);
+        continue;
+      }
+      const promo = !away && backs < MAX_BACKS ? BACK_ON.find((b) => find(nodes, b.text ? { text: b.text } : { desc: b.desc })) : null;
+      if (away || promo) {
+        if (backs >= MAX_BACKS) return fail(step, 'left_app', { pkg: pkgNow });
+        await driver.key('back'); backs++;
+        trace.push({ name: step.name + ':back', ok: true, matched: away ? `left Instagram for ${pkgNow}` : promo.why, ms: now() - t0 });
+        await driver.wait(1500);
         continue;
       }
       if (now() - t0 >= limit) break;
@@ -225,8 +334,23 @@ async function run(driver, flow, opts) {
       trace.push({ name: step.name, ok: false, matched: '', ms: now() - t0 });
       return fail(step, 'element_not_found');
     }
-    const label = selLabel(hit.sel) + (hit.node.text ? ' "' + redact(hit.node.text, o.username) + '"' : hit.node.desc ? ' [' + redact(hit.node.desc, o.username) + ']' : '');
-    if (step.action === 'tap') {
+    let label = selLabel(hit.sel) + (hit.node.text ? ' "' + redact(hit.node.text, o.username) + '"' : hit.node.desc ? ' [' + redact(hit.node.desc, o.username) + ']' : '');
+    if (step.action === 'type-overlay') {
+      // the text tool's box: typed line by line, Enter between lines (input text cannot type a newline)
+      const lines = overlayForDevice(o.overlay && o.overlay.text).split('\n');
+      if (!hit.node.focused) { const t = tapTarget(nodes, hit.node); await driver.tap(t.cx, t.cy); await driver.wait(500); }
+      for (let i = 0; i < lines.length; i++) {
+        if (i) { await driver.key('enter'); await driver.wait(150); }
+        if (lines[i]) await driver.type(lines[i]);
+      }
+      await driver.wait(400);
+    } else if (step.action === 'drag-overlay') {
+      const rect = canvasRect(nodes);
+      const from = overlayStart(nodes, o.overlay && o.overlay.text, rect);
+      const to = overlayTarget(rect, o.overlay && o.overlay.x, o.overlay && o.overlay.y);
+      if (Math.abs(to.x - from.x) + Math.abs(to.y - from.y) > 6) await driver.swipe(from.x, from.y, to.x, to.y, 900);
+      label += ` | text dragged (${from.x},${from.y})->(${to.x},${to.y}); reel ${rect.found ? 'found' : 'assumed'} at ${rect.l},${rect.t} ${rect.w}x${rect.h}${from.found ? '' : '; start = middle of the reel'}`;
+    } else if (step.action === 'tap') {
       const t = tapTarget(nodes, hit.node);
       await driver.tap(t.cx, t.cy);
     } else if (step.action === 'type') {
@@ -241,7 +365,7 @@ async function run(driver, flow, opts) {
       await driver.key(step.key || 'back');
     }
     trace.push({ name: step.name, ok: true, matched: label, ms: now() - t0 });
-    if (o.onStep) { try { o.onStep(step, label); } catch {} }
+    if (o.onStep) { try { await o.onStep(step, label); } catch {} }   // may be async (a capture screenshot)
     if (step.action === 'done') {
       return { ok: true, state: capture ? 'captured' : 'shared', step: step.name, trace, screens, screen: describe(nodes, o.username), nodes };
     }
@@ -261,7 +385,27 @@ function captionForDevice(caption, max) {
   return String(caption || '').replace(/[^\x20-\x7e\n]/g, '').replace(/\n+/g, ' ').trim().slice(0, max || 2000);
 }
 
+// The screen as a list of elements for a person or an AI agent driving the phone (v0.5.14 `ui_dump`,
+// the CLI/MCP `read_screen`): what is written, what it is called, its id, where its centre is.
+// Texts go through redact() (emails, phone numbers); no raw XML leaves the phone.
+function uiElements(nodes, max) {
+  const out = [], seen = new Set();
+  for (const n of nodes || []) {
+    if (!n.bounds || n.bounds.r - n.bounds.l < 2 || n.bounds.b - n.bounds.t < 2) continue;
+    const id = n.id.includes('/') ? n.id.slice(n.id.lastIndexOf('/') + 1) : n.id;
+    if (!n.text && !n.desc && !id && !n.clickable) continue;
+    const key = [n.text, n.desc, id, n.cx, n.cy].join('|');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ text: redact(n.text), desc: redact(n.desc), id, cls: n.cls.split('.').pop(), clickable: n.clickable,
+      focused: n.focused || undefined, bounds: n.bounds, cx: n.cx, cy: n.cy });
+    if (out.length >= (max || 400)) break;
+  }
+  return out;
+}
+
 module.exports = {
   parseDump, matches, find, findAny, tapTarget, describe, redact, usernameFrom, captionForDevice, run,
-  FLOW_REEL, FLOW_REEL_WITH_AUDIO, FLOW_WHOAMI, DISMISS, FATAL, STEP_TIMEOUT_MS,
+  withText, overlayForDevice, screenSize, canvasRect, overlayTarget, overlayStart, screenPkg, uiElements,
+  FLOW_REEL, FLOW_REEL_WITH_AUDIO, FLOW_WHOAMI, TEXT_STEPS, DISMISS, BACK_ON, FATAL, STEP_TIMEOUT_MS, MAX_BACKS,
 };

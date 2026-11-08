@@ -1351,6 +1351,7 @@ class AgentCore extends EventEmitter {
       else if (m.op === 'input_key') this.inputKey(serial, m, ws);        // Power/Vol/Back/Home/Recent...
       else if (m.op === 'input_text') this.inputText(serial, m, ws);      // keyboard text into the focused field
       else if (m.op === 'screenshot') this.screenshot(serial, m, ws);     // adb screencap -> PNG back to the VA
+      else if (m.op === 'ui_dump') this.uiDumpOp(serial, m, ws);          // v0.5.14: the screen's elements (CLI/MCP read_screen)
       else if (m.op === 'input_tap') this.inputTap(serial, m, ws);        // tap at device coords (WebRTC video)
       else if (m.op === 'input_swipe') this.inputSwipe(serial, m, ws);    // swipe/drag/scroll at device coords
       // WebRTC video (POC, per-device flag on the backend). Signaling only rides this socket; SRTP
@@ -2057,6 +2058,22 @@ class AgentCore extends EventEmitter {
     } catch (e) { this._rpcReply(ws, m, { ok: false, state: 'error', error: String((e && e.message) || e) }); }
   }
 
+  /** The screen as elements (v0.5.14, the CLI/MCP `read_screen`): what each thing says, what it is
+      called, its resource-id and where its centre is, in device pixels. Lets an AI agent (or a person
+      at a terminal) find buttons by name and learn Instagram's real ids for the posting flow.
+      Read-only - like `screenshot` it changes nothing on the phone. Texts are cleaned on the phone
+      (emails / phone numbers masked); no raw XML leaves it. */
+  async uiDumpOp(serial, m, ws) {
+    try {
+      const nodes = igpost.parseDump(await this._uiDump(serial));
+      if (!nodes.length) return this._rpcReply(ws, m, { ok: false, state: 'error', error: 'the screen could not be read (empty dump)' });
+      const size = igpost.screenSize(nodes);
+      const elements = igpost.uiElements(nodes, 400);
+      this.emit('log', `ui_dump (${serial}) ${elements.length} elements, ${igpost.screenPkg(nodes)}`);
+      this._rpcReply(ws, m, { ok: true, elements, w: size.w, h: size.h, pkg: igpost.screenPkg(nodes) });
+    } catch (e) { this._rpcReply(ws, m, { ok: false, state: 'error', error: String((e && e.message) || e) }); }
+  }
+
   /** Best-effort deep link into Instagram's Account Status. Not an officially documented scheme, so
       failure is normal — the classifier then returns UNKNOWN rather than guess (spec §21). Real-phone
       tuning may replace this with resource-id/text taps (Profile -> menu -> Account Status). */
@@ -2144,6 +2161,9 @@ class AgentCore extends EventEmitter {
         const KEYS = { back: 4, home: 3, enter: 66, tab: 61 };
         return self._adbLong(serial, ['shell', 'input', 'keyevent', String(KEYS[name] || 4)], 8000);
       },
+      // a finger drag (v0.5.14: moving the text Instagram wrote to its spot on the reel)
+      swipe: (x1, y1, x2, y2, ms) => self._adbLong(serial, ['shell', 'input', 'swipe', ...[x1, y1, x2, y2].map((v) => String(Math.round(v))),
+        String(Math.max(100, Math.min(3000, Math.round(ms || 900))))], 10000),
       wait: (ms) => new Promise((r) => setTimeout(r, ms)),
       screenshot: async () => { try { return await self._adbBinary(serial, ['exec-out', 'screencap', '-p'], 15000); } catch { return null; } },
       username,
@@ -2220,12 +2240,15 @@ class AgentCore extends EventEmitter {
       // 3) Instagram, in this profile: straight to the audio page when the job carries one
       const audio = String(m.audio_url || '').trim();
       if (audio && /^https?:\/\/(www\.)?instagram\.com\//i.test(audio)) {
-        // Instagram's own link handler first (keeps the link inside the app); a plain VIEW as the fallback.
-        const r = await this._adbLong(serial, ['shell', 'am', 'start', '--user', String(uid), '-n', `${pkg}/com.instagram.url.UrlHandlerActivity`, '-d', audio], 10000).catch(() => 'Error');
-        if (/error|exception|unable|does not exist/i.test(r)) {
-          await this._adbLong(serial, ['shell', 'am', 'start', '--user', String(uid), '-a', 'android.intent.action.VIEW', '-d', audio], 10000).catch(() => {});
-        }
-        log('opened the audio link');
+        // The link is opened INSIDE Instagram only (v0.5.14). Until 0.5.13 a failed open fell back to
+        // a plain VIEW, which a phone gives to its browser: on 2026-11-08 the sound link landed in
+        // Vanadium and the post failed at "audio-page". Now: a VIEW addressed to Instagram's package
+        // (Android picks its link handler), else its handler activity by name, else stop here.
+        const bad = (r) => /error|exception|unable|does not exist|no activity/i.test(String(r));
+        let r = await this._adbLong(serial, ['shell', 'am', 'start', '--user', String(uid), '-a', 'android.intent.action.VIEW', '-d', audio, '-p', pkg], 10000).catch((e) => 'Error ' + e);
+        if (bad(r)) r = await this._adbLong(serial, ['shell', 'am', 'start', '--user', String(uid), '-n', `${pkg}/com.instagram.url.UrlHandlerActivity`, '-d', audio], 10000).catch((e) => 'Error ' + e);
+        if (bad(r)) throw new Error('Instagram would not open the sound link: ' + String(r).trim().slice(0, 160));
+        log('opened the audio link in Instagram');
       } else {
         const comp = await this._resolveLauncher(serial, uid, pkg);
         if (comp) await this._adbLong(serial, ['shell', 'am', 'start', '--user', String(uid), '-n', comp], 10000).catch(() => {});
@@ -2234,19 +2257,29 @@ class AgentCore extends EventEmitter {
       await wait(4000);
       // 4) the flow
       driver = this._igDriver(serial, username);
-      const flow = audio ? igpost.FLOW_REEL_WITH_AUDIO : igpost.FLOW_REEL;
+      // v0.5.14: words Instagram itself writes on the reel, at the owner's spot (shares of the reel).
+      const overlayText = igpost.overlayForDevice(m.text || '');
+      const overlay = overlayText ? { text: overlayText, x: Number(m.text_x), y: Number(m.text_y) } : null;
+      const base = audio ? igpost.FLOW_REEL_WITH_AUDIO : igpost.FLOW_REEL;
+      const flow = overlay ? igpost.withText(base) : base;
       const caption = igpost.captionForDevice(m.caption || '', 2000);
+      let textShot = null;   // a test run with text: the editor with the text on the clip is the picture that matters
       const result = await igpost.run(driver, flow, {
-        caption, mode, username,
-        onStep: (step, label) => log(`step ${step.name}: ${label}`),
+        caption, mode, username, overlay, appPkg: pkg,
+        onStep: async (step, label) => {
+          log(`step ${step.name}: ${label}`);
+          if (mode === 'capture' && step.name === 'text-place' && m.evidence !== false) { await wait(1000); textShot = await driver.screenshot(); }
+        },
         abort: () => false,   // the stream check is async; checked between phases above and below instead
       });
       delete result.nodes;
       if (await viewerOpened() && result.state !== 'shared') result.state = 'aborted';
-      const out = { ok: result.ok, state: result.state, step: result.step, why: result.why || '', trace: result.trace, screen: result.screen, flow: audio ? 'audio' : 'gallery', gallery: landed };
+      const out = { ok: result.ok, state: result.state, step: result.step, why: result.why || '', trace: result.trace, screen: result.screen,
+        flow: (audio ? 'audio' : 'gallery') + (overlay ? '+text' : ''), gallery: landed };
+      if (result.pkg) out.pkg = result.pkg;
       if (mode === 'capture') out.screens = result.screens;
       if ((!result.ok || mode === 'capture') && m.evidence !== false) {
-        const png = await driver.screenshot();
+        const png = (result.ok && textShot && textShot.length) ? textShot : await driver.screenshot();
         if (png && png.length) out.screenshot_b64 = png.toString('base64');
       }
       log(`-> ${out.state}${out.why ? ' (' + out.why + ')' : ''} at step ${out.step} in ${secs()} s`);
