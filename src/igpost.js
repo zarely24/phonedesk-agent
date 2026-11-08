@@ -34,6 +34,8 @@ function parseDump(xml) {
     out.push({
       text: attr('text'), desc: attr('content-desc'), id: attr('resource-id'), cls: attr('class'), pkg: attr('package'),
       clickable: attr('clickable') === 'true', enabled: attr('enabled') !== 'false', focused: attr('focused') === 'true',
+      // v0.5.15: which Insights tab / chip is chosen, when the build says so (the account check)
+      selected: attr('selected') === 'true', checked: attr('checked') === 'true',
       bounds, cx: bounds ? Math.round((bounds.l + bounds.r) / 2) : 0, cy: bounds ? Math.round((bounds.t + bounds.b) / 2) : 0,
     });
   }

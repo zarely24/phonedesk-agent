@@ -16,6 +16,10 @@ const instagram = require('./instagram');   // Instagram account-status classifi
 const congestion = require('./congestion'); // v0.5.8: per-tunnel queue watchdog (drop stale video, force a keyframe)
 const igpost = require('./igpost');         // v0.5.9: post a reel / read the username on the phone itself (pure, data-driven steps)
 const igstats = require('./igstats');       // v0.5.12: followers / dashboard views / reel plays in the same whoami visit (pure)
+const igcheck = require('./igcheck');       // v0.5.15: the daily account check - what each screen is, the numbers, Insights (pure)
+// The version this file ships in, for replies that say which agent read a profile. The Electron app
+// passes its own (opts.appVersion); `node agent.js` and the tests fall back to package.json.
+const AGENT_VERSION = (() => { try { return require('../package.json').version; } catch { return ''; } })();
 
 // Electron's main process (Node 20) has no global WebSocket; fall back to the `ws` package.
 const WebSocket = globalThis.WebSocket || require('ws');
@@ -1347,6 +1351,7 @@ class AgentCore extends EventEmitter {
       // Scheduled posting (v0.5.9): the backend's planner sends one post at a time per phone.
       else if (m.op === 'ig_post') this.igPost(serial, m, ws);              // switch profile, drop the clip in, share it
       else if (m.op === 'ig_whoami') this.igWhoami(serial, m, ws);          // which account is logged in, in this profile
+      else if (m.op === 'ig_check') this.igCheck(serial, m, ws);            // v0.5.15: the daily account check of one profile (accounts, numbers, Insights)
       // Physical device controls (real, deterministic: PhoneDesk button -> here -> adb -> phone).
       else if (m.op === 'input_key') this.inputKey(serial, m, ws);        // Power/Vol/Back/Home/Recent...
       else if (m.op === 'input_text') this.inputText(serial, m, ws);      // keyboard text into the focused field
@@ -2350,6 +2355,226 @@ class AgentCore extends EventEmitter {
       if (previous && previous !== String(uid)) { try { await this._adbLong(serial, ['shell', 'am', 'switch-user', String(previous)], 12000); } catch {} }
       this._posting.delete(serial);
     }
+  }
+
+  // ===========================================================================================
+  // The daily account check (v0.5.15, 2026-11-08): op `ig_check`, one profile per call. The backend
+  // runs it at 4:00 AM New York on every profile of every phone (and for the "Check" buttons), ONE
+  // profile at a time per phone. What a screen is, what its numbers mean and where a tap may land is
+  // all in src/igcheck.js (pure, tested with the farm's own screens); this part only moves the
+  // phone, and logs every step:
+  //   guards (one job per phone, nobody watching, the profile exists, Instagram is installed)
+  //   -> switch to the profile (no airplane cycle) -> settle (its home screen resumed, no lock
+  //   screen) -> start Instagram and VERIFY it is in front -> igcheck.check() -> HOME + switch back
+  //   -> reply. The phone is put back BEFORE the reply, so the backend's next profile for this phone
+  //   never finds it still busy. A viewer opening the phone at any moment ends it (device_busy).
+  // Why the settle + verify: until 0.5.14 whoami started Instagram 2.5 s into `am switch-user`
+  // without looking, which is the prime suspect for "only the current profile is ever read".
+  // ===========================================================================================
+  /** What is in front: the resumed activity ({uid, pkg}) and whether the lock screen is up.
+      `dumpsys activity activities` first; `dumpsys window` only when that one does not say. */
+  async _checkFront(serial) {
+    const act = igcheck.parseActivities(await this._adbLong(serial, ['shell', 'dumpsys', 'activity', 'activities'], 10000).catch(() => ''));
+    let keyguard = act.keyguard, resumed = act.resumed;
+    if (keyguard == null || !resumed) {
+      const w = igcheck.parseWindow(await this._adbLong(serial, ['shell', 'dumpsys', 'window'], 10000).catch(() => ''));
+      if (keyguard == null) keyguard = w.keyguard;
+      if (!resumed && w.focus && w.focus.cls) resumed = w.focus;
+    }
+    return { resumed, keyguard: !!keyguard };
+  }
+  /** The screen size (for the unlock swipe), once per phone. */
+  async _checkSize(serial) {
+    const dev = this.devices && this.devices[serial];
+    if (dev && dev._wmSize) return dev._wmSize;
+    const s = igcheck.parseWmSize(await this._adbLong(serial, ['shell', 'wm', 'size'], 5000).catch(() => '')) || { w: 1080, h: 2400 };
+    if (dev) dev._wmSize = s;
+    return s;
+  }
+  /** A lock screen in the way: dismiss-keyguard, then MENU, then a swipe up from 85 % to 30 % of the
+      height. Farm profiles have no PIN (`_prepProfile`); one that does stays locked and is reported.
+      `guard` (the viewer check) runs before each of the three and after the last wait: a person who
+      opens the phone in the middle gets no MENU press and no swipe (review 2026-11-08). */
+  async _checkUnlock(serial, guard) {
+    const g = guard || (async () => {});
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    await g();
+    await this._adbLong(serial, ['shell', 'wm', 'dismiss-keyguard'], 6000).catch(() => {});
+    await wait(700);
+    await g();
+    await this._adbLong(serial, ['shell', 'input', 'keyevent', '82'], 5000).catch(() => {});
+    await wait(700);
+    await g();
+    const s = await this._checkSize(serial);
+    await this._adbLong(serial, ['shell', 'input', 'swipe', String(Math.round(s.w / 2)), String(Math.round(s.h * 0.85)), String(Math.round(s.w / 2)), String(Math.round(s.h * 0.3)), '300'], 6000).catch(() => {});
+    await wait(1000);
+    await g();
+  }
+  /** Step 3: up to 15 s for the switch to finish - the profile's own screen resumed (user u<uid>)
+      and nothing on top of it. Never fails the check: the launch below verifies again. */
+  async _checkSettle(serial, uid, guard, log) {
+    const t0 = Date.now();
+    let last = '';
+    while (Date.now() - t0 < 15000) {
+      const f = await this._checkFront(serial);
+      const r = f.resumed;
+      const seen = `${r ? 'u' + r.uid + ' ' + r.pkg : 'nothing resumed'}${f.keyguard ? ', lock screen up' : ''}`;
+      if (seen !== last) { log(`settle: ${seen}`); last = seen; }
+      if (r && r.uid === uid && !f.keyguard) return true;
+      await guard();
+      if (f.keyguard) await this._checkUnlock(serial, guard);
+      else await new Promise((res) => setTimeout(res, 1000));
+      await guard();
+    }
+    log(`settle: still "${last}" after 15 s - carrying on, the launch checks for itself`);
+    return false;
+  }
+  /** Step 4: start Instagram in this profile and make sure it is REALLY in front: the resumed
+      activity is Instagram's for this user, or the screen dump is Instagram's (Android's own
+      "Allow Instagram to send you notifications?" counts - the visit answers it). Three tries. */
+  async _checkLaunch(serial, uid, pkg, comp, guard, log) {
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    const ours = (p) => p === pkg || /permissioncontroller/.test(String(p || ''));
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      if (attempt > 1) { await guard(); await this._adbLong(serial, ['shell', 'input', 'keyevent', '3'], 5000).catch(() => {}); await wait(1500); }
+      await guard();
+      const out = comp
+        ? await this._adbLong(serial, ['shell', 'am', 'start', '-W', '--user', String(uid), '-n', comp], 25000).catch((e) => 'Error: ' + ((e && e.message) || e))
+        : await this._adbLong(serial, ['shell', 'monkey', '-p', pkg, '--user', String(uid), '-c', 'android.intent.category.LAUNCHER', '1'], 15000).catch((e) => 'Error: ' + ((e && e.message) || e));
+      const said = [/Status: \w+/, /LaunchState: \w+/, /TotalTime: \d+/, /Error[^\n]*/].map((re) => (re.exec(out) || [''])[0]).filter(Boolean).join(', ');
+      log(`launch ${attempt}/3 (${comp || 'monkey'}): ${said || String(out).split('\n')[0].slice(0, 120)}`);
+      for (let i = 0; i < 4; i++) {
+        await wait(1500);
+        await guard();
+        const f = await this._checkFront(serial);
+        if (f.resumed && f.resumed.uid === uid && ours(f.resumed.pkg) && !f.keyguard) { log(`Instagram in front (u${uid}, ${f.resumed.pkg})`); return true; }
+        const pk = igpost.screenPkg(igpost.parseDump(await this._checkDump(serial)));
+        if (ours(pk)) { log(`Instagram in front (screen: ${pk})`); return true; }
+        if (i === 3) log(`not in front: resumed ${f.resumed ? 'u' + f.resumed.uid + ' ' + f.resumed.pkg : '?'}, screen ${pk || 'unreadable'}${f.keyguard ? ', lock screen up' : ''}`);
+        if (f.keyguard) await this._checkUnlock(serial, guard);   // seconds after the last guard: it checks again itself
+      }
+    }
+    return false;
+  }
+  /** A fresh `uiautomator dump`: the old file is removed first, so a dump that fails ("could not get
+      idle state" while something animates) is an empty screen, never the previous screen again.
+      Its own file name: an MCP read_screen on the same phone uses pd_ui.xml. */
+  async _checkDump(serial) {
+    const f = '/sdcard/pd_check.xml';
+    for (let i = 0; i < 2; i++) {
+      const out = await this._adbLong(serial, ['shell', `rm -f ${f}; uiautomator dump ${f}`], 20000).catch((e) => 'ERROR ' + ((e && e.message) || ''));
+      if (/dumped to/i.test(out)) {
+        const xml = await this._adbLong(serial, ['shell', 'cat', f], 10000).catch(() => '');
+        if (xml.includes('<hierarchy')) return xml;
+      }
+      await new Promise((r) => setTimeout(r, 800));
+    }
+    return '';
+  }
+  /** The driver igcheck.check() moves the phone with: igPost's taps / keys / swipes plus a fresh
+      dump, the viewer check, a re-launch, a profile opened by its link (another account of this
+      app) and the unlock. A username only reaches the shell after the strict username check. */
+  _checkDriver(serial, uid, pkg, comp, guard) {
+    const self = this;
+    const sh = (args, ms) => self._adbLong(serial, ['shell', ...args], ms || 10000);
+    return Object.assign({}, this._igDriver(serial, ''), {
+      dump: () => self._checkDump(serial),
+      now: () => Date.now(),
+      viewer: () => self._scrcpyRunning(serial),
+      launch: () => (comp ? sh(['am', 'start', '-W', '--user', String(uid), '-n', comp], 25000)
+        : sh(['monkey', '-p', pkg, '--user', String(uid), '-c', 'android.intent.category.LAUNCHER', '1'], 15000)).catch(() => ''),
+      openProfile: (u) => (/^[a-z0-9._]{1,30}$/i.test(String(u || ''))
+        ? sh(['am', 'start', '-W', '--user', String(uid), '-a', 'android.intent.action.VIEW', '-d', `https://www.instagram.com/${u}/`, '-p', pkg], 25000).catch(() => '')
+        : Promise.resolve('')),
+      // the viewer check between the unlock's steps; its error ends the visit as device_busy (igcheck)
+      unlock: () => self._checkUnlock(serial, guard),
+    });
+  }
+  /** The phone's own date (YYYY-MM-DD, its time zone): a restriction "Ends on Nov 24, 2026" is
+      compared with the day the phone is in, not the computer's. */
+  async _checkToday(serial) {
+    const v = (await this._adbLong(serial, ['shell', 'date', '+%F'], 5000).catch(() => '')).trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return v;
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+  async igCheck(serial, m, ws) {
+    const uid = parseInt(m.uid != null ? m.uid : -1, 10);
+    const pkg = igcheck.IG_PKG;
+    const t0 = Date.now();
+    const log = (x) => this.emit('log', `[check ${serial} u${uid}] ${x}`);
+    const base = { uid, agent_version: this.appVersion || AGENT_VERSION, username: '', accounts: [], notices: [], remembered: [], why: '', screens: [], trace: [] };
+    const reply = (obj) => this._rpcReply(ws, m, Object.assign({}, base, obj, { uid, seconds: Math.round((Date.now() - t0) / 1000) }));
+    if (!(uid >= 0)) return reply({ ok: false, state: 'bad_request', status: 'UNKNOWN', why: 'uid missing' });
+    if (!this._posting) this._posting = new Set();
+    if (this._posting.has(serial)) return reply({ ok: false, state: 'device_busy', status: 'UNKNOWN', why: 'another job is running on this phone' });
+    if ((this._checking && this._checking.has(serial)) || (this._igDiag && this._igDiag.has(serial))) {
+      return reply({ ok: false, state: 'device_busy', status: 'UNKNOWN', why: 'another check is running on this phone' });
+    }
+    this._posting.add(serial);
+    let previous = null, touched = false, out = null;
+    const guard = async () => { if (await this._scrcpyRunning(serial)) throw Object.assign(new Error('a viewer opened the phone'), { viewer: true }); };
+    try {
+      out = await this._igCheckVisit(serial, m, uid, pkg, t0, guard, log, (p) => { previous = p; touched = true; });
+    } catch (e) {
+      if (e && e.viewer) { log('a viewer opened the phone - stopped'); out = { ok: false, state: 'device_busy', status: 'UNKNOWN', why: 'viewer_opened' }; }
+      else { const err = String((e && e.message) || e).slice(0, 300); log(`failed: ${err}`); out = { ok: false, state: 'failed', status: 'UNKNOWN', why: 'exception', error: err }; }
+    } finally {
+      // Put the phone back as it was BEFORE replying: Instagram closed to the home screen, and the
+      // profile a VA left it on - so whoever opens it next, or the backend's next profile, finds it
+      // free. Only when this visit moved the phone: a phone someone was already watching is untouched.
+      if (touched) {
+        try { await this._adbLong(serial, ['shell', 'input', 'keyevent', 'KEYCODE_HOME'], 5000); } catch {}
+        if (previous && previous !== String(uid)) {
+          try { await this._adbLong(serial, ['shell', 'am', 'switch-user', String(previous)], 12000); log(`restored profile ${previous}`); } catch {}
+        }
+        try { this.devices[serial] && (this.devices[serial]._metaCache = null); } catch {}
+        this._sendMeta(serial, ws);
+      }
+      this._posting.delete(serial);
+    }
+    reply(out);
+  }
+  /** The visit itself (everything between the guards and putting the phone back). Returns the reply. */
+  async _igCheckVisit(serial, m, uid, pkg, t0, guard, log, setPrevious) {
+    const shotInto = async (out) => {   // the screen as it is, only for a result that is not a clean read
+      try { const png = await this._adbBinary(serial, ['exec-out', 'screencap', '-p'], 15000); if (png && png.length) out.screenshot_b64 = png.toString('base64'); } catch {}
+    };
+    if (await this._scrcpyRunning(serial)) return { ok: false, state: 'device_busy', status: 'UNKNOWN', why: 'someone is watching this phone' };
+    if (!(await this._userExists(serial, uid))) return { ok: false, state: 'profile_not_found', status: 'UNKNOWN', why: 'profile is gone from the phone' };
+    if (!(await this._pkgInstalledForUser(serial, uid, pkg))) {
+      log('Instagram is not installed in this profile');
+      return { ok: true, state: 'no_app', status: 'APP_ERROR', why: 'Instagram is not installed in this profile' };
+    }
+    setPrevious(null);   // from here on the phone is ours to put back (HOME at least, even if the switch throws)
+    const previous = await this._igSwitchTo(serial, uid, false, log);
+    setPrevious(previous);
+    await guard();
+    await this._checkSettle(serial, uid, guard, log);
+    const comp = await this._resolveLauncher(serial, uid, pkg);
+    if (!(await this._checkLaunch(serial, uid, pkg, comp, guard, log))) {
+      const out = { ok: true, state: 'unreadable', status: 'UNKNOWN', why: 'ig_not_in_front' };
+      const nodes = igpost.parseDump(await this._checkDump(serial));
+      if (nodes.length) out.screens = [{ at: 'not_in_front', pkg: igpost.screenPkg(nodes), ...igpost.describe(nodes, '') }];
+      if (m.shot) await shotInto(out);
+      log('-> unreadable: Instagram would not come to the front');
+      return out;
+    }
+    const today = await this._checkToday(serial);
+    const driver = this._checkDriver(serial, uid, pkg, comp, guard);
+    // The visit gets what is left of ~250 s (the backend waits 300; putting the phone back needs some).
+    const r = await igcheck.check(driver, {
+      appPkg: pkg, insights: m.insights !== false, others: m.others !== false, today,
+      budgetMs: Math.max(60000, 250000 - (Date.now() - t0)), log: (x) => log(`  ${x}`),
+    });
+    if (r.aborted) { delete r.aborted; log('a viewer opened the phone - stopped'); return Object.assign(r, { ok: false, state: 'device_busy', status: 'UNKNOWN', why: 'viewer_opened' }); }
+    const out = Object.assign({ ok: true }, r);
+    if (m.shot && out.state !== 'checked') await shotInto(out);
+    const a = out.accounts[0];
+    log(`-> ${out.state} / ${out.status}${out.username ? ' @' + out.username : ''}${a && a.followers != null ? ', ' + a.followers + ' followers' : ''}`
+      + `${out.accounts.length > 1 ? ', ' + (out.accounts.length - 1) + ' other account(s)' : ''}${out.notices.length ? ', ' + out.notices.length + ' notice(s)' : ''}`
+      + `${a && a.insights ? ', insights' + (a.insights.why.length ? ' (' + a.insights.why.length + ' missing)' : '') : ''}${out.why ? ' (' + out.why + ')' : ''} in ${Math.round((Date.now() - t0) / 1000)} s`);
+    return out;
   }
 
   /** Phase-1 REMOTE Instagram diagnostic (triggered from the web dashboard via the backend RPC). READ-

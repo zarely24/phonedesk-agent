@@ -117,6 +117,7 @@ Up to **30 phones per computer**.
 |---|---|
 | `src/main.js` | Electron shell, window, auto-update, the 2s reconcile timer |
 | `src/core.js` | everything else: adb, pairing, sockets, tunnels, profiles, charge limiting |
+| `src/igpost.js` / `src/igstats.js` / `src/igcheck.js` | Instagram on the phone, PURE (no adb, tested with scripted screens): posting + whoami (v0.5.9), the whoami numbers (v0.5.12), the daily account check `ig_check` (v0.5.15) |
 | `src/renderer/` | the small setup UI the owner sees |
 | `src/webrtc.js` | the dormant WebRTC sender (POC): offers H.264, or H.265 + H.264 when `WEBRTC_CODEC=h265`, and starts the matching capture once the browser answers |
 | `src/h264-rtp.js` / `src/h265-rtp.js` | Annex-B NAL parsing + RTP packetization (RFC 6184 / RFC 7798). Pure code, no hardware, unit-tested |
@@ -144,6 +145,17 @@ git tag v0.4.3 && git push origin v0.4.3
 
 Windows agents then **auto-update silently** on their next launch or update check (every 30 minutes
 since v0.4.3). macOS is unsigned, so Mac users get a prompt instead.
+
+**The release is named from `package.json`, not from the tag you push** (electron-builder
+`--publish always` publishes `v<version>`). On 2026-11-08 `v0.5.15` was pushed while `package.json` still
+said 0.5.14: the build published release **0.5.14** (tag `v0.5.14`, created by GitHub) and left a stray
+`v0.5.15` tag on the 0.5.14 commit with no release. A tag that already exists cannot be pushed again, so
+before tagging the real release that stray tag has to go:
+
+```bash
+git push origin :refs/tags/v0.5.15 && git tag -d v0.5.15     # only when that tag has NO release
+git tag v0.5.15 && git push origin v0.5.15                   # after package.json says 0.5.15
+```
 
 Device tokens survive updates, so an update never costs a re-pairing.
 
@@ -214,6 +226,7 @@ Facts worth knowing:
 
 | Version | What changed |
 |---|---|
+| **v0.5.15** | **The 4:00 AM account check: new op `ig_check` (2026-11-08).** The owner: "open the phone and check on each profile what accounts we got and how many followers we got" and "views, usa % everything at 4am NYC TIME". The 06:00 sweep before it (`ig_whoami` + stats) read 30 usernames out of 887 profiles: every logged-out profile came back UNKNOWN, the first "What happened" notice stopped it, Instagram was started 2.5 s into `am switch-user` without anyone checking it was in front, and Insights were never opened. `ig_check {uid, shot, others, insights}` (`ig_whoami` and `ig_post` unchanged): (1) **settle + verify** - after the switch (no airplane cycle) it waits up to 15 s until that profile's own screen is resumed and no lock screen covers it (dismiss-keyguard, MENU, swipe up), then `am start -W` and checks Instagram is REALLY in front (the resumed activity for that user, or the screen dump), three tries, else `unreadable` / `ig_not_in_front`; (2) **every screen recognised** by the new pure module `src/igcheck.js`, from texts (resource-ids only as a second opinion), written from the farm's own screenshots of 2026-11-08 (phones 10 and 14): "Join Instagram" = `NO_ACCOUNT`, a login form / saved-account login = `LOGIN_REQUIRED` + the accounts it still offers, "Confirm it's you" / "Action Blocked" / suspended / disabled = blocked with that status, "What happened" notices recorded (`restriction` with its end date = `RESTRICTED` while it lasts, `removed_post`, `warning`) and closed with their X, Android's "Allow Instagram to send you notifications?" answered "Don't allow", Instagram's own prompts "Not now" and the like, promos that only Back closes, another app, the launcher, the lock screen; (3) **the profile** (title left-aligned or centred): username, name, posts / followers / following, "44.3K views in the last 30 days."; (4) **Insights**, when the profile has a "Your dashboard" row: the dashboard (period "Oct 9 - Nov 7", Views, New followers, Content you shared) -> its Views row -> Overview (tiles Views / Net followers / Interactions with one sideways swipe, followers vs non-followers %, Viewers = reach, views and interactions by content type, profile visits, bio link taps; scrolled until the screen stops changing) -> Audience (followers, "+435.1% since Oct 9", gender, age bands, the top countries and - after its chip - cities, USA %, the active-time bars of every day chip Su..Sa as shares of the tallest bar, "When followers are most active"; below 100 followers Instagram shows none: `under_100`). An Insights failure never fails the check (nulls + reasons in `why`); a tap a tooltip swallowed is tried once more; (5) **the accounts sheet** (tap the title, read, Back - never a row) and up to four other accounts read off their public profile (`VIEW https://www.instagram.com/<u>/ -p com.instagram.android`); (6) HOME + switch back BEFORE the reply, so the backend's next profile finds the phone free. READ-ONLY: a fixed list of allowed taps, and every tap passes `tapRefused` (never See why / Allow / Continue / Log in / Try Muse / Edit profile / Add account / a row of the sheet ...); a viewer opening the phone (scrcpy) stops it at once (`device_busy` / `viewer_opened`). Screen dumps are fresh (the file is removed first, its own name `pd_check.xml`) so a failed dump is never mistaken for the previous screen. Reply: see "Account check op" below. Words people wrote (a DM thread or the inbox the app resumed in, a bio, a caption) never read as a block, a notice, a pop-up or a hung app, and nothing in a conversation is tapped - see "Words people wrote" there (review of 2026-11-08). `npm run test:igcheck` (211 checks: every screenshot modelled, whole visits on a scripted phone with every tap checked against a never-tap list, and the real `igCheck` against a scripted adb). `igpost.parseDump` now also reads `selected` / `checked`. **The texts are what the phones showed on 2026-11-08 but the flow has not run on a phone yet** - the first runs' `screens` + `trace` say what to tune. |
 | **v0.5.14** | **Text written by Instagram itself, and the first real post's failures fixed (2026-11-08).** (1) **Text on the reel in Instagram's own default font, plain white, wherever the owner drops it.** The owner wanted the words "in instagram's default" font, "anywhere I want", "plain white". That font (Instagram Sans, the "Classic" style) is Meta's and is not published or licensed, so no server may draw it - the phone does what a VA does: `ig_post` takes `text`, `text_x`, `text_y` (the CENTRE of the text as a share of the reel's width/height) and, when `text` is set, the flow gets `TEXT_STEPS` before the editor's Next (`igpost.withText`): tap the editor's "Aa"/Text tool, type the lines (Enter between them; `adb input text` = printable ASCII only), Done (the default style IS plain white, no band), then drag the text from where Instagram put it (the middle of the reel, or the node showing its first line when the build exposes one) to the spot (`input swipe`, 0.9 s). The reel's box on screen is the biggest reel-shaped preview/texture view in the dump, else a full-width 9:16 box in the middle of the screen; the spot is kept to x 10-90 %, y 8-80 % (Instagram's caption area and the trash bin that appears while dragging sit below). The trace line of `text-place` says the exact drag and whether the reel's box was found or assumed. A test run with text keeps the screenshot taken RIGHT AFTER the text was placed (the editor with the words on the clip) as its evidence. The backend never sends text to an agent below 0.5.14 (it would be ignored and the reel posted without it). (2) **"Continue" is no longer tapped as a pop-up dismissal.** The first real post (phone 40, 03:00 UTC) met Instagram's promo for its Edits app right after the clip; its button "Continue" was in `DISMISS`, tapping it opened Google Play in the browser (Vanadium on these GrapheneOS phones), and the job failed three screens later at `caption`. New `BACK_ON` list: screens that only Back closes safely (the Edits promo texts) get Back. Android's "Allow X to send you notifications?" is answered "Don't allow" (curly apostrophe in the dump). (3) **Sent to another app = Back, then a clear failure.** Once Instagram has been on screen, a dump whose top package is another app is never searched for the step's button (the browser's own "Next" must not count); Back is pressed (at most 2 per step) and if Instagram does not come back the run fails `left_app` with the package (`pkg` in the reply). (4) **The sound link is opened only inside Instagram.** The second real post's link fell through to a plain VIEW intent and opened in the browser; now `am start -a VIEW -d <link> -p com.instagram.android`, else Instagram's `UrlHandlerActivity`, else the job fails "Instagram would not open the sound link" - never the browser. (5) **New op `ui_dump`** -> `{ok, elements:[{text, desc, id, cls, clickable, focused?, bounds, cx, cy}], w, h, pkg}`: the screen as elements (deduped, emails/phone numbers masked, at most 400), for the CLI/MCP `read_screen` so an AI agent driving the phone can find buttons by name and learn the composer's real ids. Read-only, like `screenshot`. `npm run test:igpost` (59 checks, including tonight's failure replayed: promo -> Back, browser -> Back, stuck in the browser -> `left_app`). **The Mac's phones (20-40, phone 40 included) need the dmg installed by hand.** |
 | **v0.5.13** | **New profiles no longer stop on "Set a PIN" (2026-11-06).** A profile made by `pm create-user` keeps the setup wizard ENABLED for that user; marking `user_setup_complete=1` (done since v0.5.11) is only a hint, and sometimes the wizard's home screen still won the first switch and walked the VA into "Protect your phone / Set a PIN". New `_prepProfile(serial, uid)` runs for every profile EXCEPT the owner (uid 0): (1) `user_setup_complete` / `tv_user_setup_complete` = 1 again; (2) `pm disable-user --user N` for the setup-wizard packages that are enabled in THAT user only (`com.google.android.setupwizard`, `com.android.provision`, Samsung `SecSetupWizard`, Xiaomi `provision`; exact package names, the owner's wizard is never touched); (3) lock screen = None (`locksettings set-disabled --user N true`) so the profile never shows a keyguard. If someone already set a real PIN on a profile, Android refuses step 3 - the PIN stays (it cannot be removed without knowing it) and the log says "a PIN is set on this profile". It runs (a) right after each profile is created in `create_profiles` (the result per profile now carries `wizard_off` and `lock`), (b) after every verified VA switch, and (c) in `_igSwitchTo` (posting / account checks) - so profiles made by older agents are fixed the first time anyone switches to them. If the wizard was disabled during a switch (it may be the screen showing), HOME is pressed once. Done once per phone+profile per agent run, so later switches cost nothing. No root needed (all `adb shell`). `node tools/test_prep_profile.js` (8 checks). |
 | **v0.5.12** | **Account numbers in the Analytics visit (2026-11-06), and the first release of v0.5.11.** The backend's new daily Analytics sweep (06:00 New York, backend README "Analytics") calls `ig_whoami` on every profile. With `stats: true` the same visit now also reads, via the new pure module `src/igstats.js`: (1) **posts / followers / following** off the profile header (resource-id, then "N followers" text/content-desc, then a number next to its label - no tap); (2) **professional-dashboard views + accounts reached** for the last N days - from the "Professional dashboard" row when it prints "12.3K views in the last 30 days", else it opens the row, reads the "Views" / "Accounts reached" tiles and presses Back (personal accounts have no dashboard: views null, `account_type: personal`); (3) **reel plays** - taps the PROFILE's Reels tab (never the bottom-bar Reels feed; told apart by position) and sums the play counts on the reels visible on the first screen. Read-only: the only taps are the dashboard row, Back and the profile's Reels tab; a viewer opening the phone (scrcpy running) stops it before the next tap. Whatever is not found comes back null with a reason in `stats.why` and the sanitized screen (texts + ids, username redacted) in `stats.screens` for tuning - **the selectors are PROVISIONAL**, not yet seen on a farm phone. Reply: `stats: {posts, followers, following, account_type, views, reach, days, reels_views, reels_counted, why, screens}`; without the flag `ig_whoami` is unchanged. Adds ~10-15 s per profile. Number parsing handles "1,234", "12.5K", "1.2M", "3 456", "12,5K". `npm run test:igstats` (18 checks). **v0.5.11 was committed but never tagged**, so this release also ships its bulk profile creation + `profile_status` (row below). |
@@ -257,6 +270,89 @@ is no new agent code and no version bump for them:
 
 If either misbehaves, it is the backend's step logic or these ops, not a new op — check the backend
 logs, not a new agent build.
+
+## Account check op (v0.5.15)
+
+`ig_check` `{uid, shot, others, insights}` reads ONE profile on the phone itself. The backend's daily
+4:00 AM New York run (`app/accountcheck.py`) and the Monitoring page's Check buttons send it ONE at a
+time per phone, with a 300 s timeout; the agent ends its visit by ~250 s and puts the phone back
+(HOME, then `am switch-user <previous>`) before it replies.
+
+Reply (the backend relies on these keys): `{ok, state, status, uid, seconds, agent_version, username,
+accounts:[{username, active, name, posts, followers, following, views_30d, read:'own'|'visit'|'list',
+account_type:'professional'|'personal'|'', insights}], notices:[{kind, title, detail, date, until}],
+remembered:[usernames a login screen still offers], why, screens:[{at, pkg, texts, ids}],
+trace:[{name, ok, matched, ms}], screenshot_b64?}`
+
+- `state` / `status`: `checked` -> `HEALTHY`, or `RESTRICTED` while a restriction notice's end date has
+  not passed (no date printed = still on); `logged_out` -> `LOGIN_REQUIRED` / `NO_ACCOUNT`; `blocked` ->
+  `CHECKPOINT` / `CHALLENGE_REQUIRED` / `SUSPENDED` / `DISABLED`; `no_app` -> `APP_ERROR`; `unreadable`
+  -> `UNKNOWN` with `why`: `ig_not_in_front`, `left_app` (+ `pkg`), `unrecognised_screen`,
+  `empty_dump` (uiautomator gave nothing), `app_not_responding`, `screen_locked`, `notice_loop`,
+  `popup_loop`, `promo_loop`, `header_not_found`, `too_many_screens`. A username without counts is
+  still `checked`, `why: counts_not_found`. `ok:false` only for `device_busy` (another job, someone
+  watching, or `why: viewer_opened` mid-visit), `profile_not_found`, `bad_request`, `failed`.
+- `insights` (the active account, only with a "Your dashboard" row): `{range, days, views,
+  interactions, viewers, net_followers, new_followers, content_shared, followers_pct_of_views,
+  non_followers_pct_of_views, profile_visits, bio_link_taps, views_by_type:{reels, stories, posts,
+  live}, interactions_by_type:{...}, followers, growth_pct, under_100, gender:{women, men},
+  age:{'13-17'..'65+'}, countries:[{name, pct}], cities:[...], us_pct, active_times:{tz,
+  days:{Su:[8 shares of the tallest bar, 12a..9p], ...}, top:[{day:'Fri', from:'3 PM', to:'6 PM'}]},
+  why:[...]}` - Instagram's own "last 30 days" figures. Anything not found is null and named in `why`;
+  under 100 followers Instagram shows no audience (`under_100: true`, not an error). Personal accounts:
+  `account_type: 'personal'`, `insights: null`.
+- `read`: `own` = the account logged in (its profile tab); `visit` = another account of this app read
+  off its public profile; `list` = only seen on the accounts sheet (numbers null).
+- `screenshot_b64` only with `shot: true` and a result that is not `checked`.
+
+**How it moves the phone** (`src/core.js` `igCheck`): guards (one job per phone via `_posting`,
+nobody watching, the user exists, Instagram installed) -> `_igSwitchTo` (no airplane cycle) ->
+`_checkSettle` (up to 15 s: that user's screen resumed, no lock screen - `dumpsys activity
+activities`, then `dumpsys window`) -> `_checkLaunch` (`am start -W`, verified, three tries) ->
+`igcheck.check(driver)` -> HOME + switch back -> reply. Every step is logged as `[check <serial> u<uid>]`.
+**Everything that decides what a screen is lives in `src/igcheck.js`** (pure): `classifyScreen`,
+`parseNotice` / `noticeCloseTarget`, `parseProfileHeader`, `parseSwitcher`, `parseLoginRemembered`,
+`parseDashboard`, `parseOverview` / `parseAudience` (merged over the scrolled screens, section by
+section - "Reels 43.3K" under "Views by content type" and "Reels 952" under "Interactions by content
+type" can share one screen), the tap-target finders, `SAFE_DISMISS`, `FORBIDDEN` and `tapRefused`
+(the last word before any tap).
+
+**Tuning from a real run.** The Monitoring page's Details show each profile's `screens` (texts + ids,
+username masked) and `trace`. An `unrecognised_screen`, or an Insights `why` such as "Viewers not
+found", names the screen: add its real text to the matcher in `src/igcheck.js`, model that screen in
+`tools/test_igcheck.js` (texts and bounds off a screenshot), `npm run test:igcheck`, release. The
+active-time bars are read from the bars' own boxes in the dump; if a build draws the chart as one
+picture (no nodes), `why` says "active-time bars not read" and everything else still comes back.
+
+**What it never does.** Tap anything but: the profile tab, "Your dashboard", the dashboard's
+"Views", the Overview / Audience tabs, the Countries / Cities chips, the day chips, the title (opens
+the accounts sheet), a notice's X, and Not now / Skip / Later / Maybe later / No thanks / Dismiss /
+Close / Don't allow / Cancel on a prompt. Tap a row of the accounts sheet. Follow, like, message, edit or post.
+Keep going once someone opens the phone.
+
+**Words people wrote are never Instagram talking** (review of 2026-11-08, before the first real run).
+Instagram resumes where the app was left - for a chatter's profile, a DM thread or the inbox - so a
+fan's "Please verify your account", "your account has been disabled lol", "What happened?" or "Later"
+can be on the first screen. The rules that keep those from becoming a false block, a false RESTRICTED
+or a tap that opens a chat (and marks it Seen):
+- A screen with a message box (DM thread, story reply, comments) or a DM thread's call buttons is a
+  *conversation*: nothing on it is read as a block, notice, login or pop-up, nothing on it is tapped
+  (`tapRefused`), and the visit presses Back at once.
+- A block (`disabled`, `suspended`, then `challenge`, `checkpoint`) or a notice is only read on an
+  Instagram page of its own (no bottom bar, no conversation, no post with Like / Comment / Save
+  buttons), and only from the page's *headline*: a line of at most 100 characters that STARTS with
+  the wording, in the upper 60 % of the window. "What happened" counts only in the title bar, with its
+  X or "See why". A challenge / checkpoint page that offers "Not now" / "Skip" is a nag (the two-factor
+  reminder) and is dismissed. "We restricted your account" is a restriction notice (RESTRICTED), not a
+  checkpoint. A notice's kind comes from its title first, and only its own lines are read.
+- With the bottom bar in view only Not now / Maybe later / No thanks / Don't allow count as a dismiss
+  ("Cancel" there can be an upload still running). Anywhere: never a lower-case word (a username),
+  never a word inside a list row (a clickable row-sized box that also holds other words).
+- "Isn't responding" is only Android's own dialog (package `android`, with Close app / Wait); the Edits
+  / Muse promos are only promos on a page of their own (a post's "Made with Edits" chip in the feed is
+  not one).
+- An adb call that fails or times out after the account was read (Insights, the sheet, a visit) ends
+  only that step - `insights.why` / the trace says `error: ...` - and the reply stays `checked`.
 
 ## Scheduled posting ops (v0.5.9)
 
@@ -467,6 +563,26 @@ when the modern command is unknown, an OFF that never lands (three attempts, a v
 three quick switches running as first + last, the no-op repeat, the airplane watchdog (two looks,
 mid-switch and disconnected phones skipped, the settle window) and the verdict in the meta beat.
 42 checks; the failing-network cases wait out real timeouts, so about a minute.
+
+### Instagram on the phone (no phone needed)
+
+```bash
+npm run test:igpost        # posting + whoami flows on scripted screens
+npm run test:igstats       # the whoami numbers (v0.5.12)
+npm run test:igcheck       # the daily account check (v0.5.15)
+```
+
+`test_igcheck.js` models every screen photographed on the farm on 2026-11-08 (launcher after a switch,
+"Join Instagram", both "What happened" notices, the feed with the Muse card, both profile layouts, the
+accounts sheet, both dashboards, the Overview and Audience screens, the under-100 Audience, Android's
+notification prompt) plus login / saved login / "Confirm it's you" / Action Blocked / suspended /
+disabled / lock screen / another app / promos, and the review's corners (a DM thread and the inbox
+full of button-like and block-like fan messages, the two-factor nag, "We restricted your account",
+a bio / caption with "not responding" / "has stopped", a "Made with Edits" chip, an upload's Cancel,
+adb errors mid-Insights, bars that read out "12a, 9%"). It then runs whole visits on a scripted phone - every
+tap checked against a never-tap list written separately from the module's own - and finally the real
+`AgentCore.igCheck` against a scripted adb (guards, switch, settle, verified launch, phone put back
+before the reply, the reply's keys). `IGCHECK_TRACE=1` prints each visit's trace.
 
 ### WebRTC codec plumbing (no phone needed)
 
