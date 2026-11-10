@@ -1325,7 +1325,7 @@ class AgentCore extends EventEmitter {
     });
     ws.addEventListener('message', (e) => {
       let m = {}; try { m = JSON.parse(typeof e.data === 'string' ? e.data : ''); } catch {}
-      if (m.op === 'open_stream') this.openTunnel(serial, token, m.stream_id, m.query);
+      if (m.op === 'open_stream') this.openTunnel(serial, token, m.stream_id, m.query, m.watch === false);
       else if (m.op === 'switch_user') this.switchUser(serial, m.user_id, ws);
       else if (m.op === 'rename_user') this.renameUser(serial, m.user_id, m.name, ws);
       else if (m.op === 'unpair') this.unpair(serial);
@@ -1504,7 +1504,10 @@ class AgentCore extends EventEmitter {
     this._uplinkTimer = setInterval(() => this._uplinkProbe(), jitter());
   }
 
-  openTunnel(serial, token, streamId, query) {
+  /** `person` (v0.5.16) is true when the backend says this stream is a PERSON looking at the phone
+      (`watch: false` on open_stream): not a Multiview tile (`watch: true`), and not a backend from
+      before 2026-11-10, which says nothing - then nobody is counted, exactly as before. */
+  openTunnel(serial, token, streamId, query, person) {
     if (!streamId) { this.emit('log', `open_stream ignored (${serial}): missing stream_id`); return; }
     // Count live streams, so CPU can be read against how many VAs are actually watching.
     this._openTunnels = (this._openTunnels || 0) + 1;
@@ -1534,6 +1537,9 @@ class AgentCore extends EventEmitter {
       from.addEventListener('error', () => { try { to.close(); } catch {} });
     };
     tunnel.addEventListener('close', uncount); tunnel.addEventListener('error', uncount);
+    // v0.5.16 - who is watching: a person's live VIDEO on this phone (the device-list socket of the
+    // same viewer carries no screen and is not counted). See _scrcpyRunning.
+    if (AgentCore._countsAsPerson(person, q)) this._trackPerson(serial, tunnel);
 
     // ---- v0.5.8: the congestion valve. See src/congestion.js for the why. ------------------------
     // Viewer -> phone: remember the viewer's stream-settings command so we can replay it (bitrate
@@ -1918,6 +1924,10 @@ class AgentCore extends EventEmitter {
           if (!err) return resolve(String(stdout || '').trim());
           const e = new Error(String(stderr || err.message || '').trim());
           e.killed = !!(err.killed || err.signal);   // hit the timeout: adb never finished
+          // v0.5.16: `am start -W` prints its reason ("unable to resolve Intent") on stdout and exits 1;
+          // without this the caller only ever saw "Command failed: <the whole adb command line>".
+          e.stdout = String(stdout || '').trim();
+          e.stderr = String(stderr || '').trim();
           reject(e);
         });
     });
@@ -1955,13 +1965,24 @@ class AgentCore extends EventEmitter {
   }
   /** v0.5.16: up to `ms` for a profile just switched to to finish unlocking. Until then Android
       resolves only Direct-Boot-aware apps, so Instagram has "no launcher" and cannot be started -
-      the cause of ~80 % "ig_not_in_front" on the 2026-11-09/10 account checks. Never throws. */
-  async _waitUnlocked(serial, uid, ms = 30000, log) {
+      the cause of ~85 % "ig_not_in_front" on the 2026-11-09/10 account checks. The phones keep only
+      3 profiles running (max_running_users), so nearly every profile the check visits starts cold.
+      One look a second, bounded by the clock AND by a count. It waits only while the profile is on
+      its way (BOOTING / RUNNING_LOCKED / RUNNING_UNLOCKING). Unlocked, stopping, or an Android that
+      cannot say: no wait. Not started at all: three looks, in case a switch asked for a moment ago
+      has not begun - a profile nobody is starting ("open app" aimed at a profile that is not
+      running) must not hold its caller for the whole limit. Never throws. */
+  async _waitUnlocked(serial, uid, ms = 30000, log, guard) {
     const t0 = Date.now();
-    let s = null;
-    while (Date.now() - t0 < ms) {
+    const onItsWay = (x) => x === 'BOOTING' || x === 'RUNNING_LOCKED' || x === 'RUNNING_UNLOCKING';
+    let s = null, notStarted = 0;
+    for (let i = 0; i < Math.ceil(ms / 1000) && Date.now() - t0 < ms; i++) {
       s = await this._userState(serial, uid);
-      if (s === 'RUNNING_UNLOCKED' || s == null) break;   // null: this Android cannot say - carry on
+      if (!(onItsWay(s) || (s === 'STOPPED' && ++notStarted <= 3))) break;
+      // `guard` (the account check's "someone opened the phone" test) runs once per look: without
+      // it a person who opens the phone during a slow unlock waits up to 30 s on another profile.
+      // Its error is the caller's to handle (the check ends as device_busy / viewer_opened).
+      if (guard) await guard();
       await new Promise((r) => setTimeout(r, 1000));
     }
     if (log) log(`profile ${uid}: ${s || 'state unknown'} after ${Math.round((Date.now() - t0) / 1000)} s`);
@@ -1976,7 +1997,14 @@ class AgentCore extends EventEmitter {
     const args = comp
       ? ['shell', 'am', 'start', ...w, '--user', String(uid), '-n', comp]
       : ['shell', 'am', 'start', ...w, '--user', String(uid), '-a', 'android.intent.action.MAIN', '-c', 'android.intent.category.LAUNCHER', '-p', pkg];
-    const out = await this._adbLong(serial, args, waitMs || 10000).catch((e) => 'Error: ' + ((e && e.message) || e));
+    // A start that fails makes adb exit 1, which _adbLong turns into a rejection. Android's own words
+    // are on stdout with -W and on stderr without; keep whichever there is ("Error: Activity not
+    // started, unable to resolve Intent ...", "Error type 3 ..."), never the adb command line.
+    const out = await this._adbLong(serial, args, waitMs || 10000).catch((e) => {
+      const said = String((e && (e.stdout || e.stderr)) || '').trim()
+        || (e && e.killed ? 'no answer from adb in time' : String((e && e.message) || e).replace(/^Command failed:.*$/s, 'adb gave an error and no text'));
+      return /\bError\b/.test(said) ? said : 'Error: ' + said;
+    });
     return { comp, out: String(out || '') };
   }
   async _uiDump(serial) {
@@ -1986,7 +2014,9 @@ class AgentCore extends EventEmitter {
 
   async checkAppsInstalled(serial, m, ws) {
     const uid = parseInt(m.uid != null ? m.uid : 0, 10);
-    const packages = Array.isArray(m.packages) ? m.packages : [];
+    // v0.5.16: only real package names. adb joins its arguments into ONE line that the phone's shell
+    // reads again, so "x;reboot" used to run a second command on the phone with adb's rights.
+    const packages = (Array.isArray(m.packages) ? m.packages : []).filter((p) => AgentCore._validPkg(p)).slice(0, 60);
     try {
       if (!(await this._userExists(serial, uid))) return this._rpcReply(ws, m, { ok: false, state: 'profile_not_found', error: 'PROFILE_NOT_FOUND' });
       const installed = {};
@@ -2000,9 +2030,13 @@ class AgentCore extends EventEmitter {
     const pkg = String(m.package || '');
     try {
       if (!pkg) return this._rpcReply(ws, m, { ok: false, state: 'launch_failed', error: 'no package' });
+      // v0.5.16: a package name and nothing else may reach the phone's shell (see checkAppsInstalled)
+      if (!AgentCore._validPkg(pkg)) return this._rpcReply(ws, m, { ok: false, state: 'launch_failed', error: 'not a package name' });
       if (!(await this._userExists(serial, uid))) return this._rpcReply(ws, m, { ok: false, state: 'profile_not_found', error: 'PROFILE_NOT_FOUND' });
       if (!(await this._pkgInstalledForUser(serial, uid, pkg))) return this._rpcReply(ws, m, { ok: false, state: 'app_not_installed', error: 'APP_NOT_INSTALLED' });
-      await this._waitUnlocked(serial, uid, 15000);
+      // 10 s, not more: the website gives this op 20 s (warm-up browsing 25 s), and a profile that
+      // stays locked (a PIN) must still get its honest "launch_failed" inside that.
+      await this._waitUnlocked(serial, uid, 10000);
       const { out } = await this._startApp(serial, uid, pkg);
       const ok = !/error|exception|not found|no activities|unable to resolve/i.test(out || '');
       this.emit('log', `launch_app (${serial}) user=${uid} ${pkg} -> ${ok ? 'opened' : 'failed'}`);
@@ -2014,11 +2048,15 @@ class AgentCore extends EventEmitter {
     const uid = parseInt(m.uid != null ? m.uid : 0, 10);
     const url = String(m.url || '');
     try {
-      if (!/^https?:\/\//i.test(url)) return this._rpcReply(ws, m, { ok: false, state: 'launch_failed', error: 'invalid url' });
+      // A link, whole, with no blank or control character in it (v0.5.16: those ended the argument).
+      if (!/^https?:\/\/[^\s\x00-\x1f\x7f]{1,4000}$/i.test(url)) return this._rpcReply(ws, m, { ok: false, state: 'launch_failed', error: 'invalid url' });
       if (!(await this._userExists(serial, uid))) return this._rpcReply(ws, m, { ok: false, state: 'profile_not_found', error: 'PROFILE_NOT_FOUND' });
+      await this._waitUnlocked(serial, uid, 10000);   // a profile just switched to cannot open anything until it has unlocked
       // Opens in the profile's default browser (its existing logged-in session). We never touch
       // cookies/credentials (spec §7).
-      const out = await this._adbLong(serial, ['shell', 'am', 'start', '-a', 'android.intent.action.VIEW', '-d', url, '--user', String(uid)], 10000);
+      // v0.5.16: the link goes to the phone's shell inside single quotes (_shq). Unquoted, the shell
+      // cut every link at its first "&" and ran the rest as a command - with adb's rights.
+      const out = await this._adbLong(serial, ['shell', 'am', 'start', '-a', 'android.intent.action.VIEW', '-d', this._shq(url), '--user', String(uid)], 10000);
       const ok = !/error|exception|no activities|unable/i.test(out || '');
       this.emit('log', `open_url (${serial}) user=${uid} -> ${ok ? 'opened' : 'failed'}`);
       this._rpcReply(ws, m, ok ? { ok: true, state: 'opened' } : { ok: false, state: 'launch_failed', error: (out || '').slice(0, 200) });
@@ -2120,6 +2158,7 @@ class AgentCore extends EventEmitter {
   async checkAccountStatus(serial, m, ws) {
     const uid = parseInt(m.uid != null ? m.uid : 0, 10);
     const pkg = String(m.package || 'com.instagram.android');
+    if (!AgentCore._validPkg(pkg)) return this._rpcReply(ws, m, { ok: false, status: 'APP_ERROR', error: 'not a package name' });   // v0.5.16: see checkAppsInstalled
     if (!this._checking) this._checking = new Set();
     // One status check per physical phone at a time (spec §27) — never two navigating the same device.
     if (this._checking.has(serial)) return this._rpcReply(ws, m, { ok: false, state: 'device_busy', status: 'UNKNOWN', error: 'another check in progress' });
@@ -2153,8 +2192,35 @@ class AgentCore extends EventEmitter {
   /** Is a live scrcpy/stream capture running on this phone (i.e. someone is watching it)? Human-priority
       abort signal for the diagnostic. */
   async _scrcpyRunning(serial) {
-    try { return /scrcpy|com\.genymobile\.scrcpy/i.test(await this._adbLong(serial, ['shell', 'ps', '-A'], 8000)); }
-    catch { return false; }
+    // v0.5.16. Until now this searched `adb shell ps -A` for the word "scrcpy". On this stack that
+    // can never be true AND could never be useful: the phone-side server is started as
+    // `app_process / com.genymobile.scrcpy.Server ...`, so ps lists it as "app_process"; and
+    // ws-scrcpy keeps it running on every connected phone whether or not anyone watches. The test
+    // answered "nobody" about 3,100 times during the 2026-11-10 account check, VAs on the phones
+    // included: "a person always wins" was written down and not enforced.
+    // The agent knows the truth itself: every live video a person opens on this phone comes through
+    // openTunnel(), marked by the backend (`watch: false` on open_stream). No adb call at all.
+    const set = this._personStreams && this._personStreams[serial];
+    if (!set || !set.size) return false;
+    // A socket that is closing or closed no longer counts, even if its close event never arrived:
+    // one lost event must not leave a phone "watched" (and refused by every check and post) forever.
+    for (const sock of [...set]) if (sock.readyState > 1) set.delete(sock);
+    return set.size > 0;
+  }
+  /** v0.5.16: is this stream a PERSON looking at the phone's screen? Only when the backend said so
+      (`watch: false` -> person === true) and the stream is the live video (`action=proxy-adb`), not
+      the device list (`action=multiplex`) the same viewer also opens. */
+  static _countsAsPerson(person, query) {
+    return person === true && /(^|&)action=proxy-adb(&|$)/.test(String(query || ''));
+  }
+  /** v0.5.16: remember a person's live video stream on a phone until its tunnel closes. */
+  _trackPerson(serial, sock) {
+    const all = this._personStreams || (this._personStreams = {});
+    const set = all[serial] || (all[serial] = new Set());
+    set.add(sock);
+    const gone = () => { set.delete(sock); };
+    sock.addEventListener('close', gone);
+    sock.addEventListener('error', gone);
   }
   /** The ACTUAL foreground resumed activity: { uid, pkg } or null. We never conclude multi-user from
       this alone — assessMultiUser() in ig-diagnose-logic weighs it against the foreground USER. */
@@ -2210,7 +2276,13 @@ class AgentCore extends EventEmitter {
       previous user id so the caller can put the phone back. */
   async _igSwitchTo(serial, uid, freshIp, log) {
     const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-    const before = (await this._adbLong(serial, ['shell', 'am', 'get-current-user'], 6000).catch(() => '')).trim();
+    const current = async () => (await this._adbLong(serial, ['shell', 'am', 'get-current-user'], 6000).catch(() => '')).trim();
+    let before = await current();
+    if (!/^\d+$/.test(before)) { await wait(1000); before = await current(); }
+    // v0.5.16: a phone whose profile cannot be read is not moved. Until now a slow adb answer here
+    // (the Mac, 22 phones) meant "previous = nothing": the visit ran, and the phone was LEFT on the
+    // visited profile because nobody knew where to put it back.
+    if (!/^\d+$/.test(before)) throw new Error('could not read which profile the phone is on (adb gave no answer) - nothing was switched');
     if (before === String(uid)) { log(`already on profile ${uid}`); return before; }
     await this._adbLong(serial, ['shell', 'am', 'switch-user', String(uid)], 12000).catch(() => {});
     await wait(2500);
@@ -2257,6 +2329,11 @@ class AgentCore extends EventEmitter {
       if (!(await this._pkgInstalledForUser(serial, uid, pkg))) return reply({ ok: false, state: 'app_not_installed', error: 'Instagram is not installed in this profile' });
       // 1) the profile
       previous = await this._igSwitchTo(serial, uid, m.fresh_ip !== false, log);
+      // v0.5.16: nothing works in a profile that has not finished unlocking - not the gallery push
+      // below (that profile's media store), not the sound link, not the launch. Wait for it HERE,
+      // once, before any of them (it sat in front of the plain launch only, until the review).
+      await this._waitUnlocked(serial, uid, 30000, log);
+      if (await viewerOpened()) return reply({ ok: false, state: 'device_busy', error: 'a viewer opened during the post' });
       // 2) the clip, into THIS profile's gallery (newest item = what the gallery step picks)
       let landed = '';
       // The backend names the file by PATH; this computer adds its own device token (the same one
@@ -2274,18 +2351,19 @@ class AgentCore extends EventEmitter {
       if (await viewerOpened()) return reply({ ok: false, state: 'device_busy', error: 'a viewer opened during the post' });
       // 3) Instagram, in this profile: straight to the audio page when the job carries one
       const audio = String(m.audio_url || '').trim();
-      if (audio && /^https?:\/\/(www\.)?instagram\.com\//i.test(audio)) {
+      if (audio && /^https?:\/\/(www\.)?instagram\.com\/[^\s\x00-\x1f\x7f]*$/i.test(audio)) {
         // The link is opened INSIDE Instagram only (v0.5.14). Until 0.5.13 a failed open fell back to
         // a plain VIEW, which a phone gives to its browser: on 2026-11-08 the sound link landed in
         // Vanadium and the post failed at "audio-page". Now: a VIEW addressed to Instagram's package
         // (Android picks its link handler), else its handler activity by name, else stop here.
         const bad = (r) => /error|exception|unable|does not exist|no activity/i.test(String(r));
-        let r = await this._adbLong(serial, ['shell', 'am', 'start', '--user', String(uid), '-a', 'android.intent.action.VIEW', '-d', audio, '-p', pkg], 10000).catch((e) => 'Error ' + e);
-        if (bad(r)) r = await this._adbLong(serial, ['shell', 'am', 'start', '--user', String(uid), '-n', `${pkg}/com.instagram.url.UrlHandlerActivity`, '-d', audio], 10000).catch((e) => 'Error ' + e);
+        // v0.5.16: the link travels inside single quotes (_shq). A sound link with "&" in it used to
+        // be cut at the "&" by the phone's shell, and what followed was run as a command.
+        let r = await this._adbLong(serial, ['shell', 'am', 'start', '--user', String(uid), '-a', 'android.intent.action.VIEW', '-d', this._shq(audio), '-p', pkg], 10000).catch((e) => 'Error ' + e);
+        if (bad(r)) r = await this._adbLong(serial, ['shell', 'am', 'start', '--user', String(uid), '-n', `${pkg}/com.instagram.url.UrlHandlerActivity`, '-d', this._shq(audio)], 10000).catch((e) => 'Error ' + e);
         if (bad(r)) throw new Error('Instagram would not open the sound link: ' + String(r).trim().slice(0, 160));
         log('opened the audio link in Instagram');
       } else {
-        await this._waitUnlocked(serial, uid, 30000, log);
         await this._startApp(serial, uid, pkg);
       }
       await wait(4000);
@@ -2441,56 +2519,87 @@ class AgentCore extends EventEmitter {
   }
   /** Step 3: up to 15 s for the switch to finish - the profile's own screen resumed (user u<uid>)
       and nothing on top of it. Never fails the check: the launch below verifies again. */
-  async _checkSettle(serial, uid, guard, log) {
+  async _checkSettle(serial, uid, guard, log, trace) {
     const t0 = Date.now();
     let last = '';
+    // v0.5.16: what was in front when the wait ended goes into the reply's trace (see _checkLaunch).
+    // Note what it can and cannot tell: "u12 com.android.settings" here is Android's placeholder
+    // home screen (FallbackHome), shown while profile 12 is still LOCKED - the switch has reached
+    // the screen, the profile cannot open an app yet. Only _waitUnlocked knows that.
+    const done = (ok) => { if (trace) trace.push({ name: 'settle', ok, matched: (last || 'nothing seen').slice(0, 118), ms: Date.now() - t0 }); return ok; };
     while (Date.now() - t0 < 15000) {
       const f = await this._checkFront(serial);
       const r = f.resumed;
       const seen = `${r ? 'u' + r.uid + ' ' + r.pkg : 'nothing resumed'}${f.keyguard ? ', lock screen up' : ''}`;
       if (seen !== last) { log(`settle: ${seen}`); last = seen; }
-      if (r && r.uid === uid && !f.keyguard) return true;
+      if (r && r.uid === uid && !f.keyguard) return done(true);
       await guard();
       if (f.keyguard) await this._checkUnlock(serial, guard);
       else await new Promise((res) => setTimeout(res, 1000));
       await guard();
     }
     log(`settle: still "${last}" after 15 s - carrying on, the launch checks for itself`);
-    return false;
+    return done(false);
   }
   /** Step 4: start Instagram in this profile and make sure it is REALLY in front: the resumed
       activity is Instagram's for this user, or the screen dump is Instagram's (Android's own
       "Allow Instagram to send you notifications?" counts - the visit answers it). Three tries. */
-  async _checkLaunch(serial, uid, pkg, guard, log) {
+  async _checkLaunch(serial, uid, pkg, guard, log, trace = []) {
     const wait = (ms) => new Promise((r) => setTimeout(r, ms));
     const ours = (p) => p === pkg || /permissioncontroller/.test(String(p || ''));
+    // What the wait and each try did ALSO goes into the reply's trace: the backend keeps it per
+    // profile and Monitoring shows it under "What the phone saw". The 672 failures of 2026-11-10
+    // came back with an empty trace and a home screen, so their cause had to be worked out from
+    // how long they took. Package names, profile numbers and Android's own words only - nothing of
+    // an account.
+    const t0 = Date.now();
+    const note = (name, ok, matched) => { const e = { name, ok: !!ok, matched: String(matched).slice(0, 118), ms: Date.now() - t0 }; trace.push(e); return e; };
     // v0.5.16: a profile just switched to may still be locked - nothing launches until it unlocks.
-    await this._waitUnlocked(serial, uid, 30000, log);
+    const st = await this._waitUnlocked(serial, uid, 30000, log, guard);
+    note('unlock', st === 'RUNNING_UNLOCKED' || st == null, `${st || 'state unknown'} after ${Math.round((Date.now() - t0) / 1000)} s`);
     await guard();
     for (let attempt = 1; attempt <= 3; attempt++) {
       if (attempt > 1) { await guard(); await this._adbLong(serial, ['shell', 'input', 'keyevent', '3'], 5000).catch(() => {}); await wait(1500); }
       await guard();
-      let how, out;
-      const icon = attempt === 3 ? igcheck.launcherIconTarget(igpost.parseDump(await this._checkDump(serial)), 'Instagram') : null;
-      if (icon) {   // the last try: the icon on the home screen, as a person opens it
-        await guard();
+      let how, shown, out, icon = null;
+      if (attempt === 3) {
+        // The last try: the icon on the home screen, as a person opens it. ONLY when Android says
+        // the screen in front is the TARGET profile's: a tap goes to whatever is in front, and if
+        // a switch was accepted but never reached the screen, that is another profile's home and
+        // another profile's Instagram - which would then be read and stored under this profile
+        // (review 2026-11-10). The start commands above cannot do that: they carry --user N.
+        const home = await this._checkFront(serial);
+        if (home.resumed && home.resumed.uid === uid && !home.keyguard) {
+          icon = igcheck.launcherIconTarget(igpost.parseDump(await this._checkDump(serial)), 'Instagram');
+        }
+        await guard();   // those looks took seconds: nobody may have opened the phone since
+      }
+      if (icon) {
         out = await this._adbLong(serial, ['shell', 'input', 'tap', String(icon.x), String(icon.y)], 8000).catch((e) => 'Error: ' + ((e && e.message) || e));
-        how = `icon at ${icon.x},${icon.y}`;
+        how = shown = `icon at ${icon.x},${icon.y}`;
         await wait(2000);
       } else {
         const r = await this._startApp(serial, uid, pkg, 25000);
-        out = r.out; how = r.comp || 'MAIN/LAUNCHER intent';
+        out = r.out; shown = r.comp || 'MAIN/LAUNCHER intent'; how = r.comp ? 'component' : 'MAIN/LAUNCHER intent';
       }
-      const said = [/Status: \w+/, /LaunchState: \w+/, /TotalTime: \d+/, /Error[^\n]*/].map((re) => (re.exec(out) || [''])[0]).filter(Boolean).join(', ');
-      log(`launch ${attempt}/3 (${how}): ${said || String(out).split('\n')[0].slice(0, 120)}`);
+      const said = [/Status: \w+/, /LaunchState: \w+/, /TotalTime: \d+/, /Error[^\n]*/].map((re) => (re.exec(out) || [''])[0]).filter(Boolean).join(', ')
+        || String(out).split('\n')[0].slice(0, 120);
+      log(`launch ${attempt}/3 (${shown}): ${said}`);
+      const tried = note(`launch ${attempt}/3`, false, `${how}${said ? ': ' + said : ''}`);
       for (let i = 0; i < 4; i++) {
         await wait(1500);
         await guard();
         const f = await this._checkFront(serial);
-        if (f.resumed && f.resumed.uid === uid && ours(f.resumed.pkg) && !f.keyguard) { log(`Instagram in front (u${uid}, ${f.resumed.pkg})`); return true; }
+        if (f.resumed && f.resumed.uid === uid && ours(f.resumed.pkg) && !f.keyguard) { tried.ok = true; log(`Instagram in front (u${uid}, ${f.resumed.pkg})`); return true; }
         const pk = igpost.screenPkg(igpost.parseDump(await this._checkDump(serial)));
-        if (ours(pk)) { log(`Instagram in front (screen: ${pk})`); return true; }
-        if (i === 3) log(`not in front: resumed ${f.resumed ? 'u' + f.resumed.uid + ' ' + f.resumed.pkg : '?'}, screen ${pk || 'unreadable'}${f.keyguard ? ', lock screen up' : ''}`);
+        // The screen's package alone decides only while Android does not name ANOTHER profile in
+        // front: an Instagram that belongs to someone else's profile is not the one to read.
+        if (ours(pk) && !(f.resumed && f.resumed.uid !== uid)) { tried.ok = true; log(`Instagram in front (screen: ${pk})`); return true; }
+        if (i === 3) {
+          const where = `resumed ${f.resumed ? 'u' + f.resumed.uid + ' ' + f.resumed.pkg : '?'}, screen ${pk || 'unreadable'}${f.keyguard ? ', lock screen up' : ''}`;
+          log(`not in front: ${where}`);
+          note('front', false, where);
+        }
         if (f.keyguard) await this._checkUnlock(serial, guard);   // seconds after the last guard: it checks again itself
       }
     }
@@ -2589,9 +2698,13 @@ class AgentCore extends EventEmitter {
     const previous = await this._igSwitchTo(serial, uid, false, log);
     setPrevious(previous);
     await guard();
-    await this._checkSettle(serial, uid, guard, log);
-    if (!(await this._checkLaunch(serial, uid, pkg, guard, log))) {
-      const out = { ok: true, state: 'unreadable', status: 'UNKNOWN', why: 'ig_not_in_front' };
+    // v0.5.16: how the start went (what was in front after the switch, the profile's lock state and
+    // how long the wait for it took, what Android answered to each launch try) heads the reply's
+    // trace, for a good read and a failed one alike. On Monitoring: Details -> What the phone saw.
+    const started = [];
+    await this._checkSettle(serial, uid, guard, log, started);
+    if (!(await this._checkLaunch(serial, uid, pkg, guard, log, started))) {
+      const out = { ok: true, state: 'unreadable', status: 'UNKNOWN', why: 'ig_not_in_front', trace: started };
       const nodes = igpost.parseDump(await this._checkDump(serial));
       if (nodes.length) out.screens = [{ at: 'not_in_front', pkg: igpost.screenPkg(nodes), ...igpost.describe(nodes, '') }];
       if (m.shot) await shotInto(out);
@@ -2607,6 +2720,9 @@ class AgentCore extends EventEmitter {
     });
     if (r.aborted) { delete r.aborted; log('a viewer opened the phone - stopped'); return Object.assign(r, { ok: false, state: 'device_busy', status: 'UNKNOWN', why: 'viewer_opened' }); }
     const out = Object.assign({ ok: true }, r);
+    // The backend keeps 80 trace entries. The start comes first; of a longer visit the LAST steps
+    // stay (where it stopped is what gets looked at).
+    out.trace = started.concat((Array.isArray(out.trace) ? out.trace : []).slice(-(80 - started.length)));
     if (m.shot && out.state !== 'checked') await shotInto(out);
     const a = out.accounts[0];
     log(`-> ${out.state} / ${out.status}${out.username ? ' @' + out.username : ''}${a && a.followers != null ? ', ' + a.followers + ' followers' : ''}`

@@ -10,6 +10,7 @@
     "dev": "electron .",
     "core": "node agent.js",
     "webrtc-diagnose": "node tools/webrtc-diagnose.js",
+    "test": "node tools/run-all-tests.js",
     "test:rtp": "node tools/test_rtp.js && node tools/test_h265_rtp.js",
     "test:webrtc": "node tools/test_webrtc_negotiation.js && node tools/test_webrtc_switch.js",
     "test:freeze": "node tools/test-nonblocking.js && node tools/test-freeze-paths.js",

@@ -47,7 +47,8 @@ const SLOTS = ['12a', '3a', '6a', '9a', '12p', '3p', '6p', '9p'];   // the eight
 const AGES = ['13-17', '18-24', '25-34', '35-44', '45-54', '55-64', '65+'];
 
 // Time limits of the visit (driver time, ms). The backend waits 300 s for the whole op; core.js
-// spends up to ~40 s on the switch, settle and launch, so the visit itself ends by DEFAULT_BUDGET.
+// spends up to ~70 s on the switch, settle, the wait for the profile to unlock (v0.5.16, up to 30 s)
+// and the launch, and hands the visit what is left of 250 s (never less than 60 s).
 const LOOP_MS = 45000;           // step 5: from launch to a usable Instagram screen
 const PROFILE_WAIT_MS = 10000;   // step 6: the header after tapping the profile tab
 const INSIGHTS_MS = 120000;      // step 7: dashboard + Overview + Audience
@@ -354,7 +355,13 @@ function isLogin(nodes) {
   const strong = has(nodes, /^log into another account$/i) || has(nodes, /^(continue|log in) as @?[a-z0-9._]+$/i);
   const extra = has(nodes, /^forgot (your )?password\??$/i) || has(nodes, /^(create new account|sign up|create account)$/i)
     || has(nodes, /^switch accounts?$/i) || has(nodes, /^add account$/i);
-  return strong || (btn && (field || extra));
+  // v0.5.16: Meta's newer logged-out screen, the "profiles" chooser. No "Log in" button and no field:
+  // the saved profiles as rows (or one profile with "Continue"), then "Use another profile" and
+  // "Create new account". Both shapes are from the farm's own 2026-11-10 run ((5) Valentina no. 17,
+  // (20) Valentina 2 no. 21), where they ended "couldn't read". "Continue" is never tapped: a login
+  // screen stops the visit as logged out before any pop-up rule looks at it.
+  const chooser = has(nodes, /^use another profile$/i) && (has(nodes, /^create new account$/i) || has(nodes, /^continue$/i) || btn);
+  return strong || chooser || (btn && (field || extra));
 }
 // The accounts sheet. Checked BEFORE the login screen: a sheet that also offers "Log into another
 // account" must never read as a logged-out account. "Add account" alone counts only without a
@@ -522,7 +529,10 @@ function parseLoginRemembered(nodesIn) {
       const m = /^(?:continue as|log in as|log into|switch to)\s+@?([a-z0-9._]{2,30})$/i.exec(s);
       if (m) add(m[1]);
       else if (!/EditText/.test(n.cls) || (n.text && !is(n, /username|email|mobile|phone|password/i))) {
-        if (HANDLE.test(s.replace(/^@/, '')) && !/^(log|sign|create|forgot)/i.test(s)) add(s);
+        // A button's own word is not an account ("Continue" on the profiles chooser, v0.5.16). Whole
+        // words only: until 0.5.16 this dropped every username that merely BEGAN with log / sign /
+        // create / forgot ("logan.xo"). Labels of several words never pass HANDLE anyway.
+        if (HANDLE.test(s.replace(/^@/, '')) && !/^(continue|login|signup|create|forgot)$/i.test(s.trim())) add(s);
       }
     }
   }
@@ -1119,7 +1129,10 @@ async function interrupt(ctx, nodes, c) {
       return true;
     }
     case 'launcher': {
-      if (k.launch >= MAX_LAUNCH || !ctx.driver.launch) { ctx.shot('launcher', nodes, true); stop(ctx, 'unreadable', 'UNKNOWN', 'ig_not_in_front'); }
+      // v0.5.16: its own reason. "ig_not_in_front" now means one thing only: Instagram never came up
+      // after the switch (core.js _checkLaunch). This is the other case: it WAS up, the visit was
+      // under way, and the phone ended on the home screen more often than a re-launch could mend.
+      if (k.launch >= MAX_LAUNCH || !ctx.driver.launch) { ctx.shot('launcher', nodes, true); stop(ctx, 'unreadable', 'UNKNOWN', 'ig_closed_during_read'); }
       k.launch++;
       await ctx.viewer(false);
       await ctx.driver.launch();
@@ -1587,7 +1600,11 @@ function launcherIconTarget(nodes, label) {
   const list = nodes || [];
   const pkg = (list.find((n) => n.pkg) || {}).pkg || '';
   if (!/launcher|quickstep/i.test(pkg)) return null;
+  // An ICON: something the launcher itself says can be tapped, and not a folder that happens to be
+  // named after the app (its tap opens the folder, and the profile would read "couldn't read" every
+  // morning). A bare label that is not tappable is not an icon either.
   const hit = list.find((n) => n.bounds && n.bounds.r > n.bounds.l && n.bounds.b > n.bounds.t
+    && n.clickable !== false && !/folder/i.test(String(n.id || '')) && !/folder/i.test(String(n.cls || ''))
     && [n.text, n.desc].some((v) => String(v || '').trim().toLowerCase() === want));
   return hit ? { x: hit.cx, y: hit.cy } : null;
 }

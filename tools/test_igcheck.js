@@ -229,6 +229,19 @@ const LOGIN_FORM = screen(T('English (US)', 416, 290, 612, 330), T('', 42, 1000,
   T('Forgot password?', 360, 1440, 720, 1490, { click: true }), T('Create new account', 42, 2100, 1038, 2200, B), D('Meta', 460, 2250, 620, 2300));
 const LOGIN_SAVED = screen(D('Profile picture', 400, 700, 680, 980), T('urfavekadiee', 380, 1010, 700, 1060), T('Log in', 42, 1120, 1038, 1230, B),
   T('Log into another account', 42, 1260, 1038, 1370, B), T('Create new account', 42, 2100, 1038, 2200, B), D('Meta', 460, 2250, 620, 2300));
+// v0.5.16: Meta's "profiles" chooser - logged out, but no "Log in" button and no field. The texts are
+// what two farm phones showed in the 2026-11-10 run, where both ended "couldn't read":
+// (5) Valentina no. 17 (several saved profiles, one already "Instagram user") and (20) Valentina 2
+// no. 21 (one saved profile with "Continue").
+const LOGIN_PROFILES = screen(D('Settings', 960, 150, 1040, 230, { click: true }),
+  T('val.inbloom1', 250, 700, 800, 760, { click: true }), T('Instagram user', 250, 880, 800, 940, { click: true }),
+  T('val2hot2handle', 250, 1060, 800, 1120, { click: true }), T('valnightdrive', 250, 1240, 800, 1300, { click: true }),
+  T('Use another profile', 42, 1900, 1038, 2010, B), T('Create new account', 42, 2040, 1038, 2150, B), D('Meta logo', 460, 2250, 620, 2300));
+const LOGIN_ONE = screen(D('Settings', 960, 150, 1040, 230, { click: true }), T('Instagram from Meta', 300, 300, 780, 350),
+  D('val2best, profile photo', 400, 700, 680, 980), T('val2best', 380, 1010, 700, 1060), T('Continue', 42, 1120, 1038, 1230, B),
+  T('Use another profile', 42, 1260, 1038, 1370, B), T('Create new account', 42, 2040, 1038, 2150, B), D('Meta logo', 460, 2250, 620, 2300));
+const LOGIN_LOGAN = screen(D('Profile picture', 400, 700, 680, 980), T('logan.xo', 380, 1010, 700, 1060), T('Log in', 42, 1120, 1038, 1230, B),
+  T('Log into another account', 42, 1260, 1038, 1370, B), T('Create new account', 42, 2100, 1038, 2200, B));
 const CHALLENGE = screen(T('Confirm it\'s you', 43, 300, 700, 360), T('We noticed unusual activity on your account. Enter the 6-digit code we sent to your email.', 43, 400, 1037, 520),
   T('', 43, 600, 1037, 700, { cls: 'android.widget.EditText' }), T('Continue', 42, 2100, 1038, 2200, B));
 const ACTION_BLOCKED = screen(T('Action Blocked', 140, 900, 940, 960), T('This action was blocked. Please try again later. We restrict certain activity to protect our community.', 140, 980, 940, 1120),
@@ -326,6 +339,13 @@ const kind = (xml) => ck.classifyScreen(P(xml)).kind;
   }
   check('login screens: the accounts they still offer', [ck.parseLoginRemembered(P(LOGIN_SAVED)), ck.parseLoginRemembered(P(LOGIN_FORM)), ck.classifyScreen(P(LOGIN_SAVED)).detail.remembered],
     [['urfavekadiee'], [], ['urfavekadiee']]);
+  check('v0.5.16 the "profiles" chooser (no Log in button) is a login screen: several saved profiles / one with "Continue"',
+    [ck.classifyScreen(P(LOGIN_PROFILES)).kind, ck.classifyScreen(P(LOGIN_PROFILES)).detail.remembered, ck.classifyScreen(P(LOGIN_ONE)).kind, ck.classifyScreen(P(LOGIN_ONE)).detail.remembered],
+    ['login', ['val.inbloom1', 'val2hot2handle', 'valnightdrive'], 'login', ['val2best']]);
+  check('...a button\'s word is not an account, and a username that only BEGINS with log / sign / create / forgot is one',
+    [ck.parseLoginRemembered(P(LOGIN_ONE)).includes('continue'), ck.parseLoginRemembered(P(LOGIN_LOGAN))], [false, ['logan.xo']]);
+  check('..."Use another profile" alone (no Continue, no Create new account, no Log in) is not enough to call a screen a login',
+    ck.classifyScreen(P(screen(T('Use another profile', 42, 1260, 1038, 1370, B), T('Something else', 42, 300, 600, 360)))).kind === 'login', false);
 
   // ---------- 6. dashboard + Overview ----------
   check('d1_dashboard: period, Views 44.3K, New followers 0, Content you shared 10', ck.parseDashboard(P(DASH_K), '2026-11-08'),
@@ -448,6 +468,14 @@ const kind = (xml) => ck.classifyScreen(P(xml)).kind;
       ck.launcherIconTarget(home('com.android.launcher3', 'Instagram Lite'), 'Instagram'),
       ck.launcherIconTarget(home('com.instagram.android', 'Instagram'), 'Instagram'),
       ck.launcherIconTarget([], 'Instagram')],
+    [{ x: 140, y: 1090 }, null, null, null]);
+    const L = 'com.android.launcher3', box = { l: 60, t: 980, r: 220, b: 1200 };
+    const one = (x) => [{ pkg: L, text: '', desc: '', bounds: { l: 0, t: 0, r: 1080, b: 2400 }, cx: 540, cy: 1200 }, Object.assign({ pkg: L, text: '', desc: '', bounds: box, cx: 140, cy: 1090 }, x)];
+    check('launcher icon: an icon named only by its description counts; a label that cannot be tapped, a folder named Instagram and a folder class do not', [
+      ck.launcherIconTarget(one({ desc: 'Instagram', clickable: true }), 'Instagram'),
+      ck.launcherIconTarget(one({ text: 'Instagram', clickable: false }), 'Instagram'),
+      ck.launcherIconTarget(one({ text: 'Instagram', clickable: true, id: 'com.android.launcher3:id/folder_icon_name' }), 'Instagram'),
+      ck.launcherIconTarget(one({ text: 'Instagram', clickable: true, cls: 'com.android.launcher3.folder.FolderIcon' }), 'Instagram')],
     [{ x: 140, y: 1090 }, null, null, null]);
   }
 
@@ -623,6 +651,21 @@ const kind = (xml) => ck.classifyScreen(P(xml)).kind;
     const r2 = await run(phone({ s: { xml: LOGIN_SAVED } }, 's'));
     check('login form / saved login: logged_out / LOGIN_REQUIRED (+ remembered), "Log in" never tapped', [r.state, r.status, r.remembered, r2.status, r2.remembered],
       ['logged_out', 'LOGIN_REQUIRED', [], 'LOGIN_REQUIRED', ['urfavekadiee']]);
+  }
+  {
+    // v0.5.16: the two logged-out screens of the 2026-11-10 run that ended "couldn't read"
+    const F1 = phone({ s: { xml: LOGIN_PROFILES } }, 's'), F2 = phone({ s: { xml: LOGIN_ONE } }, 's');
+    const r1 = await run(F1), r2 = await run(F2);
+    check('the profiles chooser: logged_out / LOGIN_REQUIRED with the profiles it offers; nothing tapped - not a row, not "Continue", not "Use another profile"',
+      [r1.state, r1.status, r1.remembered, F1.taps.length, r2.state, r2.status, r2.remembered, F2.taps.length],
+      ['logged_out', 'LOGIN_REQUIRED', ['val.inbloom1', 'val2hot2handle', 'valnightdrive'], 0, 'logged_out', 'LOGIN_REQUIRED', ['val2best'], 0]);
+  }
+  {
+    // v0.5.16: Instagram WAS up, and the phone keeps ending on the home screen - its own reason, so
+    // that "ig_not_in_front" means the launch after the switch and nothing else
+    const F = phone({ home: { xml: LAUNCHER, launch: 'home' } }, 'home');
+    const r = await run(F);
+    check('home screen again and again during the read: unreadable / ig_closed_during_read after two re-launches (not ig_not_in_front)', [r.state, r.why, F.launched], ['unreadable', 'ig_closed_during_read', 2]);
   }
   for (const [xml, status, name] of [[CHALLENGE, 'CHALLENGE_REQUIRED', '"Confirm it\'s you"'], [ACTION_BLOCKED, 'CHECKPOINT', '"Action Blocked"'],
     [SUSPENDED, 'SUSPENDED', '"We suspended your account"'], [DISABLED, 'DISABLED', '"Your account has been disabled"']]) {
@@ -981,6 +1024,17 @@ const kind = (xml) => ck.classifyScreen(P(xml)).kind;
       core.emit = (ev, msg) => { if (ev === 'log') core.logs.push(String(msg)); };
       core._sendMeta = () => {};
       core._adbBinary = async () => Buffer.from('PNG');
+      // v0.5.16: who is watching is no longer read from `ps -A` (it never saw anyone - see
+      // _scrcpyRunning) but from the live streams the agent itself relays for people. `s.viewer`
+      // puts one open stream on whichever phone is asked about; every ask is recorded as "viewer?",
+      // and `s.viewerAfterAsks = n` makes someone open the phone at ask n+1.
+      let asks = 0;
+      core._personStreams = new Proxy({}, { get: (_t, serial) => {
+        if (typeof serial !== 'string') return undefined;
+        calls.push('viewer?');
+        if (s.viewerAfterAsks != null && ++asks > s.viewerAfterAsks) s.viewer = true;
+        return s.viewer ? new Set([{ readyState: 1 }]) : undefined;
+      } });
       core._adbLong = async (serial, args) => {
         const cmd = args.join(' ');
         calls.push(cmd);
@@ -991,20 +1045,30 @@ const kind = (xml) => ck.classifyScreen(P(xml)).kind;
         if ((mm = /am switch-user (\d+)/.exec(cmd))) { s.user = mm[1]; launched = false; return ''; }
         if (/dumpsys activity activities/.test(cmd)) {
           const top = launched && s.inFront ? 'com.instagram.android/com.instagram.mainactivity.InstagramMainActivity' : 'com.android.launcher3/.uioverrides.QuickstepLauncher';
-          return `  topResumedActivity=ActivityRecord{1f u${s.user} ${top} t7}\n  mKeyguardShowing=false`;
+          // `screenUser`: the switch was accepted (am get-current-user says N) but ANOTHER profile is still on the screen
+          return `  topResumedActivity=ActivityRecord{1f u${s.screenUser != null ? s.screenUser : s.user} ${top} t7}\n  mKeyguardShowing=false`;
         }
         // v0.5.16: a profile still LOCKED for its first `lockedPolls` state polls resolves no launcher
-        if (/am get-started-user-state/.test(cmd)) { if (s.lockedPolls > 0) { s.lockedPolls--; return 'RUNNING_LOCKED'; } return 'RUNNING_UNLOCKED'; }
-        if (/resolve-activity/.test(cmd)) return s.lockedPolls > 0 ? 'No activity found' : 'priority=0 preferredOrder=0\ncom.instagram.android/com.instagram.mainactivity.LauncherActivity';
-        if (/am start -W --user \d+ -a android\.intent\.action\.MAIN/.test(cmd)) { if (s.lockedPolls > 0) return 'Error: Activity not started, unable to resolve Intent'; launched = true; return 'Status: ok\nComplete'; }
+        // `notStarted`: a profile that is not running and that nobody is starting (open app aimed at it)
+        // `states` = what a real cold start reports, in order (BOOTING, RUNNING_LOCKED, RUNNING_UNLOCKING); `stateUnknown` = adb gave nothing
+        const stillLocked = () => s.lockedPolls > 0 || s.notStarted || s.resolveMisses > 0 || s.lockedForever || (s.states || []).some((x) => x === 'BOOTING' || x === 'RUNNING_LOCKED');
+        // a failed start as real adb reports it: a rejection that carries Android's words (on stdout with -W, on stderr without)
+        const failStart = (words, wait) => { if (!s.rejects) return words; const e = new Error(wait ? 'Command failed: C:\\adb\\adb.exe -s SER ' + cmd : words); e.stdout = wait ? words : ''; e.stderr = wait ? '' : words; throw e; };
+        if (/am get-started-user-state/.test(cmd)) { if (s.stateUnknown) return ''; if (s.notStarted) return 'User is not started: 12'; if (s.states && s.states.length) return s.states.shift(); if (s.lockedForever) return 'RUNNING_LOCKED'; if (s.lockedPolls > 0) { s.lockedPolls--; return 'RUNNING_LOCKED'; } return 'RUNNING_UNLOCKED'; }
+        if (/dumpsys user/.test(cmd) && s.dumpsysStates) { const st = s.dumpsysStates.length > 1 ? s.dumpsysStates.shift() : s.dumpsysStates[0]; if (st === 'RUNNING_UNLOCKED') s.lockedForever = false; return 'Current user: 12\n\nUsers:\n  UserInfo{0:Owner:c13} serialNo=0 isPrimary=true\n    Type: android.os.usertype.full.SYSTEM\n    State: RUNNING_UNLOCKED\n    Created: <unknown>\n  UserInfo{11:Profile 2:410} serialNo=13 isPrimary=false\n    State: -1\n  UserInfo{12:Profile 3:410} serialNo=14 isPrimary=false\n    Type: android.os.usertype.full.SECONDARY\n    State: ' + st + '\n    Created: +2d1h ago\n\nDevice properties:\n  Started users state: [0=RUNNING_UNLOCKED, 12=' + st + ']\n'; }
+        if (/resolve-activity/.test(cmd)) { if (s.resolveMisses > 0) { s.resolveMisses--; s.missed = true; return 'No activity found'; } s.missed = false; return stillLocked() ? 'No activity found' : 'priority=0 preferredOrder=0\ncom.instagram.android/com.instagram.mainactivity.LauncherActivity'; }
+        if (/am start --user \d+ -a android\.intent\.action\.MAIN/.test(cmd)) return failStart('Error: Activity not started, unable to resolve Intent { act=android.intent.action.MAIN cat=[android.intent.category.LAUNCHER] flg=0x10000000 pkg=com.instagram.android }', false);
+        if (/am start --user \d+ -n/.test(cmd)) { launched = true; return 'Starting: Intent { cmp=com.instagram.android/.mainactivity.LauncherActivity }'; }
+        if (/am start -W --user \d+ -a android\.intent\.action\.MAIN/.test(cmd)) { if (stillLocked() || s.missed) return failStart('Error: Activity not started, unable to resolve Intent', true); launched = true; return 'Status: ok\nComplete'; }
         if (/am start -W --user \d+ -n/.test(cmd)) { if (s.amStartDead) return 'Status: ok\nComplete'; launched = true; return 'Starting: Intent { cmp=com.instagram.android/... }\nStatus: ok\nLaunchState: COLD\nTotalTime: 1180\nComplete'; }
         if (/uiautomator dump/.test(cmd)) return 'UI hierchary dumped to: /sdcard/pd_check.xml';
-        if (/cat \/sdcard\/pd_check\.xml/.test(cmd)) return launched && s.inFront ? F.dump() : (s.amStartDead ? LAUNCHER_IG : LAUNCHER);
+        if (/cat \/sdcard\/pd_(check|ui)\.xml/.test(cmd)) return launched && s.inFront ? F.dump() : (s.amStartDead ? LAUNCHER_IG : LAUNCHER);
         if (s.amStartDead && !launched && (mm = /input tap (\d+) (\d+)/.exec(cmd))) { if (Math.abs(+mm[1] - 151) < 60 && Math.abs(+mm[2] - 1150) < 80) launched = true; return ''; }
         if ((mm = /input tap (\d+) (\d+)/.exec(cmd))) { await F.tap(+mm[1], +mm[2]); return ''; }
         if ((mm = /input swipe (\d+) (\d+) (\d+) (\d+)/.exec(cmd))) { await F.swipe(+mm[1], +mm[2], +mm[3], +mm[4]); return ''; }
         if ((mm = /input keyevent (\w+)/.exec(cmd))) { if (mm[1] === '4') await F.key('back'); return ''; }
-        if (/ps -A/.test(cmd)) return s.viewer ? 'shell  4242  com.genymobile.scrcpy.Server' : 'root 1 init';
+        // what a farm phone really lists, viewer or not: ws-scrcpy's server runs always, named app_process
+        if (/ps -A/.test(cmd)) return 'USER PID PPID VSZ RSS WCHAN ADDR S NAME\nroot 1 0 1 1 0 0 S init\nshell 4242 1 1 1 0 0 S app_process';
         if (/date \+%F/.test(cmd)) return '2026-11-08';
         if (/wm size/.test(cmd)) return 'Physical size: 1080x2400';
         return '';
@@ -1026,7 +1090,8 @@ const kind = (xml) => ck.classifyScreen(P(xml)).kind;
         check('core: switched to 12, settled, launched with am start -W, then HOME + switched back to 0 - all BEFORE the reply',
           [iSwitch >= 0, calls.some((c) => /am start -W --user 12 -n com\.instagram\.android/.test(c)), iBack > iSwitch, iBack < iReply, calls.slice(0, iReply).includes('shell input keyevent KEYCODE_HOME'), replies.length],
           [true, true, true, true, true, 1]);
-        check('core: the viewer was asked before taps and after waits (ps -A)', calls.filter((c) => /ps -A/.test(c)).length > 10, true);
+        check('core: "is someone watching?" was asked before taps and after waits - from the agent\'s own streams, with no adb call',
+          [calls.filter((c) => c === 'viewer?').length > 10, calls.filter((c) => /ps -A/.test(c)).length], [true, 0]);
         check('core: every step logged', ['settle: u12 com.android.launcher3', 'Instagram in front', '-> checked / HEALTHY @urfavekadiee, 85 followers', 'restored profile 0']
           .map((x) => core.logs.some((l) => l.includes(x))), [true, true, true, true]);
         check('core: the job lock is released', core._posting.has('SER1'), false);
@@ -1071,6 +1136,34 @@ const kind = (xml) => ck.classifyScreen(P(xml)).kind;
         check('core: nothing calls monkey any more (it has no --user option)', calls.filter((c) => /monkey/.test(c)), []);
       }
       {
+        // A profile that never unlocks (someone set a PIN on it): the wait is bounded - one look a
+        // second for 30 s, here 30 looks - then the three tries, and the result says where it stopped.
+        const { core, calls, replies, ws } = makeCore(phone(KADIE, 'feed'), { lockedPolls: 1e9 });
+        await core.igCheck('SER14', { request_id: 'r14', uid: 12 }, ws);
+        check('core: a profile that never unlocks: 30 looks at its state, 3 tries by MAIN/LAUNCHER intent (no launcher resolves), then unreadable / ig_not_in_front',
+          [replies[0].state, replies[0].why, calls.filter((c) => /get-started-user-state 12/.test(c)).length,
+            calls.filter((c) => /am start -W --user 12 -a android\.intent\.action\.MAIN -c android\.intent\.category\.LAUNCHER -p com\.instagram\.android/.test(c)).length,
+            calls.filter((c) => /am start -W --user 12 -n/.test(c)).length, core.logs.some((l) => /profile 12: RUNNING_LOCKED after/.test(l))],
+          ['unreadable', 'ig_not_in_front', 30, 3, 0, true]);
+      }
+      {
+        // "Open app" (the website's button, MCP open_app, warm-up browsing) goes through the same wait.
+        // On the profile the phone is on: one look, then the launch. Aimed at a profile that is not
+        // running and that nobody is starting: three more looks, never the whole 15 s.
+        const a = makeCore(phone(KADIE, 'feed'));
+        await a.core.launchApp('SER15', { request_id: 'r15', uid: 12, package: 'com.instagram.android' }, a.ws);
+        const b = makeCore(phone(KADIE, 'feed'), { notStarted: true });
+        await b.core.launchApp('SER16', { request_id: 'r16', uid: 12, package: 'com.instagram.android' }, b.ws);
+        const c = makeCore(phone(KADIE, 'feed'), { lockedPolls: 3 });
+        await c.core.launchApp('SER17', { request_id: 'r17', uid: 12, package: 'com.instagram.android' }, c.ws);
+        const looks = (x) => x.calls.filter((k) => /get-started-user-state 12/.test(k)).length;
+        check('core: open app - unlocked profile: 1 look, opened by component; not-running profile: 4 looks, launch_failed with Android\'s words; unlocking profile: waited for, then opened',
+          [a.replies[0].ok, a.replies[0].state, looks(a), a.calls.some((k) => /am start --user 12 -n com\.instagram\.android/.test(k)),
+            b.replies[0].ok, b.replies[0].state, looks(b), /unable to resolve Intent/.test(b.replies[0].error || ''),
+            c.replies[0].ok, c.replies[0].state, looks(c)],
+          [true, 'opened', 1, true, false, 'launch_failed', 4, true, true, 'opened', 4]);
+      }
+      {
         // am start "works" but Instagram never shows: the third try taps the icon on the home screen
         const { core, calls, replies, ws } = makeCore(phone(KADIE, 'feed'), { amStartDead: true });
         await core.igCheck('SER13', { request_id: 'r13', uid: 12 }, ws);
@@ -1078,7 +1171,122 @@ const kind = (xml) => ck.classifyScreen(P(xml)).kind;
           [replies[0].state, calls.filter((c) => /am start -W --user 12 -n/.test(c)).length, calls.some((c) => /input tap 151 1150/.test(c)), core.logs.some((l) => /launch 3\/3 \(icon at 151,1150\)/.test(l))],
           ['checked', 2, true, true]);
       }
+
+      // ---- v0.5.16: checks written by the independent review of 2026-11-10 (mutation-tested) ----
       {
+        // R1: a real cold start reports BOOTING first, then RUNNING_LOCKED, then RUNNING_UNLOCKING
+        const { core, calls, replies, ws } = makeCore(phone(KADIE, 'feed'), { states: ['BOOTING', 'BOOTING', 'RUNNING_LOCKED', 'RUNNING_UNLOCKING'] });
+        await core.igCheck('R1', { request_id: 'R1', uid: 12 }, ws);
+        check('core: cold start BOOTING -> RUNNING_LOCKED -> RUNNING_UNLOCKING -> unlocked: waited through all of them, one launch by component, read',
+          [replies[0].state, calls.filter((c) => /get-started-user-state 12/.test(c)).length, calls.filter((c) => /am start -W --user 12 -n/.test(c)).length,
+            calls.filter((c) => /am start -W --user 12 -a/.test(c)).length], ['checked', 5, 1, 0]);
+      }
+      {
+        // R2: the phone cannot say the state (adb gave nothing) - no wait; the launcher is missing on try 1 and there on try 2
+        const { core, calls, replies, ws } = makeCore(phone(KADIE, 'feed'), { stateUnknown: true, resolveMisses: 1 });
+        await core.igCheck('R2', { request_id: 'R2', uid: 12 }, ws);
+        check('core: state unknown + no launcher on try 1: no wait (1 look), try 1 by MAIN/LAUNCHER intent fails, try 2 resolves FRESH and launches by component',
+          [replies[0].state, calls.filter((c) => /get-started-user-state 12/.test(c)).length, calls.filter((c) => /am start -W --user 12 -a android\.intent\.action\.MAIN/.test(c)).length,
+            calls.filter((c) => /am start -W --user 12 -n/.test(c)).length], ['checked', 1, 1, 1]);
+      }
+      {
+        // open app on a profile that never unlocks: the wait is 10 looks (10 s) - the website gives launch_app 20 s
+        const x = makeCore(phone(KADIE, 'feed'), { lockedPolls: 1e9 });
+        await x.core.launchApp('R3', { request_id: 'R3', uid: 12, package: 'com.instagram.android' }, x.ws);
+        check('core: open app, profile never unlocks: exactly 10 looks, then launch_failed', [x.replies[0].ok, x.replies[0].state, x.calls.filter((k) => /get-started-user-state 12/.test(k)).length], [false, 'launch_failed', 10]);
+      }
+      {
+        // R4: someone opens the phone while the third try reads the home screen: no tap on their screen
+        const env = makeCore(phone(KADIE, 'feed'), { amStartDead: true });
+        const realAdb = env.core._adbLong;
+        let homes = 0;
+        env.core._adbLong = async (serial, args, ms) => {
+          const cmd = args.join(' ');
+          if (/input keyevent 3$/.test(cmd)) homes++;
+          const r = await realAdb(serial, args, ms);
+          if (homes === 2 && /cat \/sdcard\/pd_check\.xml/.test(cmd)) env.s.viewer = true;   // the dump try 3 reads for the icon
+          return r;
+        };
+        await env.core.igCheck('R4', { request_id: 'R4', uid: 12 }, env.ws);
+        check('core: a viewer who opens the phone while try 3 looks for the icon gets no tap; device_busy / viewer_opened',
+          [env.replies[0].ok, env.replies[0].state, env.replies[0].why, env.calls.filter((c) => /input tap/.test(c))], [false, 'device_busy', 'viewer_opened', []]);
+      }
+      {
+        // R5: real adb REJECTS when am start exits 1 (stdout dropped with -W; stderr without) - the three tries must survive that
+        const a = makeCore(phone(KADIE, 'feed'), { lockedPolls: 1e9, rejects: true });
+        await a.core.igCheck('R5', { request_id: 'R5', uid: 12 }, a.ws);
+        const b = makeCore(phone(KADIE, 'feed'), { notStarted: true, rejects: true });
+        await b.core.launchApp('R5b', { request_id: 'R5b', uid: 12, package: 'com.instagram.android' }, b.ws);
+        check('core: am start that fails the way real adb fails (a rejection): still 3 tries and unreadable / ig_not_in_front; open app says launch_failed with Android\'s words',
+          [a.replies[0].ok, a.replies[0].state, a.replies[0].why, a.calls.filter((c) => /am start -W --user 12 -a/.test(c)).length, b.replies[0].state, /unable to resolve Intent/.test(b.replies[0].error || '')],
+          [true, 'unreadable', 'ig_not_in_front', 3, 'launch_failed', true]);
+        if (process.env.IGCHECK_TRACE) console.log(a.core.logs.filter((l) => /launch \d/.test(l)).map((l) => '      ' + l).join('\n'));
+      }
+      {
+        // R6: am get-started-user-state gives nothing, dumpsys user (real layout, "State: -1" for stopped users) says locked twice, then unlocked
+        const { core, calls, replies, ws } = makeCore(phone(KADIE, 'feed'), { stateUnknown: true, lockedForever: true, dumpsysStates: ['RUNNING_LOCKED', 'RUNNING_LOCKED', 'RUNNING_UNLOCKED'] });
+        await core.igCheck('R6', { request_id: 'R6', uid: 12 }, ws);
+        check('core: state read from dumpsys user when am cannot say: waited (3 dumpsys looks), then one launch by component',
+          [replies[0].state, calls.filter((c) => /dumpsys user/.test(c)).length, calls.filter((c) => /am start -W --user 12 -n/.test(c)).length], ['checked', 3, 1]);
+      }
+      
+      // ---- v0.5.16: the other ops the change touched (same review) ----
+      {
+        const { core, calls, replies, ws } = makeCore(phone(KADIE, 'feed'), { lockedPolls: 3 });
+        await core.igWhoami('R7', { request_id: 'R7', uid: 12 }, ws);
+        const iStart = calls.findIndex((c) => /am start --user 12 -n com\.instagram\.android/.test(c));
+        check('core: ig_whoami after a switch to a profile still locked: waits (4 looks), THEN starts Instagram for user 12 by component, finds the username, puts the phone back',
+          [replies[0].ok, replies[0].state, replies[0].username, calls.filter((c) => /get-started-user-state 12/.test(c)).length, iStart > calls.lastIndexOf('shell am get-started-user-state 12'),
+            calls.includes('shell am switch-user 0'), calls.filter((c) => /monkey|--user 0 /.test(c))], [true, 'found', 'urfavekadiee', 4, true, true, []]);
+      }
+      {
+        // on a virtual clock: igpost.run's 12 s step limit reads Date.now(), which never moves with instant timers (17 s of spinning otherwise)
+        const { core, calls, replies, ws } = makeCore(phone(KADIE, 'feed'), { lockedPolls: 2 });
+        const realNow = Date.now, instant = global.setTimeout; let clock = 1e9;
+        Date.now = () => clock; global.setTimeout = (fn, ms) => { clock += ms || 0; fn(); return 0; };
+        try { await core.igPost('R8', { request_id: 'R8', uid: 12, mode: 'capture', fresh_ip: false, evidence: false }, ws); } finally { Date.now = realNow; global.setTimeout = instant; }
+        check('core: ig_post (test run, no clip): reaches the launch - waits for the unlock (3 looks), starts Instagram for user 12 by component, no exception',
+          [replies[0].why === 'exception', /not a function|TypeError|undefined/.test(String(replies[0].error || '')), calls.filter((c) => /get-started-user-state 12/.test(c)).length,
+            calls.some((c) => /am start --user 12 -n com\.instagram\.android/.test(c))], [false, false, 3, true]);
+      }
+      {
+        const a = makeCore(phone(KADIE, 'feed'));
+        await a.core.checkAccountStatus('R9', { request_id: 'R9', uid: 12 }, a.ws);
+        const b = makeCore(phone(KADIE, 'feed'));
+        await b.core.igDiagnostic('R10', { request_id: 'R10', uid: 12 }, b.ws);
+        check('core: the old status check and the diagnostic start Instagram for user 12 by component and answer',
+          [a.replies[0].ok, a.calls.some((c) => /am start --user 12 -n com\.instagram\.android/.test(c)), b.replies[0].ok, b.calls.some((c) => /am start --user 12 -n com\.instagram\.android/.test(c))],
+          [true, true, true, true]);
+      }
+      {
+        const { core, calls } = makeCore(phone(KADIE, 'feed'));
+        const d = core._checkDriver('R11', 12, 'com.instagram.android', async () => {});
+        const out = await d.launch();
+        check('core: the visit driver\'s re-launch resolves fresh and starts Instagram with -W for user 12; gives back text',
+          [typeof out, /Status: ok/.test(out), calls.filter((c) => /resolve-activity --brief --user 12/.test(c)).length, calls.filter((c) => /am start -W --user 12 -n/.test(c)).length], ['string', true, 1, 1]);
+      }
+
+      {
+        // R12: the same fake on a virtual clock - setTimeout(fn, ms) moves the clock by ms, every adb call costs 400 ms
+        const realNow = Date.now, instant = global.setTimeout;
+        let clock = 1e9;
+        Date.now = () => clock;
+        global.setTimeout = (fn, ms) => { clock += ms || 0; fn(); return 0; };
+        try {
+          const x = makeCore(phone(KADIE, 'feed'), { lockedPolls: 1e9 });
+          const real = x.core._adbLong;
+          x.core._adbLong = async (serial, args, ms) => { clock += 400; return real(serial, args, ms); };
+          const t0 = clock;
+          await x.core._waitUnlocked('R12', 12, 30000);
+          const waited = clock - t0, looks = x.calls.filter((c) => /get-started-user-state 12/.test(c)).length;
+          const t1 = clock;
+          await x.core.launchApp('R12', { request_id: 'R12', uid: 12, package: 'com.instagram.android' }, x.ws);
+          const open = clock - t1;
+          check('core: (virtual clock, adb 400 ms a call) the 30 s wait lasts 29-32 s with 20+ looks; open app on a profile that never unlocks answers inside the backend\'s 20 s',
+            [waited >= 29000 && waited <= 32000, looks >= 20, open <= 20000, x.replies[0].state], [true, true, true, 'launch_failed']);
+        } finally { Date.now = realNow; global.setTimeout = instant; }
+      }
+            {
         const { core, replies, ws } = makeCore(phone({ s: { xml: JOIN } }, 's'));
         await core.igCheck('SER7', { request_id: 'r7', uid: 12, shot: true }, ws);
         const { core: c2, replies: r2, ws: w2 } = makeCore(phone(KADIE, 'feed'));
@@ -1093,10 +1301,7 @@ const kind = (xml) => ck.classifyScreen(P(xml)).kind;
       }
       {
         const F = phone(LUCY, 'prompt');
-        const env = makeCore(F);
-        let n2 = 0;
-        const realAdb = env.core._adbLong;
-        env.core._adbLong = async (serial, args, ms) => { if (/ps -A/.test(args.join(' ')) && ++n2 > 25) env.s.viewer = true; return realAdb(serial, args, ms); };
+        const env = makeCore(F, { viewerAfterAsks: 25 });
         await env.core.igCheck('SER9', { request_id: 'r9', uid: 12 }, env.ws);
         if (process.env.IGCHECK_TRACE) console.log(env.core.logs.map((l) => '      ' + l).join('\n'));
         const iReply = env.calls.indexOf('<<REPLY>>');
@@ -1133,6 +1338,142 @@ const kind = (xml) => ck.classifyScreen(P(xml)).kind;
         check('core: an adb swipe that times out inside Insights: still ok / checked, the account and what Insights gave kept, the reason in insights.why',
           [r.ok, r.state, r.status, a.followers, a.insights && a.insights.views, a.insights && a.insights.why.some((w) => /^stopped: error: Command failed/.test(w))],
           [true, 'checked', 'HEALTHY', 85, 44321, true]);
+      }
+
+      // ---- v0.5.16: what the review of 2026-11-10 asked for before the release ----
+      // A virtual clock for the checks whose loops are bounded by time: setTimeout(fn, ms) moves the
+      // clock by ms (with instant timers and the real clock, a 15 s wait would spin for 15 real seconds).
+      const onClock = async (fn) => {
+        const realNow = Date.now, instant = global.setTimeout;
+        let clock = 1e9;
+        Date.now = () => clock;
+        global.setTimeout = (f, ms) => { clock += ms || 0; f(); return 0; };
+        try { return await fn(); } finally { Date.now = realNow; global.setTimeout = instant; }
+      };
+      {
+        const { core, replies, ws } = makeCore(phone(KADIE, 'feed'), { lockedPolls: 4 });
+        await core.igCheck('T1', { request_id: 't1', uid: 12 }, ws);
+        const tr = replies[0].trace;
+        check('core: the REPLY says how the start went - what was in front after the switch, the wait for the unlock (ok), the try that worked (ok) - then the visit\'s own steps',
+          [tr.slice(0, 3).map((t) => t.name), tr.slice(0, 3).map((t) => t.ok), tr[0].matched, /^RUNNING_UNLOCKED after \d+ s$/.test(tr[1].matched),
+            /^component: Status: ok, LaunchState: COLD/.test(tr[2].matched), tr.length > 5, tr[3].name, tr.length <= 80],
+          [['settle', 'unlock', 'launch 1/3'], [true, true, true], 'u12 com.android.launcher3', true, true, true, 'screen', true]);
+      }
+      {
+        const { core, replies, ws } = makeCore(phone(KADIE, 'feed'), { lockedPolls: 1e9, rejects: true });
+        await core.igCheck('T2', { request_id: 't2', uid: 12, shot: true }, ws);
+        const tr = replies[0].trace;
+        check('core: a profile that never unlocks says so in the REPLY: still RUNNING_LOCKED after the wait, Android\'s own words for each of the 3 tries, what was in front each time',
+          [tr.map((t) => t.name), tr.filter((t) => t.name !== 'settle').some((t) => t.ok), /^RUNNING_LOCKED after \d+ s$/.test(tr[1].matched),
+            tr.filter((t) => /^launch/.test(t.name)).every((t) => /^MAIN\/LAUNCHER intent: Error: Activity not started, unable to resolve Intent/.test(t.matched)),
+            tr.filter((t) => t.name === 'front').every((t) => t.matched === 'resumed u12 com.android.launcher3, screen com.android.launcher3'),
+            tr.every((t) => t.matched.length <= 118), replies[0].why, !!replies[0].screenshot_b64],
+          [['settle', 'unlock', 'launch 1/3', 'front', 'launch 2/3', 'front', 'launch 3/3', 'front'], false, true, true, true, true, 'ig_not_in_front', true]);
+      }
+      {
+        const { core, replies, ws } = makeCore(phone(KADIE, 'feed'), { amStartDead: true });
+        await core.igCheck('T3', { request_id: 't3', uid: 12 }, ws);
+        check('core: ...and when only the icon tap brought Instagram up, the REPLY shows the two starts that did nothing and the tap that worked',
+          replies[0].trace.slice(1, 7).map((t) => `${t.name}${t.ok ? ' ok' : ' no'}${/^launch 3/.test(t.name) ? ' ' + t.matched : ''}`),
+          ['unlock ok', 'launch 1/3 no', 'front no', 'launch 2/3 no', 'front no', 'launch 3/3 ok icon at 151,1150']);
+      }
+      await onClock(async () => {
+        // Android accepted the switch (am get-current-user says 12) but profile 10 is still on the screen,
+        // with ITS Instagram icon on the home screen: tapping it would read profile 10's account as 12's.
+        const a = makeCore(phone(KADIE, 'feed'), { amStartDead: true, screenUser: 10 });
+        await a.core.igCheck('T4', { request_id: 't4', uid: 12 }, a.ws);
+        check('core: another profile is still on the screen: its Instagram icon is NOT tapped; unreadable / ig_not_in_front, no account read, and the reply names who was in front',
+          [a.replies[0].state, a.replies[0].why, a.replies[0].username, a.calls.filter((c) => /input tap/.test(c)), a.replies[0].trace[0].ok,
+            a.replies[0].trace.filter((t) => t.name === 'front').map((t) => t.matched.split(',')[0])],
+          ['unreadable', 'ig_not_in_front', '', [], false, ['resumed u10 com.android.launcher3', 'resumed u10 com.android.launcher3', 'resumed u10 com.android.launcher3']]);
+        // ...and the older half of the same hole: another profile's Instagram already in front. Its package
+        // name alone no longer counts as "Instagram in front" when Android names the other profile.
+        const b = makeCore(phone(KADIE, 'feed'), { screenUser: 10 });
+        await b.core.igCheck('T5', { request_id: 't5', uid: 12 }, b.ws);
+        check('core: another profile\'s Instagram in front is not taken for this profile\'s: unreadable / ig_not_in_front, nothing of that account in the reply',
+          [b.replies[0].state, b.replies[0].why, b.replies[0].username, b.replies[0].accounts, b.replies[0].trace.filter((t) => t.name === 'front')[0].matched],
+          ['unreadable', 'ig_not_in_front', '', [], 'resumed u10 com.instagram.android, screen com.instagram.android']);
+      });
+      {
+        // someone opens the phone while the check waits for a slow profile to unlock
+        const env = makeCore(phone(KADIE, 'feed'), { lockedPolls: 1e9 });
+        const realAdb = env.core._adbLong;
+        let looks = 0;
+        env.core._adbLong = async (serial, args, ms) => { if (/get-started-user-state/.test(args.join(' ')) && ++looks === 3) env.s.viewer = true; return realAdb(serial, args, ms); };
+        await env.core.igCheck('T6', { request_id: 't6', uid: 12 }, env.ws);
+        const iReply = env.calls.indexOf('<<REPLY>>');
+        check('core: a viewer who opens the phone during the wait for the unlock is noticed at the next look (not 30 s later): device_busy / viewer_opened, no launch, the phone put back',
+          [env.replies[0].ok, env.replies[0].state, env.replies[0].why, looks, env.calls.filter((c) => /am start/.test(c)), env.calls.slice(0, iReply).includes('shell am switch-user 0')],
+          [false, 'device_busy', 'viewer_opened', 3, [], true]);
+      }
+      {
+        const a = makeCore(phone(KADIE, 'feed'));
+        await a.core.launchApp('S1', { request_id: 's1', uid: 12, package: 'com.instagram.android;reboot' }, a.ws);
+        const b = makeCore(phone(KADIE, 'feed'));
+        await b.core.checkAppsInstalled('S2', { request_id: 's2', uid: 12, packages: ['com.instagram.android', 'x;id', 'com.a$(id)', '', null, 'com.discord'] }, b.ws);
+        const c = makeCore(phone(KADIE, 'feed'));
+        await c.core.checkAccountStatus('S3', { request_id: 's3', uid: 12, package: 'com.x`id`' }, c.ws);
+        check('core: only a package name ever reaches the phone\'s shell - open app, installed-apps check, status check',
+          [a.replies[0].state, a.replies[0].error, a.calls.filter((k) => /^shell/.test(k)), Object.keys(b.replies[0].installed),
+            b.calls.filter((k) => /pm list packages/.test(k)).some((k) => /[;$`]/.test(k)), c.replies[0].error, c.calls.filter((k) => /^shell/.test(k))],
+          ['launch_failed', 'not a package name', [], ['com.instagram.android', 'com.discord'], false, 'not a package name', []]);
+      }
+      {
+        const x = makeCore(phone(KADIE, 'feed'));
+        const link = "https://example.com/a?x=1&y=2;z=$(id)'q";
+        await x.core.openUrl('U1', { request_id: 'u1', uid: 12, url: link }, x.ws);
+        const line = x.calls.find((k) => /am start -a android\.intent\.action\.VIEW/.test(k)) || '';
+        const y = makeCore(phone(KADIE, 'feed'));
+        await y.core.openUrl('U2', { request_id: 'u2', uid: 12, url: 'https://example.com/a b' }, y.ws);
+        await y.core.openUrl('U3', { request_id: 'u3', uid: 12, url: 'https://example.com/a\nreboot' }, y.ws);
+        await y.core.openUrl('U4', { request_id: 'u4', uid: 12, url: 'ftp://example.com/a' }, y.ws);
+        check('core: open link - the link reaches the phone\'s shell inside single quotes, whole, with --user after it; a quote inside it is escaped; a blank, a line break or another scheme is refused and nothing is sent',
+          [line, x.replies[0].ok, y.replies.map((r) => r.error), y.calls.filter((k) => /am start/.test(k))],
+          ["shell am start -a android.intent.action.VIEW -d 'https://example.com/a?x=1&y=2;z=$(id)'\\''q' --user 12", true, ['invalid url', 'invalid url', 'invalid url'], []]);
+        // a real POSIX shell must give the link back unchanged, as ONE word (skipped where there is no sh)
+        let back = null;
+        try { back = require('child_process').execFileSync('sh', ['-c', 'printf "%s|%s" ' + x.core._shq(link) + ' end'], { encoding: 'utf8', timeout: 8000 }); } catch (e) { back = null; }
+        if (back != null) check('core: ...a real shell reads the quoted link as one word, unchanged, and runs nothing in it', back, link + '|end');
+        else console.log('SKIP  (no sh on this computer) a real shell reads the quoted link as one word');
+      }
+      await onClock(async () => {
+        const { core, calls, ws } = makeCore(phone(KADIE, 'feed'), { lockedPolls: 2 });
+        await core.igPost('P1', { request_id: 'p1', uid: 12, mode: 'capture', fresh_ip: false, evidence: false, audio_url: 'https://www.instagram.com/reels/audio/123/?igsh=a&b=c' }, ws);
+        const iWait = calls.lastIndexOf('shell am get-started-user-state 12'), iView = calls.findIndex((c) => /am start --user 12 -a android\.intent\.action\.VIEW/.test(c));
+        check('core: ig_post with a sound link: the wait for the unlock comes FIRST (3 looks), then the link goes to Instagram inside single quotes',
+          [calls.filter((c) => /get-started-user-state 12/.test(c)).length, iWait >= 0 && iView > iWait, calls[iView]],
+          [3, true, "shell am start --user 12 -a android.intent.action.VIEW -d 'https://www.instagram.com/reels/audio/123/?igsh=a&b=c' -p com.instagram.android"]);
+      });
+      {
+        // The Mac answers adb slowly at busy moments. A phone that cannot say which profile it is on is not moved:
+        // before 0.5.16 the visit ran and the phone was LEFT on the visited profile (nobody knew where to put it back).
+        const env = makeCore(phone(KADIE, 'feed'));
+        const realAdb = env.core._adbLong;
+        env.core._adbLong = async (serial, args, ms) => { if (/am get-current-user/.test(args.join(' '))) { env.calls.push(args.join(' ')); throw new Error('timed out'); } return realAdb(serial, args, ms); };
+        await env.core.igCheck('W1', { request_id: 'w1', uid: 12 }, env.ws);
+        check('core: the phone cannot say which profile it is on (asked twice): nothing is switched, the visit fails and says why',
+          [env.replies[0].ok, env.replies[0].state, /nothing was switched/.test(env.replies[0].error || ''), env.calls.filter((c) => /am switch-user/.test(c)), env.calls.filter((c) => /am get-current-user/.test(c)).length],
+          [false, 'failed', true, [], 2]);
+      }
+      {
+        // who is watching: the agent's own record of people's live streams, per phone
+        const core = Object.create(AgentCore.prototype);
+        const sock = () => { const h = {}; return { readyState: 1, addEventListener: (ev, fn) => { (h[ev] = h[ev] || []).push(fn); }, fire: (ev) => (h[ev] || []).forEach((fn) => fn()) }; };
+        const a = sock(), b = sock(), c = sock();
+        const seen = [await core._scrcpyRunning('P1')];                                   // nobody yet
+        core._trackPerson('P1', a); core._trackPerson('P1', b); core._trackPerson('P2', c);
+        seen.push(await core._scrcpyRunning('P1'), await core._scrcpyRunning('P2'), await core._scrcpyRunning('P3'));
+        a.fire('close'); seen.push(await core._scrcpyRunning('P1'));                      // one of the two is left
+        b.readyState = 3; seen.push(await core._scrcpyRunning('P1'));                     // closed with no event: not counted, and forgotten
+        b.readyState = 1; seen.push(await core._scrcpyRunning('P1'));
+        c.fire('error'); seen.push(await core._scrcpyRunning('P2'));
+        check('core: who is watching = people\'s live video streams on THAT phone; a stream that closed no longer counts, with or without its close event',
+          seen, [false, true, true, false, true, false, false, false]);
+        const Q = 'action=proxy-adb&remote=tcp%3A8886&udid=SER';
+        check('core: a stream counts as a person only when the backend said so (watch: false) AND it is the live video - not the device list, not a Multiview tile, not an older backend',
+          [AgentCore._countsAsPerson(true, Q), AgentCore._countsAsPerson(true, 'action=multiplex'), AgentCore._countsAsPerson(false, Q), AgentCore._countsAsPerson(undefined, Q),
+            AgentCore._countsAsPerson(true, ''), AgentCore._countsAsPerson(true, 'x=1&action=proxy-adb'), AgentCore._countsAsPerson(true, 'action=proxy-adbx')],
+          [true, false, false, false, false, true, false]);
       }
     } finally { global.setTimeout = REAL; }
   }
