@@ -49,6 +49,10 @@ const LAUNCHER = win('com.android.launcher3', [0, 0, 1080, 2400], [V(0, 0, 1080,
   T('Gallery', 352, 1910, 468, 1950, { click: true }), T('App Store', 848, 1910, 1010, 1950, { click: true }),
   D('Phone', 72, 2120, 230, 2278, { click: true }), D('Messages', 331, 2120, 489, 2278, { click: true }),
   D('Vanadium', 590, 2120, 748, 2278, { click: true }), D('Camera', 849, 2120, 1007, 2278, { click: true })]);
+// v0.5.16: the GrapheneOS home screen of the 2026-11-10 failures - Instagram's icon top left
+const LAUNCHER_IG = win('com.android.launcher3', [0, 0, 1080, 2400], [V(0, 0, 1080, 2400, { id: 'com.android.launcher3:id/workspace' }),
+  T('Instagram', 72, 1130, 230, 1170, { click: true }), T('Telegram', 331, 1130, 489, 1170, { click: true }),
+  D('Phone', 72, 2120, 230, 2278, { click: true }), D('Camera', 849, 2120, 1007, 2278, { click: true })]);
 // ph14/02_ig_open.png - "Join Instagram": nobody is logged in to this profile's Instagram
 const JOIN = screen(T('English (US)', 416, 290, 612, 330, { click: true }), T('Join Instagram', 324, 1560, 756, 1620),
   T("Share what you're into with the people who get you.", 108, 1660, 970, 1745),
@@ -427,6 +431,25 @@ const kind = (xml) => ck.classifyScreen(P(xml)).kind;
   [{ focus: { uid: 0, pkg: 'NotificationShade', cls: '' }, keyguard: true, covered: true }, { uid: 12, pkg: 'com.instagram.android', cls: 'com.instagram.mainactivity.InstagramMainActivity' }, false]);
   check('wm size: the override wins', [ck.parseWmSize('Physical size: 1080x2400\nOverride size: 720x1600'), ck.parseWmSize('Physical size: 1080x2400'), ck.parseWmSize('')],
     [{ w: 720, h: 1600 }, { w: 1080, h: 2400 }, null]);
+  // v0.5.16: the profile's lock state - a profile still locked has "no launcher" for Instagram
+  check('user state: am get-started-user-state, "not started", dumpsys user for the right uid, unknown', [
+    ck.parseUserState('RUNNING_LOCKED\n', 15), ck.parseUserState('RUNNING_UNLOCKED', 15), ck.parseUserState('User is not started: 15', 15),
+    ck.parseUserState('Users:\r\n  UserInfo{0:Owner:c13} running\r\n    State: RUNNING_UNLOCKED\r\n  UserInfo{15:6:410} serialNo=20\r\n    State: RUNNING_UNLOCKING\r\n', 15),
+    ck.parseUserState('Users:\n  UserInfo{0:Owner:c13} running\n    State: RUNNING_UNLOCKED\n  UserInfo{15:6:410}\n', 15),
+    ck.parseUserState('Unknown command: get-started-user-state', 15)],
+    ['RUNNING_LOCKED', 'RUNNING_UNLOCKED', 'STOPPED', 'RUNNING_UNLOCKING', null, null]);
+  {
+    const home = (pkg, label) => [
+      { pkg, text: '', desc: '', bounds: { l: 0, t: 0, r: 1080, b: 2400 }, cx: 540, cy: 1200 },
+      { pkg, text: 'Telegram', desc: '', bounds: { l: 330, t: 980, r: 490, b: 1200 }, cx: 410, cy: 1090 },
+      { pkg, text: label, desc: '', bounds: { l: 60, t: 980, r: 220, b: 1200 }, cx: 140, cy: 1090 }];
+    check('launcher icon: Instagram on the home screen / not "Instagram Lite" / not inside an app', [
+      ck.launcherIconTarget(home('com.android.launcher3', 'Instagram'), 'Instagram'),
+      ck.launcherIconTarget(home('com.android.launcher3', 'Instagram Lite'), 'Instagram'),
+      ck.launcherIconTarget(home('com.instagram.android', 'Instagram'), 'Instagram'),
+      ck.launcherIconTarget([], 'Instagram')],
+    [{ x: 140, y: 1090 }, null, null, null]);
+  }
 
   // ---------- 10. whole visits on a fake phone ----------
   // def: { screen: { xml, tap: [[label regex, next]], back, home, up, down, left, launch, unlock } }
@@ -970,10 +993,14 @@ const kind = (xml) => ck.classifyScreen(P(xml)).kind;
           const top = launched && s.inFront ? 'com.instagram.android/com.instagram.mainactivity.InstagramMainActivity' : 'com.android.launcher3/.uioverrides.QuickstepLauncher';
           return `  topResumedActivity=ActivityRecord{1f u${s.user} ${top} t7}\n  mKeyguardShowing=false`;
         }
-        if (/resolve-activity/.test(cmd)) return 'priority=0 preferredOrder=0\ncom.instagram.android/com.instagram.mainactivity.LauncherActivity';
-        if (/am start -W --user \d+ -n/.test(cmd)) { launched = true; return 'Starting: Intent { cmp=com.instagram.android/... }\nStatus: ok\nLaunchState: COLD\nTotalTime: 1180\nComplete'; }
+        // v0.5.16: a profile still LOCKED for its first `lockedPolls` state polls resolves no launcher
+        if (/am get-started-user-state/.test(cmd)) { if (s.lockedPolls > 0) { s.lockedPolls--; return 'RUNNING_LOCKED'; } return 'RUNNING_UNLOCKED'; }
+        if (/resolve-activity/.test(cmd)) return s.lockedPolls > 0 ? 'No activity found' : 'priority=0 preferredOrder=0\ncom.instagram.android/com.instagram.mainactivity.LauncherActivity';
+        if (/am start -W --user \d+ -a android\.intent\.action\.MAIN/.test(cmd)) { if (s.lockedPolls > 0) return 'Error: Activity not started, unable to resolve Intent'; launched = true; return 'Status: ok\nComplete'; }
+        if (/am start -W --user \d+ -n/.test(cmd)) { if (s.amStartDead) return 'Status: ok\nComplete'; launched = true; return 'Starting: Intent { cmp=com.instagram.android/... }\nStatus: ok\nLaunchState: COLD\nTotalTime: 1180\nComplete'; }
         if (/uiautomator dump/.test(cmd)) return 'UI hierchary dumped to: /sdcard/pd_check.xml';
-        if (/cat \/sdcard\/pd_check\.xml/.test(cmd)) return launched && s.inFront ? F.dump() : LAUNCHER;
+        if (/cat \/sdcard\/pd_check\.xml/.test(cmd)) return launched && s.inFront ? F.dump() : (s.amStartDead ? LAUNCHER_IG : LAUNCHER);
+        if (s.amStartDead && !launched && (mm = /input tap (\d+) (\d+)/.exec(cmd))) { if (Math.abs(+mm[1] - 151) < 60 && Math.abs(+mm[2] - 1150) < 80) launched = true; return ''; }
         if ((mm = /input tap (\d+) (\d+)/.exec(cmd))) { await F.tap(+mm[1], +mm[2]); return ''; }
         if ((mm = /input swipe (\d+) (\d+) (\d+) (\d+)/.exec(cmd))) { await F.swipe(+mm[1], +mm[2], +mm[3], +mm[4]); return ''; }
         if ((mm = /input keyevent (\w+)/.exec(cmd))) { if (mm[1] === '4') await F.key('back'); return ''; }
@@ -1031,6 +1058,25 @@ const kind = (xml) => ck.classifyScreen(P(xml)).kind;
         check('core: Instagram never comes to the front -> unreadable / ig_not_in_front after 3 launches, with the screen and a screenshot',
           [replies[0].ok, replies[0].state, replies[0].why, calls.filter((c) => /am start -W --user 12 -n/.test(c)).length, replies[0].screens[0].pkg, !!replies[0].screenshot_b64],
           [true, 'unreadable', 'ig_not_in_front', 3, 'com.android.launcher3', true]);
+      }
+      {
+        // v0.5.16 - the 2026-11-10 failure: the profile is still locked right after the switch, so
+        // Instagram has no launcher yet. The check waits for the unlock, then launches and reads.
+        const { core, calls, replies, ws } = makeCore(phone(KADIE, 'feed'), { lockedPolls: 4 });
+        await core.igCheck('SER12', { request_id: 'r12', uid: 12 }, ws);
+        check('core: a profile still locked after the switch: waits for the unlock, then launches by component and reads it',
+          [replies[0].state, replies[0].status, calls.filter((c) => /get-started-user-state 12/.test(c)).length >= 5,
+            calls.filter((c) => /am start -W --user 12 -n/.test(c)).length, core.logs.some((l) => /profile 12: RUNNING_UNLOCKED after/.test(l))],
+          ['checked', 'HEALTHY', true, 1, true]);
+        check('core: nothing calls monkey any more (it has no --user option)', calls.filter((c) => /monkey/.test(c)), []);
+      }
+      {
+        // am start "works" but Instagram never shows: the third try taps the icon on the home screen
+        const { core, calls, replies, ws } = makeCore(phone(KADIE, 'feed'), { amStartDead: true });
+        await core.igCheck('SER13', { request_id: 'r13', uid: 12 }, ws);
+        check('core: am start that never brings Instagram up: 2 am starts, then the Instagram icon is tapped and the profile read',
+          [replies[0].state, calls.filter((c) => /am start -W --user 12 -n/.test(c)).length, calls.some((c) => /input tap 151 1150/.test(c)), core.logs.some((l) => /launch 3\/3 \(icon at 151,1150\)/.test(l))],
+          ['checked', 2, true, true]);
       }
       {
         const { core, replies, ws } = makeCore(phone({ s: { xml: JOIN } }, 's'));

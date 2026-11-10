@@ -1562,6 +1562,35 @@ function parseWindow(text) {
   const covered = !!(focus && /^(NotificationShade|StatusBar|Keyguard|Bouncer)/i.test(focus.pkg));
   return { focus, keyguard: k ? k[1].toLowerCase() === 'true' : (covered ? true : null), covered };
 }
+// v0.5.16 - a profile just switched to can still be LOCKED (Direct Boot) for a few seconds: Android
+// then resolves only Direct-Boot-aware apps, so Instagram "has no launcher" and `am start` finds
+// nothing. `am get-started-user-state N` says RUNNING_LOCKED / RUNNING_UNLOCKING / RUNNING_UNLOCKED,
+// or "User is not started"; `dumpsys user` is the fallback (`State: ...` under UserInfo{N:...}).
+function parseUserState(text, uid) {
+  const t = String(text || '');
+  const direct = /\b(BOOTING|RUNNING_LOCKED|RUNNING_UNLOCKING|RUNNING_UNLOCKED|STOPPING|SHUTDOWN)\b/.exec(t);
+  if (direct && !/UserInfo\{/.test(t)) return direct[1];
+  if (/not started/i.test(t)) return 'STOPPED';
+  let cur = null, state = null;
+  for (const l of t.split(/\r?\n/)) {
+    const u = /UserInfo\{(\d+):/.exec(l);
+    if (u) { cur = parseInt(u[1], 10); continue; }
+    const st = /^\s*State:\s*([A-Z_]+)/.exec(l);
+    if (st && cur === uid && !state) state = st[1];
+  }
+  return state;
+}
+// v0.5.16 - the last launch try taps the app's icon on the home screen, as a person would. Only a
+// launcher screen, only an icon whose label or description IS the app's name (not "Instagram Lite").
+function launcherIconTarget(nodes, label) {
+  const want = String(label || 'Instagram').trim().toLowerCase();
+  const list = nodes || [];
+  const pkg = (list.find((n) => n.pkg) || {}).pkg || '';
+  if (!/launcher|quickstep/i.test(pkg)) return null;
+  const hit = list.find((n) => n.bounds && n.bounds.r > n.bounds.l && n.bounds.b > n.bounds.t
+    && [n.text, n.desc].some((v) => String(v || '').trim().toLowerCase() === want));
+  return hit ? { x: hit.cx, y: hit.cy } : null;
+}
 // `wm size`: the override when one is set, else the physical size.
 function parseWmSize(text) {
   const t = String(text || '');
@@ -1578,6 +1607,6 @@ module.exports = {
   // the visit
   check, emptyInsights, newOverview, newAudience,
   // adb output, for core.js
-  parseActivities, parseWindow, parseWmSize,
+  parseActivities, parseWindow, parseWmSize, parseUserState, launcherIconTarget,
   SAFE_DISMISS, FORBIDDEN, DAYS, SLOTS, AGES, IG_PKG, LOOP_MS, INSIGHTS_MS, DEFAULT_BUDGET_MS,
 };

@@ -1946,6 +1946,39 @@ class AgentCore extends EventEmitter {
     } catch {}
     return null;
   }
+  /** v0.5.16: the profile's lock state (RUNNING_UNLOCKED, RUNNING_LOCKED, STOPPED, ...) or null. */
+  async _userState(serial, uid) {
+    const a = await this._adbLong(serial, ['shell', 'am', 'get-started-user-state', String(uid)], 6000).catch(() => '');
+    const s = igcheck.parseUserState(a, uid);
+    if (s && !/unknown|error/i.test(a)) return s;
+    return igcheck.parseUserState(await this._adbLong(serial, ['shell', 'dumpsys', 'user'], 8000).catch(() => ''), uid);
+  }
+  /** v0.5.16: up to `ms` for a profile just switched to to finish unlocking. Until then Android
+      resolves only Direct-Boot-aware apps, so Instagram has "no launcher" and cannot be started -
+      the cause of ~80 % "ig_not_in_front" on the 2026-11-09/10 account checks. Never throws. */
+  async _waitUnlocked(serial, uid, ms = 30000, log) {
+    const t0 = Date.now();
+    let s = null;
+    while (Date.now() - t0 < ms) {
+      s = await this._userState(serial, uid);
+      if (s === 'RUNNING_UNLOCKED' || s == null) break;   // null: this Android cannot say - carry on
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    if (log) log(`profile ${uid}: ${s || 'state unknown'} after ${Math.round((Date.now() - t0) / 1000)} s`);
+    return s;
+  }
+  /** v0.5.16: start an app's launcher activity in a profile. Resolved FRESH each call (a profile that
+      was still locked resolves nothing); without a component, a MAIN/LAUNCHER intent addressed to the
+      package. The old fallback `monkey -p .. --user N` never worked: monkey has no --user option. */
+  async _startApp(serial, uid, pkg, waitMs = 0) {
+    const comp = await this._resolveLauncher(serial, uid, pkg);
+    const w = waitMs ? ['-W'] : [];
+    const args = comp
+      ? ['shell', 'am', 'start', ...w, '--user', String(uid), '-n', comp]
+      : ['shell', 'am', 'start', ...w, '--user', String(uid), '-a', 'android.intent.action.MAIN', '-c', 'android.intent.category.LAUNCHER', '-p', pkg];
+    const out = await this._adbLong(serial, args, waitMs || 10000).catch((e) => 'Error: ' + ((e && e.message) || e));
+    return { comp, out: String(out || '') };
+  }
   async _uiDump(serial) {
     await this._adbLong(serial, ['shell', 'uiautomator', 'dump', '/sdcard/pd_ui.xml'], 20000);
     return this._adbLong(serial, ['shell', 'cat', '/sdcard/pd_ui.xml'], 10000);
@@ -1969,11 +2002,9 @@ class AgentCore extends EventEmitter {
       if (!pkg) return this._rpcReply(ws, m, { ok: false, state: 'launch_failed', error: 'no package' });
       if (!(await this._userExists(serial, uid))) return this._rpcReply(ws, m, { ok: false, state: 'profile_not_found', error: 'PROFILE_NOT_FOUND' });
       if (!(await this._pkgInstalledForUser(serial, uid, pkg))) return this._rpcReply(ws, m, { ok: false, state: 'app_not_installed', error: 'APP_NOT_INSTALLED' });
-      const comp = await this._resolveLauncher(serial, uid, pkg);
-      const out = comp
-        ? await this._adbLong(serial, ['shell', 'am', 'start', '--user', String(uid), '-n', comp], 10000)
-        : await this._adbLong(serial, ['shell', 'monkey', '-p', pkg, '--user', String(uid), '-c', 'android.intent.category.LAUNCHER', '1'], 10000);
-      const ok = !/error|exception|not found|no activities/i.test(out || '');
+      await this._waitUnlocked(serial, uid, 15000);
+      const { out } = await this._startApp(serial, uid, pkg);
+      const ok = !/error|exception|not found|no activities|unable to resolve/i.test(out || '');
       this.emit('log', `launch_app (${serial}) user=${uid} ${pkg} -> ${ok ? 'opened' : 'failed'}`);
       this._rpcReply(ws, m, ok ? { ok: true, state: 'opened' } : { ok: false, state: 'launch_failed', error: (out || '').slice(0, 200) });
     } catch (e) { this._rpcReply(ws, m, { ok: false, state: 'launch_failed', error: String((e && e.message) || e) }); }
@@ -2098,8 +2129,7 @@ class AgentCore extends EventEmitter {
       if (!(await this._userExists(serial, uid))) return this._rpcReply(ws, m, { ok: false, status: 'PROFILE_UNAVAILABLE', error: 'PROFILE_NOT_FOUND' });
       if (!(await this._pkgInstalledForUser(serial, uid, pkg))) return this._rpcReply(ws, m, { ok: false, status: 'APP_ERROR', error: 'instagram not installed for this profile' });
       // Foreground Instagram for THIS profile (never the owner) then read the UI hierarchy.
-      const comp = await this._resolveLauncher(serial, uid, pkg);
-      if (comp) { try { await this._adbLong(serial, ['shell', 'am', 'start', '--user', String(uid), '-n', comp], 10000); } catch {} }
+      await this._startApp(serial, uid, pkg);
       await new Promise((r) => setTimeout(r, 2500));               // let the UI settle
       let xml = ''; try { xml = await this._uiDump(serial); } catch { xml = ''; }
       let r = instagram.classify(xml);
@@ -2255,9 +2285,8 @@ class AgentCore extends EventEmitter {
         if (bad(r)) throw new Error('Instagram would not open the sound link: ' + String(r).trim().slice(0, 160));
         log('opened the audio link in Instagram');
       } else {
-        const comp = await this._resolveLauncher(serial, uid, pkg);
-        if (comp) await this._adbLong(serial, ['shell', 'am', 'start', '--user', String(uid), '-n', comp], 10000).catch(() => {});
-        else await this._adbLong(serial, ['shell', 'monkey', '-p', pkg, '--user', String(uid), '-c', 'android.intent.category.LAUNCHER', '1'], 10000).catch(() => {});
+        await this._waitUnlocked(serial, uid, 30000, log);
+        await this._startApp(serial, uid, pkg);
       }
       await wait(4000);
       // 4) the flow
@@ -2327,8 +2356,8 @@ class AgentCore extends EventEmitter {
       if (!(await this._userExists(serial, uid))) return reply({ ok: false, state: 'profile_not_found', error: 'PROFILE_NOT_FOUND' });
       if (!(await this._pkgInstalledForUser(serial, uid, pkg))) return reply({ ok: true, state: 'app_not_installed', username: '', status: 'APP_ERROR' });
       previous = await this._igSwitchTo(serial, uid, false, log);
-      const comp = await this._resolveLauncher(serial, uid, pkg);
-      if (comp) await this._adbLong(serial, ['shell', 'am', 'start', '--user', String(uid), '-n', comp], 10000).catch(() => {});
+      await this._waitUnlocked(serial, uid, 30000, log);
+      await this._startApp(serial, uid, pkg);
       await new Promise((r) => setTimeout(r, 3500));
       const driver = this._igDriver(serial, '');
       const r = await igpost.run(driver, igpost.FLOW_WHOAMI, { mode: 'post' });
@@ -2432,17 +2461,28 @@ class AgentCore extends EventEmitter {
   /** Step 4: start Instagram in this profile and make sure it is REALLY in front: the resumed
       activity is Instagram's for this user, or the screen dump is Instagram's (Android's own
       "Allow Instagram to send you notifications?" counts - the visit answers it). Three tries. */
-  async _checkLaunch(serial, uid, pkg, comp, guard, log) {
+  async _checkLaunch(serial, uid, pkg, guard, log) {
     const wait = (ms) => new Promise((r) => setTimeout(r, ms));
     const ours = (p) => p === pkg || /permissioncontroller/.test(String(p || ''));
+    // v0.5.16: a profile just switched to may still be locked - nothing launches until it unlocks.
+    await this._waitUnlocked(serial, uid, 30000, log);
+    await guard();
     for (let attempt = 1; attempt <= 3; attempt++) {
       if (attempt > 1) { await guard(); await this._adbLong(serial, ['shell', 'input', 'keyevent', '3'], 5000).catch(() => {}); await wait(1500); }
       await guard();
-      const out = comp
-        ? await this._adbLong(serial, ['shell', 'am', 'start', '-W', '--user', String(uid), '-n', comp], 25000).catch((e) => 'Error: ' + ((e && e.message) || e))
-        : await this._adbLong(serial, ['shell', 'monkey', '-p', pkg, '--user', String(uid), '-c', 'android.intent.category.LAUNCHER', '1'], 15000).catch((e) => 'Error: ' + ((e && e.message) || e));
+      let how, out;
+      const icon = attempt === 3 ? igcheck.launcherIconTarget(igpost.parseDump(await this._checkDump(serial)), 'Instagram') : null;
+      if (icon) {   // the last try: the icon on the home screen, as a person opens it
+        await guard();
+        out = await this._adbLong(serial, ['shell', 'input', 'tap', String(icon.x), String(icon.y)], 8000).catch((e) => 'Error: ' + ((e && e.message) || e));
+        how = `icon at ${icon.x},${icon.y}`;
+        await wait(2000);
+      } else {
+        const r = await this._startApp(serial, uid, pkg, 25000);
+        out = r.out; how = r.comp || 'MAIN/LAUNCHER intent';
+      }
       const said = [/Status: \w+/, /LaunchState: \w+/, /TotalTime: \d+/, /Error[^\n]*/].map((re) => (re.exec(out) || [''])[0]).filter(Boolean).join(', ');
-      log(`launch ${attempt}/3 (${comp || 'monkey'}): ${said || String(out).split('\n')[0].slice(0, 120)}`);
+      log(`launch ${attempt}/3 (${how}): ${said || String(out).split('\n')[0].slice(0, 120)}`);
       for (let i = 0; i < 4; i++) {
         await wait(1500);
         await guard();
@@ -2474,15 +2514,14 @@ class AgentCore extends EventEmitter {
   /** The driver igcheck.check() moves the phone with: igPost's taps / keys / swipes plus a fresh
       dump, the viewer check, a re-launch, a profile opened by its link (another account of this
       app) and the unlock. A username only reaches the shell after the strict username check. */
-  _checkDriver(serial, uid, pkg, comp, guard) {
+  _checkDriver(serial, uid, pkg, guard) {
     const self = this;
     const sh = (args, ms) => self._adbLong(serial, ['shell', ...args], ms || 10000);
     return Object.assign({}, this._igDriver(serial, ''), {
       dump: () => self._checkDump(serial),
       now: () => Date.now(),
       viewer: () => self._scrcpyRunning(serial),
-      launch: () => (comp ? sh(['am', 'start', '-W', '--user', String(uid), '-n', comp], 25000)
-        : sh(['monkey', '-p', pkg, '--user', String(uid), '-c', 'android.intent.category.LAUNCHER', '1'], 15000)).catch(() => ''),
+      launch: () => self._startApp(serial, uid, pkg, 25000).then((r) => r.out).catch(() => ''),
       openProfile: (u) => (/^[a-z0-9._]{1,30}$/i.test(String(u || ''))
         ? sh(['am', 'start', '-W', '--user', String(uid), '-a', 'android.intent.action.VIEW', '-d', `https://www.instagram.com/${u}/`, '-p', pkg], 25000).catch(() => '')
         : Promise.resolve('')),
@@ -2551,8 +2590,7 @@ class AgentCore extends EventEmitter {
     setPrevious(previous);
     await guard();
     await this._checkSettle(serial, uid, guard, log);
-    const comp = await this._resolveLauncher(serial, uid, pkg);
-    if (!(await this._checkLaunch(serial, uid, pkg, comp, guard, log))) {
+    if (!(await this._checkLaunch(serial, uid, pkg, guard, log))) {
       const out = { ok: true, state: 'unreadable', status: 'UNKNOWN', why: 'ig_not_in_front' };
       const nodes = igpost.parseDump(await this._checkDump(serial));
       if (nodes.length) out.screens = [{ at: 'not_in_front', pkg: igpost.screenPkg(nodes), ...igpost.describe(nodes, '') }];
@@ -2561,7 +2599,7 @@ class AgentCore extends EventEmitter {
       return out;
     }
     const today = await this._checkToday(serial);
-    const driver = this._checkDriver(serial, uid, pkg, comp, guard);
+    const driver = this._checkDriver(serial, uid, pkg, guard);
     // The visit gets what is left of ~250 s (the backend waits 300; putting the phone back needs some).
     const r = await igcheck.check(driver, {
       appPkg: pkg, insights: m.insights !== false, others: m.others !== false, today,
@@ -2601,8 +2639,8 @@ class AgentCore extends EventEmitter {
         return this._rpcReply(ws, m, { ok: true, multiUser: 'INCONCLUSIVE', instagram: 'NOT_DETECTED', classifier: 'APP_ERROR', accountStatusNav: 'INCONCLUSIVE', fixtureCaptured: false, durationSec: dur(), reasons: ['Instagram not installed for this profile'] });
       }
       const before = (await this._adbLong(serial, ['shell', 'am', 'get-current-user'], 6000).catch(() => '')).trim();
-      const comp = await this._resolveLauncher(serial, uid, pkg);
-      if (comp) { await this._adbLong(serial, ['shell', 'am', 'start', '--user', String(uid), '-n', comp], 10000).catch(() => {}); await wait(3500); }
+      await this._startApp(serial, uid, pkg);
+      await wait(3500);
       if (await this._scrcpyRunning(serial)) {   // a viewer opened mid-run -> HUMAN WINS
         await this._adbLong(serial, ['shell', 'input', 'keyevent', 'KEYCODE_HOME'], 5000).catch(() => {});
         return this._rpcReply(ws, m, { ok: false, state: 'device_busy', error: 'a viewer opened during the diagnostic' });
