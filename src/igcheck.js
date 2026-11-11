@@ -35,6 +35,16 @@
 // Keys: BACK / HOME. Every tap also goes through a last check (`tapRefused`): a point that lands on
 // anything FORBIDDEN, or anywhere on the accounts sheet, is not tapped - Back is the answer then.
 //
+// v0.5.17 (2026-11-11), both READ-ONLY and opt-in on the reply:
+//   * `dm_unread` - the number on the Messages / Direct icon's badge (bottom bar or top bar), read off
+//     the feed and the profile the visit is on anyway. No tap, no inbox, no conversation opened.
+//   * `account_status` - only with the op's `status_page: true`: the profile's menu (Options / Menu)
+//     -> "Settings and activity" -> "Account status", read, then Back. Those taps are the ONLY ones
+//     added, each through `tapRefused` with a narrow allow-list (STATUS_TAPS); on the Settings page
+//     nothing but the "Account status" row may be tapped, and on the Account status page NOTHING is
+//     tapped (Back leaves it). The layouts are modelled on Instagram's known pages, NOT on screenshots
+//     from the farm: like everything here, provisional until the first real run.
+//
 // PROVISIONAL like the other readers: the texts below are what the phones printed on 2026-11-08;
 // resource-ids are only ever a second opinion (Instagram renames them; texts change less). What was
 // not found comes back null with a reason (`why`) and the screens in `screens`, never a guess.
@@ -55,7 +65,7 @@ const INSIGHTS_MS = 120000;      // step 7: dashboard + Overview + Audience
 const SHEET_WAIT_MS = 5000;      // step 8: the accounts sheet after tapping the title
 const VISIT_WAIT_MS = 10000;     // step 9: another account's header after the VIEW intent
 const DEFAULT_BUDGET_MS = 240000;
-const MIN_LEFT = { insights: 60000, sheet: 15000, visit: 16000 };
+const MIN_LEFT = { insights: 60000, sheet: 15000, visit: 16000, status: 30000 };
 const MAX_NOTICES = 4, MAX_POPUPS = 4, MAX_PROMO_BACKS = 3, MAX_OTHER_APP = 2, MAX_LAUNCH = 2, MAX_UNLOCK = 2;
 const MAX_VISITS = 4;
 const MAX_DUMPS = 160;           // a runaway loop ends as `too_many_screens`, never as a hung phone
@@ -397,7 +407,8 @@ function isProfileScreen(nodes, h) {
 
 // What the screen is, for the visit: { kind, detail }. Kinds: no_account, login, checkpoint,
 // challenge, suspended, disabled, notice, popup, promo_back, other_app, keyguard, launcher, switcher,
-// profile, dashboard, insights_overview, insights_audience, feed, loading, unknown.
+// profile, dashboard, insights_overview, insights_audience, feed, loading, unknown; v0.5.17:
+// settings, account_status.
 function classifyScreen(nodesIn, opts) {
   const o = opts || {};
   const app = o.appPkg || IG_PKG;
@@ -423,6 +434,10 @@ function classifyScreen(nodesIn, opts) {
   // Inside Instagram (or a dump that does not say whose it is).
   const nav = tabBar(nodes, h);
   const convo = conversation(nodes, f);
+  // v0.5.17: Instagram's Settings and its Account status page, by their title bars. Before the
+  // blocks (the status page's own wording - "account at risk", "features you can't use" - is not a
+  // block), and before the accounts sheet (Settings also lists "Add account").
+  if (!convo) { const sp = settingsKind(nodes, f); if (sp) return { kind: sp, detail: {} }; }
   // An Instagram page of its own: no bottom bar, nobody's messages or posts on it. Only such a page
   // can be a block or a notice (see "WORDS PEOPLE WROTE" above).
   if (!nav && !convo && !postOnScreen(nodes)) {
@@ -1000,12 +1015,174 @@ function tileRow(nodesIn) {
 }
 // The last word before a tap: never on a FORBIDDEN label, never on the accounts sheet, never inside a
 // conversation (a DM thread / story reply / comments with no bottom bar: Back is the way out).
-function tapRefused(nodesIn, x, y) {
+// v0.5.17 `allow`: a regex the Account-status step passes for ITS taps only. It counts only for the
+// labels in STATUS_TAPS (the profile's menu icon, "Settings and activity" / "Settings and privacy",
+// "Account status"); every other rule stays. On the Account status page itself nothing is tapped,
+// whatever is allowed; on Settings only an allowed label, and only when everything under the point
+// is that label (a row holding other words is not tapped).
+function tapRefused(nodesIn, x, y, allow) {
   const nodes = boxed(nodesIn || []);
+  const allowed = (s) => !!allow && STATUS_TAPS.test(s) && allow.test(s);
+  if (nodes.length) {
+    const page = settingsKind(nodes, frame(nodes));
+    if (page === 'account_status') return 'the Account status page is only read (Back leaves it)';
+    if (page === 'settings') {
+      // the words under the point AND every word of the row (the smallest clickable box) it lands in
+      const row = nodes.filter((n) => n.clickable && inside(n, x, y))
+        .sort((a, b) => (a.bounds.r - a.bounds.l) * (a.bounds.b - a.bounds.t) - (b.bounds.r - b.bounds.l) * (b.bounds.b - b.bounds.t))[0];
+      const words = nodes.filter((n) => inside(n, x, y) || (row && contains(row, n))).flatMap(labelsOf);
+      return words.length && words.every(allowed) ? '' : 'on Settings only "Account status" is tapped';
+    }
+  }
   if (nodes.length && isSwitcher(nodes)) return 'the accounts sheet is open';
   if (nodes.length) { const f = frame(nodes); if (!tabBar(nodes, f.h) && conversation(nodes, f)) return 'a conversation is open'; }
-  const hit = nodes.find((n) => inside(n, x, y) && labelsOf(n).some((s) => FORBIDDEN.test(s)));
+  const hit = nodes.find((n) => inside(n, x, y) && labelsOf(n).some((s) => FORBIDDEN.test(s) && !allowed(s)));
   return hit ? `"${lbl(hit)}" is never tapped` : '';
+}
+
+// ---- 11b. v0.5.17: the unread-DM badge and Instagram's own "Account status" -------------------
+// UNREAD DMs. Instagram puts its Messages icon in the bottom bar (2024+ builds: "Message", id
+// direct_tab) or in the feed's top bar (older builds: "Messenger" / "Direct", id
+// action_bar_inbox_button), with the unread count as a small badge on the icon ("3", "9+", "99+") or
+// in the icon's read-out ("Message, 3 unread messages"). Read off the screens the visit is on anyway
+// (feed, own profile): nothing is tapped and the inbox is never opened, so no chat is ever marked
+// Seen. "9+" reads 9 (a lower bound: Instagram prints no more). An icon without a badge = 0; no icon
+// in sight = null.
+const DM_LABEL = /^(message|messages|messenger|direct|direct messages?|inbox|chats?)([,:]\s*.*)?$/i;
+const DM_ID = /(^|\/)(direct_tab|action_bar_inbox_button|action_bar_inbox|direct_inbox_button|inbox_button|messenger_button)$/;
+const DM_COUNT = [/(\d{1,4})\s*\+?\s*(unread|new)\b/i, /^(?:message|messages|messenger|direct(?: messages?)?|inbox|chats?)[,:]?\s+(\d{1,4})\s*\+?$/i];
+const BADGE_TEXT = /^(\d{1,4})\s*\+?$/;
+const BADGE_ID = /badge|dot|indicator|unread/i;
+function parseDmUnread(nodesIn) {
+  const nodes = boxed(nodesIn);
+  if (!nodes.length) return { value: null, why: 'empty screen' };
+  const f = frame(nodes);
+  const { h } = size(nodes);
+  if (conversation(nodes, f)) return { value: null, why: 'a conversation is open' };
+  // only the bars: a "Message" button on a profile, or a word in a list, is never the icon
+  const inBars = (n) => n.bounds.b <= h * 0.13 || n.bounds.t >= h * 0.86;
+  const icons = nodes.filter((n) => inBars(n) && (DM_ID.test(n.id) || DM_LABEL.test(norm(n.desc))));
+  if (!icons.length) return { value: null, why: 'no Messages icon on this screen' };
+  const whereOf = (n) => (n.bounds.t >= h * 0.86 ? 'bottom bar' : 'top bar');
+  let dot = false;
+  for (const ic of icons) {
+    for (const s of labelsOf(ic)) for (const re of DM_COUNT) { const m = re.exec(s); if (m) return { value: parseInt(m[1], 10), why: '', where: whereOf(ic) }; }
+    // a badge: a small node whose centre is on the icon (or just off its corner)
+    const near = (n) => n !== ic && (n.bounds.r - n.bounds.l) < 140 && n.cx >= ic.bounds.l - 40 && n.cx <= ic.bounds.r + 40
+      && n.cy >= ic.bounds.t - 40 && n.cy <= ic.bounds.b + 40;
+    for (const n of nodes) {
+      if (!near(n)) continue;
+      for (const s of labelsOf(n)) {
+        const m = BADGE_TEXT.exec(s) || DM_COUNT[0].exec(s);
+        if (m) return { value: parseInt(m[1], 10), why: '', where: whereOf(ic) };
+      }
+      if (!lbl(n) && BADGE_ID.test(n.id)) dot = true;
+    }
+  }
+  return dot ? { value: null, why: 'a badge without a number' } : { value: 0, why: '', where: whereOf(icons[0]) };
+}
+
+// ACCOUNT STATUS. Instagram's own verdict on the account: profile -> menu -> "Settings and activity"
+// -> (scrolled down to "More info and support") "Account status". The page lists a few rows -
+// removed content, what can't be recommended, features you can't use, account at risk of being
+// disabled, (pro accounts) monetization - each with "No issues" / a check mark, or what is wrong.
+const STATUS_TAPS = /^(options|menu|settings and activity|settings and privacy|account status)$/i;
+const MENU_ALLOW = /^(options|menu|settings and activity)$/i;
+const SETTINGS_ROW_ALLOW = /^(settings and activity|settings and privacy)$/i;
+const STATUS_ROW_ALLOW = /^account status$/i;
+const SETTINGS_TITLE = /^settings( and (activity|privacy))?$/i;
+const STATUS_TITLE = /^account status$/i;
+// 'settings' | 'account_status' | '' - by the page's title in its title bar. Settings keeps its title
+// pinned, so its own "Account status" row scrolled to the top never reads as the status page.
+// A title is WRITTEN (text, not an icon's read-out): the dashboard's gear icon and the login
+// chooser's are also "Settings".
+function settingsKind(nodes, f) {
+  const bar = (re) => nodes.some((n) => n.bounds.b <= f.top + f.span * 0.14 && n.bounds.t < f.top + f.span * 0.1 && re.test(norm(n.text)));
+  if (bar(SETTINGS_TITLE)) return 'settings';
+  if (bar(STATUS_TITLE)) return 'account_status';
+  return '';
+}
+const STATUS_ROWS = [
+  { kind: 'removed_content', re: /^(removed content( and messaging issues)?|content (we|that was) removed)$/i },
+  { kind: 'not_recommended', re: /^(what can'?t be recommended|content that can'?t be recommended|recommendations?|recommendation (status|eligibility)|(content )?lowered in feed)$/i },
+  { kind: 'features_limited', re: /^(features you can'?t use|feature limits|limited features|restricted features)$/i },
+  { kind: 'at_risk', re: /^((your )?account (is |may be |could be )?at risk( of being disabled)?|(your )?account (may|could) be disabled)$/i },
+  { kind: 'monetization', re: /^monetization( status)?$/i },
+];
+const OK_LINE = /^(no issues?( found)?|no (removed content|restrictions?|limits?|violations?|issues with your (account|content))|nothing (was |is |has been )?(removed|limited|restricted)|you('re| are) (all )?(good|set)|you haven'?t .*|your (account|content) (can be recommended|follows .*|is (eligible|fine|in good standing).*)|eligible|none|0 (items|issues))\.?$/i;
+const BAD_LINE = /(\b\d+\s+(items?|issues?|pieces? of content|posts?|reels?|features?|violations?)\b|can'?t be recommended|cannot be recommended|not (eligible|recommended)|\bat risk\b|may be disabled|could be disabled|you can'?t\b|\blimited\b|\brestricted\b|\bremoved\b)/i;
+const OK_ICON = /^(no issues?|check ?mark|checked|green check|ok|good|eligible|success)$/i;
+const BAD_ICON = /^(issues?|warning|alert|error|attention|caution|not eligible|at risk)$/i;
+const PAGE_OK = /^(no issues|your account is (fine|in good standing)|you haven'?t (posted|shared|done) anything .*|everything looks good)\.?$/i;
+const PAGE_BAD = [
+  { kind: 'at_risk', re: /^(your account (is|may be|could be) (at risk|disabled)|your account is at risk of being disabled)\b/i },
+  { kind: 'not_recommended', re: /^your (account|content) can'?t be recommended\b/i },
+  { kind: 'features_limited', re: /^you can'?t use some features\b/i },
+];
+function newStatus() { return { state: 'unknown', items: [], seen: [], ok: [], why: '' }; }
+// One screen of the Account status page, merged over the earlier screens (`prev`). A row's verdict
+// comes from the lines and icons in its own band (its title down to the next row's title), never
+// from its title ("Removed content" is the row's name, not a removal).
+function parseAccountStatus(nodesIn, prev) {
+  const st = prev ? clone(prev) : newStatus();
+  const nodes = boxed(nodesIn);
+  if (!nodes.length) return st;
+  const f = frame(nodes);
+  const body = nodes.filter((n) => n.bounds.t > f.top + f.span * 0.1).sort((a, b) => a.bounds.t - b.bounds.t || a.bounds.l - b.bounds.l);
+  const titles = [];
+  for (const n of body) { const d = STATUS_ROWS.find((r) => is(n, r.re)); if (d && !titles.some((t) => t.kind === d.kind)) titles.push({ kind: d.kind, n }); }
+  const inRows = new Set();
+  const add = (kind, title, detail) => {
+    if (!st.items.some((x) => x.kind === kind)) st.items.push({ kind, title: clip(title, 80), detail: clip(detail || '', 120) });
+    st.ok = st.ok.filter((k) => k !== kind);
+  };
+  titles.forEach((t, i) => {
+    const top = t.n.bounds.t - 40;
+    const next = titles[i + 1];
+    const bottom = next ? next.n.bounds.t - 4 : t.n.bounds.b + 220;
+    const band = body.filter((n) => n !== t.n && n.bounds.t >= top && n.bounds.t < bottom);
+    band.forEach((n) => inRows.add(n));
+    inRows.add(t.n);
+    const lines = band.flatMap(labelsOf).filter((s) => !STATUS_ROWS.some((r) => r.re.test(s)));
+    const okL = lines.find((s) => OK_LINE.test(s) || OK_ICON.test(s));
+    const badL = lines.find((s) => !OK_LINE.test(s) && !OK_ICON.test(s) && (BAD_LINE.test(s) || BAD_ICON.test(s)));
+    if (!st.seen.includes(t.kind)) st.seen.push(t.kind);
+    if (badL) {
+      const words = BAD_ICON.test(badL) ? (lines.find((s) => s !== badL && !BAD_ICON.test(s) && !OK_ICON.test(s)) || badL) : badL;
+      add(t.kind, lbl(t.n), words);
+    } else if (okL && !st.items.some((x) => x.kind === t.kind) && !st.ok.includes(t.kind)) st.ok.push(t.kind);
+  });
+  for (const n of body) {
+    if (inRows.has(n)) continue;
+    for (const s of labelsOf(n)) {
+      if (s.length > 140) continue;
+      const b = PAGE_BAD.find((x) => x.re.test(s));
+      if (b) add(b.kind, s, '');
+      else if (PAGE_OK.test(s)) st.page_ok = true;
+    }
+  }
+  st.state = st.items.length ? 'issues' : (st.ok.length || st.page_ok) ? 'no_issues' : 'unknown';
+  return st;
+}
+// The profile's menu icon (top right of the OWN profile's bar), "Settings and activity" on an older
+// build's menu sheet, and the "Account status" row on Settings - the step's only tap targets.
+function menuTarget(nodesIn) {
+  const nodes = boxed(nodesIn);
+  const { w, h } = size(nodes);
+  const n = nodes.find((x) => x.bounds.b <= h * 0.13 && x.cx > w * 0.6
+    && (MENU_ALLOW.test(norm(x.desc)) || /(^|\/)(action_bar_overflow|profile_menu_button|menu_button)$/.test(x.id)));
+  return n ? ig.tapTarget(nodes, n) : null;
+}
+function settingsRowTarget(nodesIn) {
+  const nodes = boxed(nodesIn);
+  const n = first(nodes, SETTINGS_ROW_ALLOW);
+  return n ? ig.tapTarget(nodes, n) : null;
+}
+function statusRowTarget(nodesIn) {
+  const nodes = boxed(nodesIn);
+  const f = frame(nodes);
+  const n = first(nodes, STATUS_ROW_ALLOW, (x) => x.bounds.t > f.top + f.span * 0.1 && x.bounds.b < f.h * 0.95);
+  return n ? ig.tapTarget(nodes, n) : null;
 }
 
 // ---- 12. the visit ---------------------------------------------------------------------------
@@ -1021,7 +1198,8 @@ class Abort extends Error { constructor(why) { super(why); this.why = why; } }
 function context(driver, o) {
   const now = driver.now || (() => Date.now());
   const t0 = now();
-  const R = { state: 'unreadable', status: 'UNKNOWN', username: '', accounts: [], notices: [], remembered: [], why: '', screens: [], trace: [] };
+  const R = { state: 'unreadable', status: 'UNKNOWN', username: '', accounts: [], notices: [], remembered: [], why: '', screens: [], trace: [],
+    dm_unread: null, account_status: null };
   const k = { notice: 0, popup: 0, promo: 0, other: 0, launch: 0, unlock: 0, dumps: 0, back: 0 };
   let viewerAt = -Infinity;
   const ctx = {
@@ -1049,8 +1227,8 @@ function context(driver, o) {
       ctx.nodes = boxed(ig.parseDump(xml));
       return ctx.nodes;
     },
-    async tap(node, why) {
-      const refused = tapRefused(ctx.nodes, node.cx, node.cy);
+    async tap(node, why, allow) {
+      const refused = tapRefused(ctx.nodes, node.cx, node.cy, allow);
       if (refused) { ctx.note('tap', false, `${why}: refused, ${refused}`); return false; }
       await ctx.viewer(false);
       await driver.tap(node.cx, node.cy);
@@ -1159,7 +1337,7 @@ async function interrupt(ctx, nodes, c) {
 // Deeper Instagram screens left open (by a previous run, or by Instagram resuming where it was):
 // Back, a few times.
 async function backOutOfDeep(ctx, c) {
-  if (!['switcher', 'dashboard', 'insights_overview', 'insights_audience'].includes(c.kind) || ctx.k.back >= 6) return false;
+  if (!['switcher', 'dashboard', 'insights_overview', 'insights_audience', 'settings', 'account_status'].includes(c.kind) || ctx.k.back >= 6) return false;
   ctx.k.back++;
   await ctx.key('back', `${c.kind} still open`);
   await ctx.wait(1200);
@@ -1174,7 +1352,7 @@ async function reachMain(ctx) {
     const c = classifyScreen(nodes, { appPkg: ctx.o.appPkg });
     if (nodes.length) anything = true;
     if (firstShot) { ctx.shot('start', nodes); firstShot = false; }
-    if (c.kind === 'feed' || c.kind === 'profile') { ctx.note('screen', true, c.kind); return { nodes, c }; }
+    if (c.kind === 'feed' || c.kind === 'profile') { ctx.note('screen', true, c.kind); seeDms(ctx, nodes); return { nodes, c }; }
     if (await interrupt(ctx, nodes, c)) { unknown = 0; continue; }
     if (await backOutOfDeep(ctx, c)) continue;
     // when in doubt, Back: at once out of a conversation (a DM thread the app resumed in), after three
@@ -1219,6 +1397,7 @@ async function readOwnProfile(ctx, start) {
   }
   if (!best) { ctx.shot('profile', nodes, true); stop(ctx, 'unreadable', 'UNKNOWN', 'header_not_found'); }
   ctx.shot('profile', best.nodes);
+  seeDms(ctx, best.nodes);
   return best;
 }
 // Look until one of `kinds` is on screen (handling pop-ups and notices on the way), at most `ms`.
@@ -1235,10 +1414,10 @@ async function waitFor(ctx, kinds, ms, accept) {
 }
 // Tap, then wait for the next screen; when the screen did not move (a tooltip or an animation took
 // the tap), tap once more. `again(nodes, c)` finds the target again on the screen we are still on.
-async function tapUntil(ctx, target, why, kinds, ms, again) {
+async function tapUntil(ctx, target, why, kinds, ms, again, allow) {
   let t = target, s = null;
   for (let i = 0; i < 2 && t; i++) {
-    if (!(await ctx.tap(t, i ? `${why} (again)` : why))) break;
+    if (!(await ctx.tap(t, i ? `${why} (again)` : why, allow))) break;
     await ctx.wait(2500);
     s = await waitFor(ctx, kinds, ms);
     if (!s.timeout) return s;
@@ -1251,7 +1430,7 @@ async function backToProfile(ctx) {
   for (let i = 0; i < 5; i++) {
     const nodes = await ctx.dump();
     const c = classifyScreen(nodes, { appPkg: ctx.o.appPkg });
-    if (c.kind === 'profile' && c.detail.own) return { nodes, c };
+    if (c.kind === 'profile' && c.detail.own) { seeDms(ctx, nodes); return { nodes, c }; }
     if (await interrupt(ctx, nodes, c)) continue;
     if (c.kind === 'feed') { const t = profileTab(nodes); if (t && await ctx.tap(t, 'profile tab')) { await ctx.wait(2000); continue; } }
     if (i === 4) break;
@@ -1454,6 +1633,75 @@ async function readInsights(ctx, profileNodes) {
   if (!back.ok || !back.value) why('did not get back to the profile');
   return ins;
 }
+// v0.5.17: the unread-DM badge of every feed / own-profile screen the visit passes. The badge can
+// arrive a moment after the app opened, and nothing in a read-only visit lowers it: the highest
+// reading counts.
+function seeDms(ctx, nodes) {
+  const d = parseDmUnread(nodes);
+  if (d.value == null) { if (!ctx.dmWhy) ctx.dmWhy = d.why; return; }
+  if (ctx.R.dm_unread == null || d.value > ctx.R.dm_unread) { ctx.R.dm_unread = d.value; ctx.dmWhere = d.where; }
+}
+// Step 7b (v0.5.17, only with `status_page`): menu -> Settings and activity -> Account status, read
+// (scrolled at most twice, never a tap on it), Back to the profile. Returns { state, items, seen,
+// page_ok?, why }. A failure here never fails the check: `state: 'unknown'` and the reason in `why`.
+async function readAccountStatus(ctx) {
+  const out = newStatus();
+  const cls = (n) => classifyScreen(n, { appPkg: ctx.o.appPkg });
+  const r = await soft(ctx, async () => {
+    let nodes = await ctx.dump();
+    const c0 = cls(nodes);
+    if (!(c0.kind === 'profile' && c0.detail.own)) { const b = await backToProfile(ctx); if (!b) { out.why = 'not on the profile'; return; } nodes = b.nodes; }
+    const m = menuTarget(nodes);
+    if (!m) { out.why = 'the profile menu was not found'; return; }
+    let s = await tapUntil(ctx, m, 'profile menu', ['settings'], 6000, (n, c) => (c.kind === 'profile' ? menuTarget(n) : null), MENU_ALLOW);
+    if (s.timeout) {
+      // an older build: the menu is a sheet with a "Settings and activity" / "Settings and privacy" row
+      const row = settingsRowTarget(s.nodes);
+      if (row) s = await tapUntil(ctx, row, 'menu sheet: Settings', ['settings'], 6000, null, SETTINGS_ROW_ALLOW);
+    }
+    if (s.timeout) { out.why = 'Settings did not open'; ctx.shot('settings?', s.nodes); return; }
+    ctx.shot('settings', s.nodes);
+    // "Account status" sits under "More info and support", near the bottom: scroll down to it
+    let target = statusRowTarget(s.nodes), sig = signature(s.nodes);
+    const { w, h } = size(s.nodes);
+    for (let i = 0; i < 8 && !target; i++) {
+      await ctx.swipe(w / 2, h * 0.78, w / 2, h * 0.34, 700, 'Settings scroll');
+      await ctx.wait(1000);
+      const n2 = await ctx.dump();
+      if (cls(n2).kind !== 'settings') break;
+      const sg = signature(n2);
+      if (sg === sig) break;   // the bottom of Settings
+      sig = sg;
+      target = statusRowTarget(n2);
+    }
+    if (!target) { out.why = '"Account status" not found in Settings'; ctx.shot('settings', ctx.nodes, true); return; }
+    const a = await tapUntil(ctx, target, 'Settings: "Account status"', ['account_status'], 8000,
+      (n, c) => (c.kind === 'settings' ? statusRowTarget(n) : null), STATUS_ROW_ALLOW);
+    if (a.timeout) { out.why = 'the Account status page did not open'; ctx.shot('status?', a.nodes); return; }
+    ctx.shot('account_status', a.nodes, true);
+    let st = parseAccountStatus(a.nodes, null);
+    sig = signature(a.nodes);
+    for (let i = 0; i < 2; i++) {   // the rows further down: scrolled, never tapped
+      await ctx.swipe(w / 2, h * 0.78, w / 2, h * 0.40, 700, 'Account status scroll');
+      await ctx.wait(1000);
+      const n2 = await ctx.dump();
+      if (cls(n2).kind !== 'account_status') break;
+      const sg = signature(n2);
+      if (sg === sig) break;
+      sig = sg;
+      st = parseAccountStatus(n2, st);
+    }
+    Object.assign(out, { state: st.state, items: st.items, seen: st.seen });
+    if (st.page_ok) out.page_ok = true;
+    if (st.state === 'unknown') out.why = 'the page was open but its wording was not recognised';
+  });
+  if (!r.ok && !out.why) out.why = `stopped: ${r.why}`;
+  // Back (keys only) out of the status page and Settings, to the profile - verified
+  const back = await soft(ctx, () => backToProfile(ctx));
+  if ((!back.ok || !back.value) && !out.why) out.why = 'did not get back to the profile';
+  ctx.note('status', out.state !== 'unknown', `Account status: ${out.state}${out.items.length ? ' - ' + out.items.map((x) => x.kind).join(', ') : ''}${out.why ? ' (' + out.why + ')' : ''}`);
+  return out;
+}
 // Step 8: the accounts sheet (tap the title, read, Back). Returns [{username, active}] or null.
 async function readAccountsSheet(ctx, username) {
   let nodes = await ctx.dump();
@@ -1493,7 +1741,7 @@ function account(username, active) {
   return { username, active, name: '', posts: null, followers: null, following: null, views_30d: null, read: 'list', account_type: '', insights: null };
 }
 async function check(driver, opts) {
-  const o = Object.assign({ appPkg: IG_PKG, insights: true, others: true, today: '' }, opts || {});
+  const o = Object.assign({ appPkg: IG_PKG, insights: true, others: true, status_page: false, today: '' }, opts || {});
   const ctx = context(driver, o);
   const R = ctx.R;
   try {
@@ -1509,9 +1757,16 @@ async function check(driver, opts) {
     R.state = 'checked'; R.status = 'HEALTHY';
     if (hd.followers == null && hd.posts == null && hd.following == null) R.why = 'counts_not_found';
     ctx.note('profile', true, `@${hd.username}: ${hd.posts} posts, ${hd.followers} followers, ${hd.following} following, ${hd.views_30d} views/30d, ${me.account_type || 'type ?'}`);
+    ctx.note('dms', R.dm_unread != null, R.dm_unread != null ? `unread DMs ${R.dm_unread} (${ctx.dmWhere})` : `unread DMs not read: ${ctx.dmWhy || 'no Messages icon seen'}`);
     // step 7
     if (o.insights !== false && hd.has_dashboard) {
       me.insights = ctx.left() > MIN_LEFT.insights ? await readInsights(ctx, prof.nodes) : emptyInsights(['skipped: not enough time left in the check']);
+    }
+    // step 7b (v0.5.17): Instagram's own Account status, only when the op asks for it
+    if (o.status_page === true) {
+      R.account_status = ctx.left() > MIN_LEFT.status ? await readAccountStatus(ctx)
+        : Object.assign(newStatus(), { why: 'skipped: not enough time left in the check' });
+      delete R.account_status.ok;
     }
     // step 8 + 9
     if (o.others !== false) {
@@ -1547,7 +1802,11 @@ function finish(ctx) {
   if (R.username) {   // the username stays out of the evidence, like igpost's traces
     for (const s of R.screens) s.texts = s.texts.map((t) => redactUser(t, R.username));
     for (const t of R.trace) t.matched = redactUser(t.matched, R.username).slice(0, 160);
+    if (R.account_status) for (const it of R.account_status.items) { it.title = redactUser(it.title, R.username); it.detail = redactUser(it.detail, R.username); }
   }
+  // v0.5.17: a profile that was not read (logged out, blocked, unreadable) has no inbox count and no
+  // Account status to speak of
+  if (R.state !== 'checked') { R.dm_unread = null; R.account_status = null; }
   return R;
 }
 
@@ -1621,6 +1880,8 @@ module.exports = {
   parseDashboard, parseOverview, parseAudience, parsePct, parseDate, parseRange, statusFor, handleOf,
   // where a tap may land
   profileTab, dashboardRow, viewsRow, tabTarget, chipTarget, titleTarget, tileRow, dayChips, tapRefused,
+  // v0.5.17: unread DMs, Instagram's Account status
+  parseDmUnread, parseAccountStatus, menuTarget, settingsRowTarget, statusRowTarget, STATUS_TAPS,
   // the visit
   check, emptyInsights, newOverview, newAudience,
   // adb output, for core.js

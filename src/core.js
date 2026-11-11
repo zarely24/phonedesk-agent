@@ -2651,7 +2651,11 @@ class AgentCore extends EventEmitter {
     const pkg = igcheck.IG_PKG;
     const t0 = Date.now();
     const log = (x) => this.emit('log', `[check ${serial} u${uid}] ${x}`);
-    const base = { uid, agent_version: this.appVersion || AGENT_VERSION, username: '', accounts: [], notices: [], remembered: [], why: '', screens: [], trace: [] };
+    // v0.5.17: dm_unread (the Messages badge, null = not read) and account_status (Instagram's own
+    // Account status page, only with `status_page: true`; null = not asked / not read) - both opt-in
+    // keys an older backend simply ignores
+    const base = { uid, agent_version: this.appVersion || AGENT_VERSION, username: '', accounts: [], notices: [], remembered: [], why: '', screens: [], trace: [],
+      dm_unread: null, account_status: null };
     const reply = (obj) => this._rpcReply(ws, m, Object.assign({}, base, obj, { uid, seconds: Math.round((Date.now() - t0) / 1000) }));
     if (!(uid >= 0)) return reply({ ok: false, state: 'bad_request', status: 'UNKNOWN', why: 'uid missing' });
     if (!this._posting) this._posting = new Set();
@@ -2715,7 +2719,7 @@ class AgentCore extends EventEmitter {
     const driver = this._checkDriver(serial, uid, pkg, guard);
     // The visit gets what is left of ~250 s (the backend waits 300; putting the phone back needs some).
     const r = await igcheck.check(driver, {
-      appPkg: pkg, insights: m.insights !== false, others: m.others !== false, today,
+      appPkg: pkg, insights: m.insights !== false, others: m.others !== false, status_page: m.status_page === true, today,
       budgetMs: Math.max(60000, 250000 - (Date.now() - t0)), log: (x) => log(`  ${x}`),
     });
     if (r.aborted) { delete r.aborted; log('a viewer opened the phone - stopped'); return Object.assign(r, { ok: false, state: 'device_busy', status: 'UNKNOWN', why: 'viewer_opened' }); }
@@ -2727,7 +2731,9 @@ class AgentCore extends EventEmitter {
     const a = out.accounts[0];
     log(`-> ${out.state} / ${out.status}${out.username ? ' @' + out.username : ''}${a && a.followers != null ? ', ' + a.followers + ' followers' : ''}`
       + `${out.accounts.length > 1 ? ', ' + (out.accounts.length - 1) + ' other account(s)' : ''}${out.notices.length ? ', ' + out.notices.length + ' notice(s)' : ''}`
-      + `${a && a.insights ? ', insights' + (a.insights.why.length ? ' (' + a.insights.why.length + ' missing)' : '') : ''}${out.why ? ' (' + out.why + ')' : ''} in ${Math.round((Date.now() - t0) / 1000)} s`);
+      + `${a && a.insights ? ', insights' + (a.insights.why.length ? ' (' + a.insights.why.length + ' missing)' : '') : ''}`
+      + `${out.dm_unread != null ? ', ' + out.dm_unread + ' unread DM(s)' : ''}${out.account_status ? ', Account status ' + out.account_status.state : ''}`
+      + `${out.why ? ' (' + out.why + ')' : ''} in ${Math.round((Date.now() - t0) / 1000)} s`);
     return out;
   }
 

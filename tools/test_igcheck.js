@@ -1007,6 +1007,159 @@ const kind = (xml) => ck.classifyScreen(P(xml)).kind;
     }
   }
 
+  // ---------- 10c. v0.5.17: unread DMs and Instagram's own Account status ----------
+  let statusedPhone = null;   // the phone of these visits, for the core.js check in section 11
+  // THESE SCREENS ARE NOT FROM THE FARM'S PHONES. Nobody has photographed a DM badge or the Account
+  // status page on a farm phone yet: they are modelled on Instagram's known layouts (the Messages tab
+  // of the 2024+ bottom bar, id direct_tab, with its count badge; the older top-bar Messenger icon, id
+  // action_bar_inbox_button; Settings and activity -> More info and support -> Account status, with
+  // its rows removed content / what can't be recommended / features you can't use / account at risk),
+  // at the 1080x2400 geometry of the screens above. The first real runs' `screens` say what to tune.
+  {
+    const BADGE = (n, x) => T(n, 572, 2214, 618, 2256, { id: 'notification_badge', ...(x || {}) });   // on the Message tab's top-right corner
+    const FEED_DM = (n) => screen(D('New post', 36, 180, 90, 234, { click: true }), STORIES(['avaxreyess', 'nimkguyen', 'tracifoube']),
+      T('zoeyiso', 150, 674, 282, 712), NAV, n == null ? [] : [BADGE(n)]);
+    const PROFILE_DM = (n) => screen(T('urfavekadiee', 43, 174, 444, 234, { id: 'action_bar_title', click: true }), D('Muse', 708, 174, 774, 234, { click: true }),
+      D('New post', 840, 174, 894, 234, { click: true }), D('Options', 970, 174, 1022, 234, { click: true }), PROFILE_BODY_K, NAV, n == null ? [] : [BADGE(n)]);
+    // the Message tab read out with its count, no badge node
+    const NAV_READOUT = NAV.map((x) => (x.desc === 'Message' ? { ...x, desc: 'Message, 5 unread messages' } : x));
+    // an older build: the Messenger icon in the feed's top bar, the badge on it; no Messages tab below
+    const FEED_TOPBAR = screen(D('Instagram', 374, 170, 682, 240), D('Activity', 850, 180, 910, 234, { click: true }),
+      D('Messenger', 966, 180, 1026, 234, { click: true, id: 'action_bar_inbox_button' }), T('12', 1000, 160, 1046, 202, { id: 'action_bar_inbox_badge' }),
+      T('zoeyiso', 150, 674, 282, 712), NAV.filter((x) => x.desc !== 'Message'));
+    const dm = (xml) => { const d = ck.parseDmUnread(P(xml)); return d.value; };
+    check('unread DMs: the badge on the Messages tab, "9+" as 9, no badge = 0, the read-out "Message, 5 unread messages", the older top-bar Messenger badge',
+      [dm(FEED_DM('3')), dm(FEED_DM('9+')), dm(FEED_DM('99+')), dm(FEED_DM(null)), dm(screen(T('zoeyiso', 150, 674, 282, 712), NAV_READOUT)), dm(FEED_TOPBAR), dm(PROFILE_DM('4'))],
+      [3, 9, 99, 0, 5, 12, 4]);
+    check('unread DMs: nothing to read = null - no Messages icon (a login screen, Insights), a badge that is only a dot, a DM thread',
+      [dm(LOGIN_FORM), dm(OV1), dm(screen(NAV, V(585, 2220, 605, 2240, { id: 'tab_badge_dot' }))), ck.parseDmUnread(P(screen(NAV, V(585, 2220, 605, 2240, { id: 'tab_badge_dot' })))).why,
+        dm(screen(D('Back', 30, 174, 100, 234, { click: true }), T('fan.account22', 150, 170, 520, 210), D('Audio call', 820, 174, 880, 234, { click: true }),
+          T('3', 600, 900, 640, 940), T('Message...', 40, 2200, 900, 2300, { cls: 'android.widget.EditText', click: true })))],
+      [null, null, null, 'a badge without a number', null]);
+    check('unread DMs: someone else\'s "Message" button and the numbers on a profile are not the badge (only the bars count)',
+      [dm(VISIT_BACKUP), dm(PROFILE_K)], [0, 0]);
+
+    // Settings and activity (top, then scrolled to the bottom) and the Account status page
+    const ROW = (label, y, x) => [C(0, y, 1080, y + 120, { click: true }), T(label, 150, y + 40, 150 + label.length * 19, y + 80, x)];
+    const SETTINGS1 = screen(D('Back', 43, 180, 103, 234, { click: true }), T('Settings and activity', 190, 180, 640, 234),
+      T('', 43, 280, 1037, 370, { cls: 'android.widget.EditText', desc: 'Search', click: true }), T('Your account', 43, 420, 280, 460),
+      C(0, 480, 1080, 640, { click: true }), T('Accounts Center', 150, 510, 470, 550), T('Password, security, personal details, ad preferences', 150, 560, 960, 600),
+      T('How you use Instagram', 43, 690, 470, 730), ROW('Saved', 750), ROW('Archive', 880), ROW('Your activity', 1010), ROW('Notifications', 1140), ROW('Time management', 1270),
+      T('Who can see your content', 43, 1420, 520, 1460), ROW('Account privacy', 1480), ROW('Close Friends', 1610), ROW('Blocked', 1740), ROW('Hide story and live', 1870));
+    const SETTINGS2 = screen(D('Back', 43, 180, 103, 234, { click: true }), T('Settings and activity', 190, 180, 640, 234),
+      T('More info and support', 43, 420, 480, 460), ROW('Help', 480), ROW('Privacy Center', 610), ROW('Account Status', 740), ROW('About', 870),
+      T('Login', 43, 1040, 160, 1080), T('Add account', 43, 1110, 280, 1150, { click: true }), T('Log out', 43, 1200, 200, 1240, { click: true }),
+      T('Log out of all accounts', 43, 1290, 480, 1330, { click: true }));
+    const STATUS_HEAD = [D('Back', 43, 180, 103, 234, { click: true }), T('Account status', 190, 180, 560, 234), D('Profile picture', 440, 300, 640, 500),
+      T('urfavekadiee', 380, 520, 700, 560), T('See if your account or content goes against our Community Guidelines or Recommendation Guidelines, and what that means for you.', 43, 600, 1037, 720)];
+    // a row: its title, then either a line under it or an icon on its right read out ("No issues" / "Issue")
+    const SROW = (title, y, line, icon) => [C(0, y, 1080, y + 170, { click: true }), T(title, 150, y + 30, 900, y + 70),
+      ...(line ? [T(line, 150, y + 80, 900, y + 120)] : []), ...(icon ? [D(icon, 960, y + 50, 1020, y + 110)] : [])];
+    const STATUS_OK = screen(STATUS_HEAD, SROW('Removed content and messaging issues', 780, '', 'No issues'), SROW('What can\'t be recommended', 960, '', 'No issues'),
+      SROW('Features you can\'t use', 1140, '', 'No issues'), SROW('Account at risk of being disabled', 1320, '', 'No issues'),
+      T('Learn more about how account status works', 43, 1600, 900, 1640, { click: true }));
+    const STATUS_BAD1 = screen(STATUS_HEAD, SROW('Removed content and messaging issues', 780, '1 removed post', 'Issue'),
+      SROW('What can\'t be recommended', 960, 'Your account can\'t be recommended to non-followers', ''));
+    const STATUS_BAD2 = screen(STATUS_HEAD.slice(0, 2), SROW('What can\'t be recommended', 300, 'Your account can\'t be recommended to non-followers', ''),
+      SROW('Features you can\'t use', 480, 'You can\'t go live for now', 'Issue'), SROW('Account at risk of being disabled', 660, 'No issues', ''));
+    const sk = (xml) => ck.classifyScreen(P(xml)).kind;
+    check('Settings and its Account status page are recognised by their title bars - not as the accounts sheet ("Add account"), a login ("Log out") or a block ("account at risk")',
+      [sk(SETTINGS1), sk(SETTINGS2), sk(STATUS_OK), sk(STATUS_BAD1), sk(STATUS_BAD2)], ['settings', 'settings', 'account_status', 'account_status', 'account_status']);
+    check('...and the dashboard\'s gear icon "Settings" or a fan named "Account status" in a DM thread is neither',
+      [sk(DASH_K), sk(screen(D('Back', 30, 174, 100, 234, { click: true }), T('Account status', 150, 170, 520, 210), D('Audio call', 820, 174, 880, 234, { click: true }),
+        T('hey', 600, 900, 900, 940), T('Message...', 40, 2200, 900, 2300, { cls: 'android.widget.EditText', click: true })))],
+      ['dashboard', 'unknown']);
+    const ps = (xml, prev) => ck.parseAccountStatus(P(xml), prev);
+    const okSt = ps(STATUS_OK);
+    check('Account status, nothing wrong: no_issues, every row seen, no items', [okSt.state, okSt.items, okSt.seen],
+      ['no_issues', [], ['removed_content', 'not_recommended', 'features_limited', 'at_risk']]);
+    const bad = ps(STATUS_BAD2, ps(STATUS_BAD1));
+    check('Account status with issues, over two scrolled screens: removed content, not recommended, a feature limit - the row at risk is fine',
+      [bad.state, bad.items, bad.seen.length],
+      ['issues', [{ kind: 'removed_content', title: 'Removed content and messaging issues', detail: '1 removed post' },
+        { kind: 'not_recommended', title: 'What can\'t be recommended', detail: 'Your account can\'t be recommended to non-followers' },
+        { kind: 'features_limited', title: 'Features you can\'t use', detail: 'You can\'t go live for now' }], 4]);
+    check('Account status: a page whose rows are not recognised is "unknown", never a guess', ps(screen(STATUS_HEAD, T('Something else entirely', 150, 800, 900, 840))).state, 'unknown');
+
+    // the tap rules of the step
+    const at2 = (xml, re, allow) => { const ns = P(xml); const n = ns.find((x) => re.test(x.text) || re.test(x.desc)); return ck.tapRefused(ns, n.cx, n.cy, allow); };
+    check('taps: the profile\'s "Options" only with the step\'s allow-list; an allow-list never opens anything outside STATUS_TAPS ("Edit profile", "Log out")',
+      [at2(PROFILE_K, /^Options$/, null) !== '', at2(PROFILE_K, /^Options$/, /^(options|menu|settings and activity)$/i), at2(PROFILE_K, /^Edit profile$/, /.*/) !== '',
+        at2(SETTINGS2, /^Log out$/, /.*/) !== ''],
+      [true, '', true, true]);
+    check('taps: on Settings only the "Account status" row, and only with the allow-list; on the Account status page nothing at all, whatever is allowed',
+      [at2(SETTINGS2, /^Account Status$/, /^account status$/i), at2(SETTINGS2, /^Account Status$/, null) !== '', at2(SETTINGS1, /^Saved$/, /^account status$/i) !== '',
+        ...[/^Removed content/, /^No issues$/, /^Learn more/, /^Back$/].map((re) => at2(STATUS_OK, re, /.*/))],
+      ['', true, true, 'the Account status page is only read (Back leaves it)', 'the Account status page is only read (Back leaves it)',
+        'the Account status page is only read (Back leaves it)', 'the Account status page is only read (Back leaves it)']);
+
+    // whole visits
+    const STATUSED = (statusXml, more) => ({
+      ...KADIE,
+      feed: { xml: FEED_DM('3'), tap: [[/^profile$/i, 'prof']] },
+      prof: { xml: PROFILE_DM('4'), tap: [[/^your dashboard$/i, 'dash'], [/^urfavekadiee$/, 'sheet'], [/^options$/i, 'set1']], back: 'feed' },
+      set1: { xml: SETTINGS1, up: 'set2', back: 'prof' },
+      set2: { xml: SETTINGS2, up: 'set2', back: 'prof', tap: [[/^account status$/i, 'stat']] },
+      stat: { xml: statusXml, up: more ? 'stat2' : 'stat', back: 'set2' },
+      ...(more ? { stat2: { xml: more, up: 'stat2', back: 'set2' } } : {}),
+    });
+    statusedPhone = () => phone(STATUSED(STATUS_OK), 'feed');
+    {
+      const F = phone(STATUSED(STATUS_OK), 'feed');
+      const r = await run(F);
+      check('visit, default (no status_page): unread DMs read off the feed and the profile (the higher, 4), Account status not opened, Options never tapped',
+        [r.state, r.dm_unread, r.account_status, F.seen.includes('set1'), F.taps.some((tp) => tp.labels.includes('Options'))], ['checked', 4, null, false, false]);
+    }
+    {
+      const F = phone(STATUSED(STATUS_OK), 'feed');
+      const r = await run(F, { status_page: true });
+      check('visit with status_page: menu -> Settings (scrolled) -> Account status read -> Back, Back; Insights and the sheet still read',
+        [r.state, r.status, r.account_status, r.accounts[0].insights.viewers, F.seen.includes('sheet'), F.seen[F.seen.length - 1]],
+        ['checked', 'HEALTHY', { state: 'no_issues', items: [], seen: ['removed_content', 'not_recommended', 'features_limited', 'at_risk'], why: '' }, 20198, true, 'prof']);
+      check('visit with status_page: the only new taps are "Options" and "Account Status"; nothing at all on the status page; no forbidden tap',
+        // (a tap on a row lands in the row's middle, beside its words: the row "Account Status" is the one at y 740-860)
+        [F.taps.filter((tp) => ['set1', 'set2', 'stat'].includes(tp.screen) || tp.labels.includes('Options'))
+          .map((tp) => `${tp.screen}: ${tp.labels.join('/') || (tp.screen === 'set2' && tp.y > 740 && tp.y < 860 ? 'Account Status' : '?')}`),
+          F.taps.filter((tp) => tp.screen === 'stat').length, F.keys.filter((k) => k.screen === 'stat').map((k) => k.k), badTaps(F)],
+        [['prof: Options', 'set2: Account Status'], 0, ['back'], []]);
+      check('visit with status_page: the trace says what Instagram said, the screens keep the page (username masked)',
+        [r.trace.some((t) => t.name === 'status' && /no_issues/.test(t.matched)), r.screens.some((s) => s.at === 'account_status'),
+          JSON.stringify(r.screens).includes('urfavekadiee')], [true, true, false]);
+    }
+    {
+      const F = phone(STATUSED(STATUS_BAD1, STATUS_BAD2), 'feed');
+      const r = await run(F, { status_page: true, insights: false, others: false });
+      check('visit with status_page, issues over two screens: state issues, three items, the page scrolled and never tapped',
+        [r.account_status.state, r.account_status.items.map((x) => x.kind), F.taps.filter((tp) => /^stat/.test(tp.screen)).length, r.status],
+        ['issues', ['removed_content', 'not_recommended', 'features_limited'], 0, 'HEALTHY']);
+    }
+    {
+      // Settings that never shows "Account status": the step gives up, says why, and the check stands
+      const def = STATUSED(STATUS_OK);
+      def.set2 = { ...def.set2, xml: SETTINGS1, tap: [] };
+      def.set1 = { ...def.set1, up: 'set1' };
+      const F = phone(def, 'feed');
+      const r = await run(F, { status_page: true, insights: false, others: false });
+      check('visit with status_page, no "Account status" row: unknown + why, still checked, back on the profile, nothing on Settings tapped',
+        [r.state, r.account_status.state, r.account_status.why, F.seen[F.seen.length - 1], F.taps.filter((tp) => /^set/.test(tp.screen)).length],
+        ['checked', 'unknown', '"Account status" not found in Settings', 'prof', 0]);
+    }
+    {
+      // a logged-out profile: no DM count, no Account status (nothing tapped)
+      const F = phone({ s: { xml: LOGIN_FORM } }, 's');
+      const r = await run(F, { status_page: true });
+      check('logged out with status_page: dm_unread null, account_status null, nothing tapped', [r.state, r.dm_unread, r.account_status, F.taps.length], ['logged_out', null, null, 0]);
+    }
+    {
+      // Instagram resumed on the Account status page (a previous run stopped there): Back out, then read
+      const def = { ...STATUSED(STATUS_OK), stat: { xml: STATUS_OK, back: 'feed' } };
+      const F = phone(def, 'stat');
+      const r = await run(F, { insights: false, others: false });
+      check('a visit that starts on the Account status page: Back (no tap there), then read', [r.state, F.keys[0] && F.keys[0].screen, F.taps.filter((tp) => tp.screen === 'stat').length],
+        ['checked', 'stat', 0]);
+    }
+  }
+
   // ---------- 11. core.js: the real igCheck op, with a scripted adb ----------
   // The adb lines igCheck sends are answered from a small model of the phone (users, current user,
   // what is resumed) and the same fake screens: `uiautomator dump` + `cat` show the current screen,
@@ -1095,6 +1248,20 @@ const kind = (xml) => ck.classifyScreen(P(xml)).kind;
         check('core: every step logged', ['settle: u12 com.android.launcher3', 'Instagram in front', '-> checked / HEALTHY @urfavekadiee, 85 followers', 'restored profile 0']
           .map((x) => core.logs.some((l) => l.includes(x))), [true, true, true, true]);
         check('core: the job lock is released', core._posting.has('SER1'), false);
+      }
+      {
+        // v0.5.17: the op's status_page reaches the visit (default off); dm_unread / account_status are in every reply
+        const a = makeCore(statusedPhone()), b = makeCore(statusedPhone());
+        await a.core.igCheck('SER1', { op: 'ig_check', request_id: 'd1', uid: 12, insights: false, others: false }, a.ws);
+        await b.core.igCheck('SER1', { op: 'ig_check', request_id: 'd2', uid: 12, insights: false, others: false, status_page: true }, b.ws);
+        const ra = a.replies[0], rb = b.replies[0];
+        check('core: dm_unread read through the real op (4, the badge on the profile); account_status null unless the op says status_page: true',
+          [ra.state, ra.dm_unread, ra.account_status, 'account_status' in ra, rb.state, rb.dm_unread, rb.account_status && rb.account_status.state, rb.account_status && rb.account_status.why],
+          ['checked', 4, null, true, 'checked', 4, 'no_issues', '']);
+        check('core: the trace and the log say it', [rb.trace.some((t) => t.name === 'status'), b.core.logs.some((l) => /4 unread DM\(s\), Account status no_issues/.test(l))], [true, true]);
+        const busy = makeCore(phone(KADIE, 'feed'), { viewer: true });
+        await busy.core.igCheck('SER2', { request_id: 'd3', uid: 12, status_page: true }, busy.ws);
+        check('core: an early reply (device_busy) still carries dm_unread / account_status as null', [busy.replies[0].dm_unread, busy.replies[0].account_status], [null, null]);
       }
       {
         const { core, calls, replies, ws } = makeCore(phone(KADIE, 'feed'), { viewer: true });
