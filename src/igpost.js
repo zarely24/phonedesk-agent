@@ -171,7 +171,7 @@ const FLOW_REEL = [
 //   open link in this profile -> Use audio -> camera with that sound -> gallery -> newest -> Add ->
 //   Next -> caption -> Share
 const FLOW_REEL_WITH_AUDIO = [
-  { name: 'audio-page', find: [{ text: /^use audio$/i }, { desc: /^use audio$/i }, { text: /use audio/i }, { desc: /use audio/i }, { id: /use_in_camera_button|use_audio|audio_page_cta/ }], action: 'tap', settle: 4000, timeout: 20000 },
+  { name: 'audio-page', find: [{ text: /^use audio$/i }, { desc: /^use audio$/i }, { text: /use audio/i }, { desc: /use audio/i }, { id: /use_in_camera_button|use_audio|audio_page_cta/ }], action: 'tap', settle: 4000, timeout: 20000, fallback: 'primary-button' },
   { name: 'camera-gallery', find: [{ id: /gallery_grid_item_thumbnail|camera_gallery_button|gallery_button|clips_gallery/ }, { desc: /^(open gallery|gallery|add from gallery|camera roll)/i }, { desc: /gallery/i }, { desc: /thumbnail/i }], action: 'tap', settle: 2500 },
   { name: 'gallery-newest', find: [{ id: /gallery_grid_item_thumbnail|gallery_grid_item_selection|media_thumbnail|gallery_item/ }, { desc: /^(video|photo) thumbnail/i }, { desc: /thumbnail/i }], action: 'tap', optional: true, settle: 2500, timeout: 6000 },
   { name: 'add-or-next', find: [{ text: /^(add|next)$/i }, { desc: /^(add|next)$/i }, { id: /next_button|clips_right_action_button|right_action_button|action_bar_button_action/ }], action: 'tap', settle: 4000 },
@@ -297,7 +297,7 @@ async function run(driver, flow, opts) {
     }
     // Look for a candidate, dismissing pop-ups in between, until the step's timeout.
     const limit = step.timeout || STEP_TIMEOUT_MS;
-    let hit = null, dismissed = 0, backs = 0, fatal = null;
+    let hit = null, dismissed = 0, backs = 0, fatal = null, emptyReads = 0, shotTap = null;
     while (true) {
       await dump();
       if (capture) screens.push({ at: step.name, ...describe(nodes, o.username) });
@@ -308,6 +308,14 @@ async function run(driver, flow, opts) {
       const sysDialog = away && /permissioncontroller|packageinstaller|^android$|systemui/.test(pkgNow);
       hit = away ? null : findAny(nodes, step.find);
       if (hit) break;
+      // v0.5.18: a screen uiautomator cannot read (the sound page's previews never stop moving, so it
+      // never gets an "idle" screen) comes back empty. Twice empty on a step that allows it: its button
+      // is found on a screenshot instead (Instagram's big blue button: "Use audio").
+      if (!nodes.length) emptyReads++; else emptyReads = 0;
+      if (step.fallback === 'primary-button' && emptyReads >= 2 && driver.primaryButton) {
+        const b = await driver.primaryButton();
+        if (b) { shotTap = b; break; }
+      }
       if (!away || sysDialog) {
         fatal = findAny(nodes, FATAL.map((f) => ({ text: f.text })));
         if (fatal) { const f = FATAL.find((x) => x.text === fatal.sel.text); return fail(step, f ? f.why : 'blocked'); }
@@ -330,6 +338,12 @@ async function run(driver, flow, opts) {
       }
       if (now() - t0 >= limit) break;
       await driver.wait(POLL_MS);
+    }
+    if (!hit && shotTap) {
+      await driver.tap(shotTap.x, shotTap.y);
+      trace.push({ name: step.name, ok: true, matched: `screen unreadable: the blue button on a screenshot, tapped at ${shotTap.x},${shotTap.y}`, ms: now() - t0 });
+      await driver.wait(step.settle || 1500);
+      continue;
     }
     if (!hit) {
       if (step.optional) { trace.push({ name: step.name, ok: true, matched: 'skipped (optional, not on screen)', ms: now() - t0 }); continue; }

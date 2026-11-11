@@ -13,6 +13,7 @@ files:
   - "!*.log"
   - "!repack-asar.js"
   - "!build-mac.command"
+  - "!tools/fixtures/**"
   - "!README-MAC.txt"
   - "!.check-asar.js"
 # The Instagram diagnostic is executed with ELECTRON_RUN_AS_NODE (plain Node), which CANNOT read files

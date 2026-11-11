@@ -143,6 +143,43 @@ function fakeDriver(screens) {
     const r = await ig.run(d, ig.FLOW_REEL_WITH_AUDIO, { caption: 'with sound', mode: 'post' });
     check('audio flow: Use audio -> gallery -> newest -> ... -> shared', [r.state, r.trace[0].name, r.trace[0].matched.includes('use audio')], ['shared', 'audio-page', true]);
   }
+  // ---------- v0.5.18: the sound page cannot be read (2026-11-11, phone 40, two test runs) ----------
+  // Its previews keep playing, uiautomator never gets an idle screen and the dump comes back empty;
+  // the flow then finds "Use audio" on a screenshot - the phone's real one from that run.
+  {
+    const fs = require('fs'), path = require('path'), pngscan = require('../src/pngscan');
+    const shot = fs.readFileSync(path.join(__dirname, 'fixtures', 'audio_page.png'));
+    const b = pngscan.primaryButton(shot);
+    check('the real sound page: the blue button is found inside "Use audio" (22-284 x 342-386)',
+      !!b && b.x > 22 && b.x < 284 && b.y > 342 && b.y < 386, true);
+    const zlib = require('zlib');
+    const png = (w, h, fill) => {        // a tiny RGB PNG (filter 0 rows)
+      const raw = Buffer.alloc((w * 3 + 1) * h);
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const c = fill(x, y), o = y * (w * 3 + 1) + 1 + x * 3; raw[o] = c[0]; raw[o + 1] = c[1]; raw[o + 2] = c[2]; }
+      const chunk = (t, d) => { const l = Buffer.alloc(4); l.writeUInt32BE(d.length); return Buffer.concat([l, Buffer.from(t, 'latin1'), d, Buffer.alloc(4)]); };
+      const ih = Buffer.alloc(13); ih.writeUInt32BE(w, 0); ih.writeUInt32BE(h, 4); ih[8] = 8; ih[9] = 2;
+      return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk('IHDR', ih), chunk('IDAT', zlib.deflateSync(raw)), chunk('IEND', Buffer.alloc(0))]);
+    };
+    check('a screen with no blue button -> null (nothing is tapped)', pngscan.primaryButton(png(100, 200, () => [240, 240, 240])), null);
+    check('a thin blue line (a link) is not a button', pngscan.primaryButton(png(100, 200, (x, y) => (y === 60 ? [75, 94, 250] : [255, 255, 255]))), null);
+    check('not a PNG -> null', pngscan.primaryButton(Buffer.from('nope')), null);
+
+    const EMPTY = '';
+    const d = fakeDriver([EMPTY, CAMERA, GALLERY, GALLERY, EDITOR, SHARE_SHEET, SHARE_SHEET, SHARED]);
+    d.primaryButton = async () => pngscan.primaryButton(shot);
+    const r = await ig.run(d, ig.FLOW_REEL_WITH_AUDIO, { caption: 'with sound', mode: 'post' });
+    check('an unreadable sound page: the button is tapped off the screenshot and the post goes on',
+      [r.state, r.trace[0].name, r.trace[0].matched.startsWith('screen unreadable'), d.taps[0]], ['shared', 'audio-page', true, [b.x, b.y]]);
+    const d2 = fakeDriver([EMPTY, EMPTY]);
+    d2.primaryButton = async () => null;
+    const r2 = await ig.run(d2, ig.FLOW_REEL_WITH_AUDIO, { caption: 'c', mode: 'post' });
+    check('unreadable and no button on the screenshot either: still element_not_found, nothing tapped',
+      [r2.state, r2.why, r2.step, d2.taps.length], ['failed', 'element_not_found', 'audio-page', 0]);
+    const d3 = fakeDriver([EMPTY, CAMERA, GALLERY]);
+    d3.primaryButton = async () => ({ x: 1, y: 1 });
+    const r3 = await ig.run(d3, ig.FLOW_REEL, { caption: 'c', mode: 'post' });
+    check('the plain reel flow never taps off a screenshot (only the sound page allows it)', r3.trace.every((t) => !/screen unreadable/.test(t.matched)), true);
+  }
   // ---------- whoami flow ----------
   {
     const d = fakeDriver([HOME, PROFILE]);

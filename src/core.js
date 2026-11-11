@@ -16,6 +16,7 @@ const instagram = require('./instagram');   // Instagram account-status classifi
 const congestion = require('./congestion'); // v0.5.8: per-tunnel queue watchdog (drop stale video, force a keyframe)
 const igpost = require('./igpost');         // v0.5.9: post a reel / read the username on the phone itself (pure, data-driven steps)
 const igstats = require('./igstats');       // v0.5.12: followers / dashboard views / reel plays in the same whoami visit (pure)
+const pngscan = require('./pngscan');       // v0.5.18: Instagram's blue button off a screenshot when the screen cannot be read
 const igcheck = require('./igcheck');       // v0.5.15: the daily account check - what each screen is, the numbers, Insights (pure)
 // The version this file ships in, for replies that say which agent read a profile. The Electron app
 // passes its own (opts.appVersion); `node agent.js` and the tests fall back to package.json.
@@ -2007,9 +2008,30 @@ class AgentCore extends EventEmitter {
     });
     return { comp, out: String(out || '') };
   }
+  /** The screen's elements. v0.5.18: the old file is removed first and the dump must say "dumped to",
+      else it is tried once more and then the answer is '' (an empty screen). Until 0.5.17 a dump that
+      failed - uiautomator cannot get an "idle" screen while something keeps moving, like the sound
+      page's playing previews - left the PREVIOUS file in place, and the posting flow read that old
+      screen (the home screen) for 25 s while "Use audio" was in front (test runs of 2026-11-11). */
   async _uiDump(serial) {
-    await this._adbLong(serial, ['shell', 'uiautomator', 'dump', '/sdcard/pd_ui.xml'], 20000);
-    return this._adbLong(serial, ['shell', 'cat', '/sdcard/pd_ui.xml'], 10000);
+    const f = '/sdcard/pd_ui.xml';
+    for (let i = 0; i < 2; i++) {
+      const out = await this._adbLong(serial, ['shell', `rm -f ${f}; uiautomator dump ${f}`], 20000).catch((e) => 'ERROR ' + ((e && e.message) || ''));
+      if (/dumped to/i.test(out)) {
+        const xml = await this._adbLong(serial, ['shell', 'cat', f], 10000).catch(() => '');
+        if (xml.includes('<hierarchy')) return xml;
+      }
+      await new Promise((r) => setTimeout(r, 700));
+    }
+    return '';
+  }
+  /** v0.5.18: the centre of the big blue button in the upper half of the screen (Instagram's primary
+      button, e.g. "Use audio"), read off a screenshot when the screen cannot be read as text. */
+  async _primaryButton(serial) {
+    try {
+      const png = await this._adbBinary(serial, ['exec-out', 'screencap', '-p'], 15000);
+      return pngscan.primaryButton(png);
+    } catch { return null; }
   }
 
   async checkAppsInstalled(serial, m, ws) {
@@ -2248,6 +2270,7 @@ class AgentCore extends EventEmitter {
     const self = this;
     return {
       dump: () => self._uiDump(serial),
+      primaryButton: () => self._primaryButton(serial),
       tap: (x, y) => self._adbLong(serial, ['shell', 'input', 'tap', String(Math.round(x)), String(Math.round(y))], 8000),
       type: async (text) => {
         // `input text` in chunks: one long argument trips the device shell's line limit and %s
