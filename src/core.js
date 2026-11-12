@@ -17,6 +17,7 @@ const congestion = require('./congestion'); // v0.5.8: per-tunnel queue watchdog
 const igpost = require('./igpost');         // v0.5.9: post a reel / read the username on the phone itself (pure, data-driven steps)
 const igstats = require('./igstats');       // v0.5.12: followers / dashboard views / reel plays in the same whoami visit (pure)
 const pngscan = require('./pngscan');       // v0.5.18: Instagram's blue button off a screenshot when the screen cannot be read
+const recovery = require('./recovery');     // v0.5.19: phones that fall off adb are tried again by themselves
 const igcheck = require('./igcheck');       // v0.5.15: the daily account check - what each screen is, the numbers, Insights (pure)
 // The version this file ships in, for replies that say which agent read a profile. The Electron app
 // passes its own (opts.appVersion); `node agent.js` and the tests fall back to package.json.
@@ -127,6 +128,10 @@ class AgentCore extends EventEmitter {
     this._stopped = false;    // set on shutdown() so ws-scrcpy isn't resurrected as the app quits
     this._switches = {};      // serial -> { running, next, last }: one profile switch at a time per phone (v0.5.10)
     this._airplaneWatchdogTimer = null;
+    // v0.5.19 self-recovery (src/recovery.js): the agent setting lives next to agent.json.
+    this.settingsFile = opts.settingsFile || (this.tokenFile ? path.join(path.dirname(this.tokenFile), 'agent-settings.json') : null);
+    this._recovery = null;
+    this._recoveryOutbox = [];
   }
 
   /** Tear down ONE device: stop its timers, close its socket, forget it. Used everywhere we drop a
@@ -297,6 +302,8 @@ class AgentCore extends EventEmitter {
       // currently holding their picture still, congestion events in the last 5 min, the deepest
       // queue seen and the ws pong lag (kernel buffer) - the dashboard shows these next to `uplink`.
       congestion: this._congestionStats(now),
+      // v0.5.19: is self-recovery on here, is the USB reset usable, how many phones are stuck right now
+      recovery: this._recovery ? this._recovery.status() : { on: !!this.recoverySettings().self_recovery, usb_reset: false, usb_note: '', stuck: 0 },
       uptime_h: Math.round(os.uptime() / 360) / 10,
     };
     this._hostCache = stats;
@@ -1240,6 +1247,79 @@ class AgentCore extends EventEmitter {
       this.emit('log', `${serial}: ${row ? 'adb reports it "' + row.state + '"' : 'gone from adb devices'} for ${dev.missedScans} scans - dropping (USB cable/hub?)`);
       this._dropDevice(serial);
     });
+    // v0.5.19: a known phone that is stuck (offline / unauthorized / gone) is tried again by itself.
+    // observe() is bookkeeping on the cached scan; tick() starts at most one async, time-limited try.
+    try { const r = this._recoveryMgr(); r.observe(this.detectAll()); r.tick(); } catch (e) { this.emit('log', 'self-recovery: ' + ((e && e.message) || e)); }
+  }
+
+  // ---- self-recovery of stuck phones (v0.5.19, src/recovery.js) -----------------------------------
+  recoverySettings() {
+    const now = Date.now();
+    if (!this._recSettings || now - this._recSettingsAt > 10000) {
+      this._recSettings = recovery.loadSettings(this.settingsFile);
+      this._recSettingsAt = now;
+    }
+    return this._recSettings;
+  }
+  /** The owner's app ticks / unticks the two switches (main.js IPC). Returns the settings now in force. */
+  setRecoverySettings(s) {
+    const cur = recovery.loadSettings(this.settingsFile, {});
+    const next = { self_recovery: s && typeof s.self_recovery === 'boolean' ? s.self_recovery : cur.self_recovery,
+                   usb_reset: s && typeof s.usb_reset === 'boolean' ? s.usb_reset : cur.usb_reset };
+    if (this.settingsFile) { try { recovery.saveSettings(this.settingsFile, next); } catch (e) { this.emit('log', 'settings save failed: ' + e); } }
+    this._recSettings = null;
+    this._hostCache = null;
+    this.emit('log', `self-recovery settings: recovery ${next.self_recovery ? 'on' : 'off'}, USB reset ${next.usb_reset ? 'on' : 'off'}`);
+    return this.recoverySettings();
+  }
+  _jobsRunning() {
+    if (this._posting && this._posting.size) return true;
+    if (this._checking && this._checking.size) return true;
+    return Object.values(this._switches || {}).some((st) => st && (st.running || st.next));
+  }
+  _recoveryMgr() {
+    if (this._recovery) return this._recovery;
+    const self = this;
+    this._recovery = new recovery.Recovery({
+      adb: (args, t) => self._adbAsync(args, t),
+      scan: () => self._adbAsync(['devices']).then((out) => { const rows = self._rowsToDevices(out); self._deviceCache = rows; return rows; }),
+      paired: () => Object.keys(self._loadTokens()),
+      streamsOpen: () => self._openTunnels || 0,
+      jobsRunning: () => self._jobsRunning(),
+      settings: () => self.recoverySettings(),
+      report: (e) => self._reportRecovery(e),
+      log: (line) => self.emit('log', line),
+      afterKill: () => { self._killWsScrcpy(); self.startWsScrcpy(); },   // its adb client died with the server
+      run: (cmd, args, t) => new Promise((resolve) => {
+        try {
+          execFile(cmd, args, { encoding: 'utf8', timeout: t, windowsHide: true }, (err, so, se) => {
+            resolve({ code: err ? (typeof err.code === 'number' ? err.code : -1) : 0, out: String(so || '') + String(se || '') });
+          });
+        } catch (e) { resolve({ code: -1, out: String((e && e.message) || e) }); }
+      }),
+      now: () => Date.now(),
+      platform: process.platform,
+    });
+    return this._recovery;
+  }
+  /** A recovery report goes to the server as {op: 'recovery'} over ANY open phone-home socket of this
+      computer (the stuck phone's own socket is gone). With none open (every phone down) the reports
+      wait - at most 50 - and go out with the first socket that opens. */
+  _reportRecovery(e) {
+    const name = ((this._loadTokens()[e.serial] || {}).name) || '';
+    this._recoveryOutbox.push({ ...e, name });
+    if (this._recoveryOutbox.length > 50) this._recoveryOutbox.splice(0, this._recoveryOutbox.length - 50);
+    this._flushRecovery();
+  }
+  _flushRecovery() {
+    const box = this._recoveryOutbox || [];
+    if (!box.length) return;
+    const dev = Object.values(this.devices || {}).find((d) => d && d.ws && d.ws.readyState === 1);
+    if (!dev) return;
+    while (box.length) {
+      try { dev.ws.send(JSON.stringify({ op: 'recovery', data: box[0] })); } catch { return; }
+      box.shift();
+    }
   }
 
   /** Pair the first plugged-in UNPAIRED phone with a code, then bring it online. */
@@ -1284,6 +1364,7 @@ class AgentCore extends EventEmitter {
           .catch(() => {});
       };
       sendMeta(true);                       // first beat: full (battery + fresh user list)
+      this._flushRecovery();                // v0.5.19: recovery reports that waited for an open socket
       // Re-apply any saved charge limit (the backend also re-pushes set_charge_policy on connect;
       // doing it here too means the limit holds even if that message is missed).
       try {

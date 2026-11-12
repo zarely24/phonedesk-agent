@@ -14,4 +14,6 @@ contextBridge.exposeInMainWorld('agent', {
   resetPairings: () => ipcRenderer.invoke('reset-pairings'),
   listDevices: () => ipcRenderer.invoke('list-devices'),
   runIgDiagnostic: (opts) => ipcRenderer.invoke('run-ig-diagnostic', opts),
+  recoverySettings: () => ipcRenderer.invoke('recovery-settings'),             // v0.5.19 self-recovery switches
+  setRecoverySettings: (s) => ipcRenderer.invoke('set-recovery-settings', s),
 });

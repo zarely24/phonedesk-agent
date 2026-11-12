@@ -44,6 +44,10 @@
     #diag-out { white-space:pre-wrap; font-size:11px; max-height:220px; overflow:auto; background:rgba(0,0,0,.25);
       padding:8px; border-radius:8px; margin:0; }
     #diag-out:empty { display:none; }
+    #rec-panel { width:100%; max-width:340px; border-top:1px solid rgba(255,255,255,.08); margin-top:12px; padding-top:10px;
+      text-align:left; display:flex; flex-direction:column; gap:6px; font-size:12px; color:#9aa3b2; }
+    #rec-panel label { display:flex; gap:8px; align-items:flex-start; cursor:pointer; }
+    #rec-panel p { margin:0; font-size:11px; }
   </style>
 </head>
 <body>
@@ -65,6 +69,14 @@
       <div id="detect-guide" class="guide hide"></div>
       <button id="add-phone-btn" class="btn primary">+ Add a phone</button>
       <button id="reset-btn" class="linkbtn">Phone stuck? Reset pairings</button>
+
+      <!-- v0.5.19 self-recovery: a phone that falls off adb is tried again by this app (adb reconnect,
+           restarting adb when several are stuck and nobody is watching). USB reset is Windows only, off by default. -->
+      <div id="rec-panel">
+        <label><input type="checkbox" id="rec-on"> Bring stuck phones back by themselves</label>
+        <label><input type="checkbox" id="rec-usb"> Also reset the phone's USB port (Windows, needs the app run as administrator)</label>
+        <p id="rec-note" class="muted"></p>
+      </div>
 
       <!-- Instagram diagnostic (Phase-1, manual, advanced). Collapsed by default; nothing runs on its own.
            It sits inside this step on purpose: placed after .app it was drawn over the phone list. -->

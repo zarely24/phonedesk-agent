@@ -143,6 +143,22 @@ function fillDiagDevices(st) {
     : '<option value="" disabled>(no phones added yet)</option>');
   if (cur && phones.some((p) => p.serial === cur)) sel.value = cur;   // keep the owner's choice across refreshes
 }
+// v0.5.19 self-recovery switches (agent-settings.json, read by src/recovery.js).
+(function () {
+  try {
+    var on = document.getElementById('rec-on'), usb = document.getElementById('rec-usb'), note = document.getElementById('rec-note');
+    if (!on || !usb || !window.agent || !window.agent.recoverySettings) return;
+    var show = function (s) {
+      on.checked = !!s.self_recovery; usb.checked = !!s.usb_reset; usb.disabled = !s.self_recovery;
+      note.textContent = s.self_recovery ? 'Every try and its result shows on the website (Farm health, Offline phones).' : 'Off: stuck phones wait for someone to replug them.';
+    };
+    window.agent.recoverySettings().then(show).catch(function () {});
+    var save = async function () {
+      try { show(await window.agent.setRecoverySettings({ self_recovery: on.checked, usb_reset: usb.checked })); } catch (e) { /* keep the old switches */ }
+    };
+    on.onchange = save; usb.onchange = save;
+  } catch (e) { /* optional UI; never break the agent */ }
+})();
 (function () {
   try {
     var toggle = document.getElementById('diag-toggle');

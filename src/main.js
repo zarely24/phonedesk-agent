@@ -223,6 +223,13 @@ ipcMain.handle('reset-pairings', () => {
   try { core.resetPairings(); } catch (e) { fileLog('reset error:', e && e.stack); }
   return true;
 });
+// v0.5.19 self-recovery switches (src/recovery.js): read / change the agent setting.
+ipcMain.handle('recovery-settings', () => {
+  try { return core ? core.recoverySettings() : { self_recovery: true, usb_reset: false }; } catch (e) { return { self_recovery: true, usb_reset: false }; }
+});
+ipcMain.handle('set-recovery-settings', (_e, s) => {
+  try { return core.setRecoverySettings(s || {}); } catch (e) { fileLog('recovery settings error:', e && e.stack); return core ? core.recoverySettings() : null; }
+});
 ipcMain.handle('install-update', () => {
   try { require('electron-updater').autoUpdater.quitAndInstall(); } catch (e) { fileLog('quitAndInstall:', e && e.message); }
 });
