@@ -225,7 +225,7 @@ ipcMain.handle('reset-pairings', () => {
 });
 // v0.5.19 self-recovery switches (src/recovery.js): read / change the agent setting.
 ipcMain.handle('recovery-settings', () => {
-  try { return core ? core.recoverySettings() : { self_recovery: true, usb_reset: false }; } catch (e) { return { self_recovery: true, usb_reset: false }; }
+  try { return core ? core.recoverySettings() : { self_recovery: false, usb_reset: false }; } catch (e) { return { self_recovery: false, usb_reset: false }; }
 });
 ipcMain.handle('set-recovery-settings', (_e, s) => {
   try { return core.setRecoverySettings(s || {}); } catch (e) { fileLog('recovery settings error:', e && e.stack); return core ? core.recoverySettings() : null; }

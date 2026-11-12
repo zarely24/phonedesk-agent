@@ -70,12 +70,12 @@ const LADDER = {
 };
 const REPEAT_FROM = { offline: 1, absent: 0 };                // where the ladder starts again after a full pass
 
-/** The agent setting (agent-settings.json next to agent.json). self_recovery: on unless switched
-    off; usb_reset: off unless switched on. PD_SELF_RECOVERY / PD_USB_RESET (0/1) override both. */
+/** The agent setting (agent-settings.json next to agent.json). Both OFF unless switched on (the
+    shared rule: anything that acts on phones by itself ships default off). PD_SELF_RECOVERY / PD_USB_RESET (0/1) override both. */
 function loadSettings(file, env = process.env) {
   let s = {};
   if (file) { try { s = JSON.parse(fs.readFileSync(file, 'utf8')) || {}; } catch { s = {}; } }
-  const out = { self_recovery: s.self_recovery !== false, usb_reset: s.usb_reset === true };
+  const out = { self_recovery: s.self_recovery === true, usb_reset: s.usb_reset === true };
   if (env.PD_SELF_RECOVERY === '0') out.self_recovery = false;
   else if (env.PD_SELF_RECOVERY === '1') out.self_recovery = true;
   if (env.PD_USB_RESET === '1') out.usb_reset = true;

@@ -49,12 +49,12 @@ check('pnputil: an empty serial never matches', findUsbInstance(PNP, ''), '');
 // ---- the setting ---------------------------------------------------------------------------------------
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pd_rec_'));
 const sf = path.join(tmp, 'agent-settings.json');
-check('no settings file: recovery on, USB reset off', loadSettings(sf, {}), { self_recovery: true, usb_reset: false });
+check('no settings file: both OFF (default off)', loadSettings(sf, {}), { self_recovery: false, usb_reset: false });
 saveSettings(sf, { self_recovery: false, usb_reset: true });
 check('saved settings are read back', loadSettings(sf, {}), { self_recovery: false, usb_reset: true });
 check('the environment overrides the file', loadSettings(sf, { PD_SELF_RECOVERY: '1', PD_USB_RESET: '0' }), { self_recovery: true, usb_reset: false });
 fs.writeFileSync(sf, '{broken');
-check('a broken file = the defaults', loadSettings(sf, {}), { self_recovery: true, usb_reset: false });
+check('a broken file = the defaults (off)', loadSettings(sf, {}), { self_recovery: false, usb_reset: false });
 
 // ---- the manager with a fake adb -------------------------------------------------------------------------
 function farm(opts = {}) {
@@ -284,9 +284,9 @@ const steps = (reports) => reports.map((e) => e.step + (e.ok ? ':ok' : ''));
     check('the scan + reconnect use the async adb with a timeout', asyncCalls.map((c) => c[0]), ['devices', '-s S1 reconnect']);
     check('...the scan parses the states', rows, [{ serial: 'S1', state: 'offline' }]);
     check('...and refreshes the device cache reconcile() reads', c2._deviceCache, rows);
-    check('settings default: on, USB reset off', c2.recoverySettings(), { self_recovery: true, usb_reset: false });
+    check('settings default: both off', c2.recoverySettings(), { self_recovery: false, usb_reset: false });
     c2.settingsFile = path.join(tmp, 's2.json');
-    check('the owner app switches it', c2.setRecoverySettings({ usb_reset: true }), { self_recovery: true, usb_reset: true });
+    check('the owner app switches it', c2.setRecoverySettings({ self_recovery: true, usb_reset: true }), { self_recovery: true, usb_reset: true });
     check('...and it is saved', JSON.parse(fs.readFileSync(c2.settingsFile, 'utf8')), { self_recovery: true, usb_reset: true });
     c2._posting = new Set(['S9']);
     check('a post running counts as a job', c2._jobsRunning(), true);
