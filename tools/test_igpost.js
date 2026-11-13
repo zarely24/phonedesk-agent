@@ -175,6 +175,19 @@ function fakeDriver(screens) {
     const r2 = await ig.run(d2, ig.FLOW_REEL_WITH_AUDIO, { caption: 'c', mode: 'post' });
     check('unreadable and no button on the screenshot either: still element_not_found, nothing tapped',
       [r2.state, r2.why, r2.step, d2.taps.length], ['failed', 'element_not_found', 'audio-page', 0]);
+    // v0.5.20: 2026-11-13, phone 40 - the read came back as the HOME SCREEN (launcher) while the
+    // sound page was in front: the screenshot fallback must fire for that too.
+    const LAUNCHER = screen({ text: 'Gallery', pkg: 'com.android.launcher3', bounds: [0, 0, 200, 100] }, { text: 'Camera', pkg: 'com.android.launcher3', bounds: [200, 0, 400, 100] });
+    const d4 = fakeDriver([LAUNCHER, CAMERA, GALLERY, GALLERY, EDITOR, SHARE_SHEET, SHARE_SHEET, SHARED]);
+    d4.primaryButton = async () => pngscan.primaryButton(shot);
+    const r4 = await ig.run(d4, ig.FLOW_REEL_WITH_AUDIO, { caption: 'with sound', mode: 'post', appPkg: 'com.instagram.android' });
+    check('a read that is the home screen, not Instagram: the button is tapped off the screenshot',
+      [r4.state, r4.trace[0].matched.startsWith('screen unreadable'), d4.taps[0]], ['shared', true, [b.x, b.y]]);
+    const d5 = fakeDriver([LAUNCHER, LAUNCHER]);
+    d5.primaryButton = async () => null;           // a real home screen: no big blue button on it
+    const r5 = await ig.run(d5, ig.FLOW_REEL_WITH_AUDIO, { caption: 'c', mode: 'post', appPkg: 'com.instagram.android' });
+    check('a REAL home screen (no blue button on the screenshot): fails as before, nothing tapped',
+      [r5.state, r5.why, d5.taps.length], ['failed', 'element_not_found', 0]);
     const d3 = fakeDriver([EMPTY, CAMERA, GALLERY]);
     d3.primaryButton = async () => ({ x: 1, y: 1 });
     const r3 = await ig.run(d3, ig.FLOW_REEL, { caption: 'c', mode: 'post' });

@@ -2491,7 +2491,8 @@ class AgentCore extends EventEmitter {
       delete result.nodes;
       if (await viewerOpened() && result.state !== 'shared') result.state = 'aborted';
       const out = { ok: result.ok, state: result.state, step: result.step, why: result.why || '', trace: result.trace, screen: result.screen,
-        flow: (audio ? 'audio' : 'gallery') + (overlay ? '+text' : ''), gallery: landed };
+        flow: (audio ? 'audio' : 'gallery') + (overlay ? '+text' : ''), gallery: landed,
+        agent_version: this.appVersion || AGENT_VERSION };   // v0.5.20: which app ran it (2026-11-13: was it the fixed one?)
       if (result.pkg) out.pkg = result.pkg;
       if (mode === 'capture') out.screens = result.screens;
       if ((!result.ok || mode === 'capture') && m.evidence !== false) {

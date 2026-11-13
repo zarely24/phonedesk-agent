@@ -311,7 +311,12 @@ async function run(driver, flow, opts) {
       // v0.5.18: a screen uiautomator cannot read (the sound page's previews never stop moving, so it
       // never gets an "idle" screen) comes back empty. Twice empty on a step that allows it: its button
       // is found on a screenshot instead (Instagram's big blue button: "Use audio").
-      if (!nodes.length) emptyReads++; else emptyReads = 0;
+      // v0.5.20: also unreadable = a read that is not Instagram at all. On 2026-11-13 (phone 40) the
+      // read came back as a whole HOME SCREEN while the sound page with "Use audio" was in front, so
+      // the empty-read rule never fired. A screenshot only taps a big blue button, which the home
+      // screen does not have, so a real home screen still fails as before.
+      const notApp = !!(o.appPkg && pkgNow && pkgNow !== o.appPkg && !/permissioncontroller|packageinstaller|^android$|systemui/.test(pkgNow));
+      if (!nodes.length || notApp) emptyReads++; else emptyReads = 0;
       if (step.fallback === 'primary-button' && emptyReads >= 2 && driver.primaryButton) {
         const b = await driver.primaryButton();
         if (b) { shotTap = b; break; }
