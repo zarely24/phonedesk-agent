@@ -173,10 +173,58 @@ class AgentCore extends EventEmitter {
       VAs report. One-off calls triggered by a human action may stay synchronous; recurring ones cannot. */
   _adbAsync(args, timeoutMs = 8000) {
     return new Promise((resolve, reject) => {
-      execFile(this.adbPath, args, { encoding: 'utf8', timeout: timeoutMs }, (err, stdout) => {
-        if (err) reject(err); else resolve(String(stdout || '').trim());
+      execFile(this.adbPath, args, { encoding: 'utf8', timeout: timeoutMs }, (err, stdout, stderr) => {
+        if (!err) return resolve(String(stdout || '').trim());
+        // v0.5.21: say WHY. Node's own message is "Command failed: <the whole adb command line>", which
+        // told nobody anything (2026-11-16: phone 32's screenshot "failed" with just that, and it was a
+        // timeout). err keeps its own fields (killed, code, signal); only the words get better.
+        try { err.stderr = String(stderr || '').trim(); err.message = AgentCore._adbErrText(err, stderr, timeoutMs); } catch {}
+        reject(err);
       });
     });
+  }
+  /** One line about a failed adb call: adb's own complaint, or that the phone never answered. Pure. */
+  static _adbErrText(err, stderr, timeoutMs) {
+    if (err && (err.killed || err.signal === 'SIGTERM')) {
+      return `the phone did not answer in ${Math.round((timeoutMs || 0) / 1000)} s (adb timed out) - it is on USB but not responding`;
+    }
+    const lines = String(stderr || '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    if (lines.length) return 'adb: ' + lines[lines.length - 1].slice(0, 240);
+    const msg = String((err && err.message) || err || '').split(/\r?\n/).map((l) => l.trim())
+      .filter((l) => l && !/^Command failed:/.test(l));
+    if (msg.length) return 'adb: ' + msg[msg.length - 1].slice(0, 240);
+    return `adb failed (exit code ${err && err.code != null ? err.code : '?'})`;
+  }
+  /** v0.5.21: is the phone actually answering? A phone can sit in `adb devices` as "device" while every
+      command on it hangs or fails (the 2026-11-16 phone 32 case: "Online" on the website, black screen).
+      The heartbeat's own adb calls are the probe - no extra adb traffic. Two failed beats in a row
+      (~30-60 s) = "unresponsive"; one good answer clears it. */
+  _noteAdb(serial, ok, err) {
+    const dev = this.devices[serial];
+    if (!dev) return;
+    if (ok) {
+      if (dev.adbHealth && dev.adbHealth.fails >= 2) this.emit('log', `${serial}: answering again`);
+      dev.adbHealth = null;
+      return;
+    }
+    const h = dev.adbHealth || (dev.adbHealth = { fails: 0, since: Date.now(), error: '' });
+    h.fails++;
+    h.error = String((err && err.message) || err || '').slice(0, 240);
+    if (h.fails === 2) this.emit('log', `${serial}: on adb but not answering (${h.error})`);
+  }
+  _adbState(serial) {
+    const h = this.devices[serial] && this.devices[serial].adbHealth;
+    if (h && h.fails >= 2) return { state: 'unresponsive', since: h.since, error: h.error, fails: h.fails };
+    return { state: 'ready' };
+  }
+  /** A real command on the phone (recovery checks it after a try): true when it answers. */
+  async _probe(serial) {
+    try {
+      const out = await this._adbAsync(['-s', serial, 'shell', 'echo', 'pd-ok'], 8000);
+      const ok = /pd-ok/.test(out);
+      this._noteAdb(serial, ok, ok ? null : 'unexpected answer');
+      return ok;
+    } catch (e) { this._noteAdb(serial, false, e); return false; }
   }
   /** The phone's own profile ceiling (v0.5.11): `pm get-max-users` ("Maximum supported users: 32")
       counts the owner too. Set by the OS build (stock Pixel 4; GrapheneOS raises it) or a system
@@ -201,8 +249,9 @@ class AgentCore extends EventEmitter {
       const status = /status:\s*(\d+)/.exec(out);
       const powered = [/AC powered:\s*true/i, /USB powered:\s*true/i, /Wireless powered:\s*true/i]
         .some((re) => re.test(out));
+      this._noteAdb(serial, true);
       return { battery: lvl ? parseInt(lvl[1], 10) : null, charging: status ? status[1] === '2' : powered };
-    } catch { return { battery: null, charging: null }; }
+    } catch (e) { this._noteAdb(serial, false, e); return { battery: null, charging: null }; }
   }
   async _listUsersAsync(serial) {
     const users = [];
@@ -231,13 +280,19 @@ class AgentCore extends EventEmitter {
     const cs = dev && dev.chargeStatus;
     // The last profile switch's verdict and the airplane watchdog's last action ride along (v0.5.10).
     const sw = { switch_status: (dev && dev.switchStatus) || null, airplane_watchdog: (dev && dev.airplaneWatchdog) || null };
+    // v0.5.21: `adb` = is the phone answering? {state: 'ready'} or {state: 'unresponsive', since, error}.
+    const adb = this._adbState(serial);
     if (!full && dev && dev._metaCache) {
-      return { battery: bc.battery, charging: bc.charging, charge_status: cs, host: this._hostStats(), agent_version: this.appVersion, ...sw, ...dev._metaCache };
+      return { battery: bc.battery, charging: bc.charging, charge_status: cs, host: this._hostStats(), agent_version: this.appVersion, adb, ...sw, ...dev._metaCache };
+    }
+    // A phone that does not answer would spend 3 more timeouts here for nothing: keep the last list.
+    if (adb.state === 'unresponsive' && dev && dev._metaCache) {
+      return { battery: bc.battery, charging: bc.charging, charge_status: cs, host: this._hostStats(), agent_version: this.appVersion, adb, ...sw, ...dev._metaCache };
     }
     const cache = { users: await this._listUsersAsync(serial), current_user: await this._currentUserAsync(serial),
                     ...(await this._userLimitsAsync(serial)), profiles_job: (dev && dev.profilesJob) || null };
     if (dev) dev._metaCache = cache;
-    return { battery: bc.battery, charging: bc.charging, charge_status: cs, host: this._hostStats(), agent_version: this.appVersion, ...sw, ...cache };
+    return { battery: bc.battery, charging: bc.charging, charge_status: cs, host: this._hostStats(), agent_version: this.appVersion, adb, ...sw, ...cache };
   }
   /** Health of the computer the phones are plugged into.
       Reported on every heartbeat so we can see the machine instead of guessing about it. Free to
@@ -1249,7 +1304,12 @@ class AgentCore extends EventEmitter {
     });
     // v0.5.19: a known phone that is stuck (offline / unauthorized / gone) is tried again by itself.
     // observe() is bookkeeping on the cached scan; tick() starts at most one async, time-limited try.
-    try { const r = this._recoveryMgr(); r.observe(this.detectAll()); r.tick(); } catch (e) { this.emit('log', 'self-recovery: ' + ((e && e.message) || e)); }
+    // v0.5.21: a phone adb lists as "device" that does not answer counts as stuck too ('unresponsive').
+    try {
+      const rows = this.detectAll().map((d) => (d.state === 'ready' && this._adbState(d.serial).state === 'unresponsive'
+        ? { serial: d.serial, state: 'unresponsive' } : d));
+      const r = this._recoveryMgr(); r.observe(rows); r.tick();
+    } catch (e) { this.emit('log', 'self-recovery: ' + ((e && e.message) || e)); }
   }
 
   // ---- self-recovery of stuck phones (v0.5.19, src/recovery.js) -----------------------------------
@@ -1299,8 +1359,23 @@ class AgentCore extends EventEmitter {
       }),
       now: () => Date.now(),
       platform: process.platform,
+      probe: (serial) => self._probe(serial),                         // v0.5.21: does a real command answer?
+      uhubctl: () => recovery.findUhubctl(),                           // v0.5.21: Mac / Linux USB power cycle
     });
     return this._recovery;
+  }
+  /** v0.5.21, the website's "Power-cycle USB" button. It may arrive over ANY phone of this computer (the
+      stuck phone's own socket can be gone), so it names the phone by serial - only a phone paired with
+      THIS computer is ever touched. */
+  async usbPowerCycle(serial, m, ws) {
+    const target = String((m && m.serial) || serial || '');
+    if (!target || !this._loadTokens()[target]) {
+      return this._rpcReply(ws, m, { ok: false, state: 'unknown_phone', error: 'that phone is not paired with this computer' });
+    }
+    this.emit('log', `USB power cycle (${target}) asked from the website`);
+    const r = await this._recoveryMgr().manualUsbReset(target);
+    this.emit('log', `USB power cycle (${target}): ${r.ok ? 'back' : r.state} - ${r.detail}`);
+    this._rpcReply(ws, m, { ok: !!r.ok, state: r.state, detail: r.detail, error: r.ok ? '' : r.detail });
   }
   /** A recovery report goes to the server as {op: 'recovery'} over ANY open phone-home socket of this
       computer (the stuck phone's own socket is gone). With none open (every phone down) the reports
@@ -1412,6 +1487,7 @@ class AgentCore extends EventEmitter {
       else if (m.op === 'rename_user') this.renameUser(serial, m.user_id, m.name, ws);
       else if (m.op === 'unpair') this.unpair(serial);
       else if (m.op === 'refresh') this.refreshOne(serial);   // VA pressed "Refresh phone" on ONE phone's row
+      else if (m.op === 'usb_power_cycle') this.usbPowerCycle(serial, m, ws).catch(() => {});   // v0.5.21: website button
       else if (m.op === 'set_charge_policy') this.setChargePolicy(serial, m, ws);   // battery charge limit
       else if (m.op === 'create_profiles') this.createProfiles(serial, m.count, m.package, m.name_prefix, ws, m.packages);
       else if (m.op === 'upload_media') this.uploadMedia(serial, m, ws);   // push photos/videos to the gallery
@@ -2221,7 +2297,13 @@ class AgentCore extends EventEmitter {
   _adbBinary(serial, args, ms) {
     return new Promise((resolve, reject) => {
       execFile(this.adbPath, ['-s', serial, ...args], { encoding: 'buffer', timeout: ms || 15000, maxBuffer: 64 * 1024 * 1024 },
-        (err, stdout, stderr) => { if (err) reject(new Error(String((stderr && stderr.toString()) || (err && err.message) || '').trim())); else resolve(stdout); });
+        (err, stdout, stderr) => {
+          if (!err) return resolve(stdout);
+          // v0.5.21: a timeout used to come back as "Command failed: <the adb command line>" - no reason.
+          const e = new Error(AgentCore._adbErrText(err, stderr && stderr.toString(), ms || 15000));
+          e.killed = !!(err.killed || err.signal);
+          reject(e);
+        });
     });
   }
 

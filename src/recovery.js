@@ -20,10 +20,16 @@
  *                      this computer and no job (post / account check / profile switch) runs, at
  *                      most once per KILL_EVERY_MS. Restarting adb's server cuts every phone of the
  *                      computer for a few seconds, so it is never done under a VA's live screen.
- *   usb_reset          Windows only, OFF unless the owner ticks "USB reset" (agent setting): pnputil
- *                      /restart-device on the phone's USB device (Windows 10 2004+). pnputil needs
- *                      the app to run as administrator; when Windows refuses, the step is switched
- *                      off until the app restarts and the report says so. Never on a Mac.
+ *   usb_reset          OFF unless the owner ticks "USB reset" (agent setting).
+ *                      Windows: pnputil /restart-device on the phone's USB device (Windows 10 2004+).
+ *                      pnputil needs the app to run as administrator; when Windows refuses, the step
+ *                      is switched off until the app restarts and the report says so.
+ *                      Mac / Linux (v0.5.21): `uhubctl -a cycle` cuts the POWER of the hub port the
+ *                      phone hangs off and turns it back on - the software version of pulling the
+ *                      cable out. Needs uhubctl installed (brew install uhubctl) AND a hub that can
+ *                      switch each port's power ("ppps" in uhubctl's list; most cheap hubs cannot).
+ *                      The phone's hub + port is found by its serial in uhubctl's list and remembered,
+ *                      so a phone that dropped off USB completely can still be cycled.
  *
  *   offline       reconnect_offline, reconnect_device, kill_server, usb_reset, then again from
  *                 reconnect_device (a step that is not allowed right now is skipped)
@@ -31,6 +37,19 @@
  *                 that it needs a person to tap Allow on the phone; nothing more is tried.
  *   absent        (gone from `adb devices`) kill_server, usb_reset. When neither is allowed there is
  *                 nothing a computer can do: one "none" report says why, and it waits for a person.
+ *   unresponsive  (v0.5.21) adb lists the phone as "device" but every command on it fails or hangs
+ *                 (core.js sees it in the heartbeat: 2 failed beats in a row). The 2026-11-16 phone 32
+ *                 case: "Online" on the website, black screen, replugging did not help.
+ *                 reconnect_device, usb_reset, then again. A try counts as a success only when a real
+ *                 command (`shell echo`) answers afterwards, not when `adb devices` lists it.
+ *
+ * STATE REPORTS (v0.5.21). The moment a phone becomes stuck (and whenever its state changes while
+ * stuck) one {step: 'stuck'} report goes out EVEN WITH SELF-RECOVERY OFF, so the server always knows
+ * WHY a phone is down ("waiting for Allow USB debugging" vs "not on USB" vs "not answering") instead
+ * of guessing. "back" was already reported either way.
+ *
+ * BY HAND (v0.5.21). manualUsbReset(serial) is the website's "Power-cycle USB" button: the same
+ * usb_reset, without the setting or the 30-minute spacing (a person asked), but never two at once.
  *
  * LIMITS. One attempt at a time for the whole computer (never a burst of adb processes on the USB
  * tree), every command async with a timeout (THIS PROCESS IS THE VIDEO RELAY: see core.js _adbAsync),
@@ -55,6 +74,9 @@ const DEFAULTS = {
   cmdTimeoutMs: 10000,                                        // one adb command
   startServerTimeoutMs: 20000,
   pnputilTimeoutMs: 20000,
+  uhubctlTimeoutMs: 30000,                                    // a cycle waits uhubctlOffS with the power off
+  uhubctlOffS: 3,
+  manualEveryMs: 60000,                                       // the website's button: at most once a minute per phone
   killMinStuck: 3,                                            // kill-server only when this many phones are stuck
   killEveryMs: 30 * 60000,                                    // ... and at most this often per computer
   usbEveryMs: 30 * 60000,                                     // a USB reset per phone at most this often
@@ -67,8 +89,9 @@ const LADDER = {
   offline: ['reconnect_offline', 'reconnect_device', 'kill_server', 'usb_reset'],
   absent: ['kill_server', 'usb_reset'],
   unauthorized: ['reconnect_device', 'reconnect_device'],
+  unresponsive: ['reconnect_device', 'usb_reset'],
 };
-const REPEAT_FROM = { offline: 1, absent: 0 };                // where the ladder starts again after a full pass
+const REPEAT_FROM = { offline: 1, absent: 0, unresponsive: 0 }; // where the ladder starts again after a full pass
 
 /** The agent setting (agent-settings.json next to agent.json). Both OFF unless switched on (the
     shared rule: anything that acts on phones by itself ships default off). PD_SELF_RECOVERY / PD_USB_RESET (0/1) override both. */
@@ -113,11 +136,47 @@ function findUsbInstance(out, serial) {
   return '';
 }
 
+/** The hub + port the phone with this serial hangs off, in `uhubctl` (no arguments) output, or null.
+    uhubctl lists every hub that can switch port power and, per port, what is plugged in:
+      Current status for hub 20-3.4 [2109:2817 VIA Labs, Inc. USB2.0 Hub, USB 2.10, 4 ports, ppps]
+        Port 1: 0103 power enable connect [18d1:4ee7 Google Pixel 8 48121FDJH000CR]
+    The serial is the last word inside the port's brackets. Pure. */
+function findHubPort(out, serial) {
+  if (!serial) return null;
+  const want = String(serial).toUpperCase();
+  let hub = '';
+  for (const line of String(out || '').split(/\r?\n/)) {
+    const h = /^\s*Current status for hub (\S+)/i.exec(line);
+    if (h) { hub = h[1]; continue; }
+    const p = /^\s*Port (\d+):.*\[([0-9a-f]{4}:[0-9a-f]{4})([^\]]*)\]\s*$/i.exec(line);
+    if (!p || !hub) continue;
+    const words = p[3].trim().split(/\s+/);
+    if (words.length && words[words.length - 1].toUpperCase() === want) return { hub, port: p[1] };
+  }
+  return null;
+}
+
+/** Where uhubctl is. The Mac app is started by launchd/Finder, whose PATH has no Homebrew, so the
+    usual install places are looked at by name. PD_UHUBCTL points at another one. '' = not installed. */
+function findUhubctl(env = process.env, exists = fs.existsSync) {
+  const c = [env.PD_UHUBCTL, '/opt/homebrew/bin/uhubctl', '/usr/local/bin/uhubctl', '/usr/sbin/uhubctl', '/usr/bin/uhubctl']
+    .filter(Boolean);
+  for (const p of c) { try { if (exists(p)) return p; } catch {} }
+  return '';
+}
+
 const STEP_WORDS = {
   reconnect_offline: 'adb reconnect offline',
   reconnect_device: 'adb reconnect (this phone)',
   kill_server: 'restart adb (kill-server / start-server)',
-  usb_reset: 'USB reset (pnputil /restart-device)',
+  usb_reset: 'USB reset (Windows: pnputil /restart-device; Mac/Linux: uhubctl power cycle)',
+};
+
+const STATE_LOG = {
+  offline: 'adb says "offline": on USB, but adb lost it',
+  unauthorized: 'adb says "unauthorized": the phone waits for "Allow USB debugging?"',
+  absent: 'gone from adb devices: the computer does not see it on USB',
+  unresponsive: 'adb lists it, but no command on it answers',
 };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms)));
@@ -133,7 +192,9 @@ class Recovery {
    *    settings() -> {self_recovery, usb_reset}
    *    report(evt), log(line)
    *    afterKill()                                 restart what holds an adb client (ws-scrcpy)
-   *    run(cmd, args, timeoutMs) -> Promise<{code, out}>   for pnputil (never rejects)
+   *    run(cmd, args, timeoutMs) -> Promise<{code, out}>   for pnputil / uhubctl (never rejects)
+   *    probe(serial) -> Promise<bool>              v0.5.21: does a real command answer? (`shell echo`)
+   *    uhubctl() -> path or ''                     v0.5.21: where uhubctl is (Mac / Linux)
    *    now() -> ms, platform
    *  } */
   constructor(host, opts = {}) {
@@ -146,7 +207,17 @@ class Recovery {
     this.lastKillAt = 0;
     this.lastUsb = {};
     this.usbOff = '';          // why the USB reset is off for this run ('' = it is not)
+    this.hubPorts = {};        // serial -> {hub, port} last found in uhubctl's list (Mac / Linux)
+    this.lastManual = {};      // serial -> when the website's button last ran for it
     this.lastReport = null;
+  }
+
+  /** '' when this computer has a way to reset a phone's USB at all (setting aside the owner's tick), else why not. */
+  usbTool() {
+    if (this.host.platform === 'win32') return '';
+    if (this.host.platform !== 'darwin' && this.host.platform !== 'linux') return 'USB reset is not available on this system';
+    let p = ''; try { p = (this.host.uhubctl && this.host.uhubctl()) || ''; } catch { p = ''; }
+    return p ? '' : 'USB reset needs uhubctl (brew install uhubctl) and a hub that can switch port power';
   }
 
   now() { return this.host.now ? this.host.now() : Date.now(); }
@@ -184,7 +255,15 @@ class Recovery {
         q.since = now;
         q.firstState = state;
         q.nextAt = now + this.cfg.firstDelayMs;
-        this.host.log && this.host.log(`${serial}: stuck (${state === 'absent' ? 'gone from adb devices' : 'adb says "' + state + '"'}) - self-recovery will try in ${Math.round(this.cfg.firstDelayMs / 1000)} s`);
+        const on = !!this._settings().self_recovery;
+        this.host.log && this.host.log(`${serial}: stuck (${STATE_LOG[state] || 'adb says "' + state + '"'})` +
+          (on ? ` - self-recovery will try in ${Math.round(this.cfg.firstDelayMs / 1000)} s` : ' - self-recovery is off'));
+      }
+      // v0.5.21: say WHY it is down, once per state, whether or not self-recovery is on.
+      if (q.since != null && q.saidState !== state) {
+        q.saidState = state;
+        this._report({ serial, step: 'stuck', ok: false, state_before: state, state_after: state, attempt: q.tries,
+          detail: STATE_LOG[state] || state, since: q.since });
       }
     });
   }
@@ -193,8 +272,10 @@ class Recovery {
 
   status() {
     const st = this._settings();
-    return { on: !!st.self_recovery, usb_reset: !!st.usb_reset && this.host.platform === 'win32' && !this.usbOff,
-             usb_note: this.usbOff || (st.usb_reset && this.host.platform !== 'win32' ? 'Windows only' : ''),
+    const tool = this.usbTool();
+    return { on: !!st.self_recovery, usb_reset: !!st.usb_reset && !tool && !this.usbOff,
+             usb_note: this.usbOff || tool,
+             usb_tool: !tool,                         // v0.5.21: the website's "Power-cycle USB" button can work here
              stuck: this.stuck().length };
   }
 
@@ -220,7 +301,8 @@ class Recovery {
     return '';
   }
   usbBlocked(serial, now = this.now(), st = this._settings()) {
-    if (this.host.platform !== 'win32') return 'USB reset is Windows only';
+    const tool = this.usbTool();
+    if (tool) return tool;
     if (!st.usb_reset) return 'USB reset is off (agent setting)';
     if (this.usbOff) return this.usbOff;
     if (this.lastUsb[serial] && now - this.lastUsb[serial] < this.cfg.usbEveryMs) return 'USB reset was tried less than 30 minutes ago';
@@ -257,6 +339,8 @@ class Recovery {
         p.saidNone = true;
         let why;
         if (p.state === 'unauthorized') why = 'the phone asks "Allow USB debugging?" - someone must unlock it and tap Allow';
+        else if (p.state === 'unresponsive') why = 'the phone is on USB but does not answer; ' + (this.usbBlocked(serial, now, st) || 'nothing left to try') +
+          ' - restart the phone (hold the power button about 30 s if it is frozen)';
         else why = 'the computer does not see the phone on USB; ' + [this.killBlocked(now), this.usbBlocked(serial, now, st)].filter(Boolean).join('; ');
         this._report({ serial, step: 'none', ok: false, state_before: p.state, state_after: p.state, attempt: p.tries, detail: why, since: p.since });
       }
@@ -287,6 +371,12 @@ class Recovery {
       const r = (rows || []).find((x) => x.serial === serial);
       after = r ? r.state : 'absent';
     } catch { /* adb itself did not answer: keep the old state */ }
+    // v0.5.21: a phone that was listed but did not answer is back only when a real command answers.
+    if (after === 'ready' && (before === 'unresponsive' || p.firstState === 'unresponsive') && this.host.probe) {
+      let alive = false;
+      try { alive = !!(await this.host.probe(serial)); } catch { alive = false; }
+      if (!alive) after = 'unresponsive';
+    }
     const ok = after === 'ready';
     const wait = this.cfg.backoffMs[Math.min(p.tries - 1, this.cfg.backoffMs.length - 1)];
     p.nextAt = this.now() + wait;
@@ -308,6 +398,10 @@ class Recovery {
       await this.host.adb(['start-server'], this.cfg.startServerTimeoutMs);
       try { this.host.afterKill && this.host.afterKill(); } catch {}
       return 'adb server restarted';
+    }
+    if (step === 'usb_reset' && this.host.platform !== 'win32') {
+      this.lastUsb[serial] = this.now();
+      return this._uhubCycle(serial);
     }
     if (step === 'usb_reset') {
       this.lastUsb[serial] = this.now();
@@ -333,6 +427,76 @@ class Recovery {
     throw new Error('unknown step ' + step);
   }
 
+  /** Mac / Linux (v0.5.21): cut the power of the phone's hub port and turn it back on (uhubctl). */
+  async _uhubCycle(serial) {
+    const bin = (this.host.uhubctl && this.host.uhubctl()) || '';
+    if (!bin) throw new Error('uhubctl is not installed (brew install uhubctl)');
+    const t = this.cfg.uhubctlTimeoutMs;
+    const list = await this.host.run(bin, [], t);
+    const out = String(list.out || '');
+    if (/permission|access denied|must be root|sudo/i.test(out) && !/Current status for hub/i.test(out)) {
+      this.usbOff = 'uhubctl is not allowed to switch the hubs (it needs to run as root on this computer)';
+      throw new Error(this.usbOff);
+    }
+    if (!/Current status for hub/i.test(out)) {
+      throw new Error('no hub on this computer can switch its port power (uhubctl lists none) - a hub with per-port power switching is needed');
+    }
+    const found = findHubPort(out, serial);
+    if (found) this.hubPorts[serial] = found;
+    const at = found || this.hubPorts[serial];
+    if (!at) throw new Error('the phone is not on a hub uhubctl can switch (or it dropped off USB before its port was ever seen)');
+    const r = await this.host.run(bin, ['-l', at.hub, '-p', String(at.port), '-a', 'cycle', '-d', String(this.cfg.uhubctlOffS)], t);
+    if (r.code !== 0) {
+      const o = String(r.out || '').trim().split(/\r?\n/).filter(Boolean).pop() || ('exit code ' + r.code);
+      throw new Error(('uhubctl said: ' + o).slice(0, 200));
+    }
+    return `power of hub ${at.hub} port ${at.port} cut for ${this.cfg.uhubctlOffS} s and turned back on` + (found ? '' : ' (remembered port)');
+  }
+
+  /** The website's "Power-cycle USB" button (v0.5.21): one USB reset of this phone, now. A person asked,
+      so the agent setting and the 30-minute spacing do not apply; at most one a minute per phone, and
+      never while another try runs on this computer. Resolves {ok, state, detail}; never rejects. */
+  async manualUsbReset(serial) {
+    const tool = this.usbTool();
+    if (tool) return { ok: false, state: 'unsupported', detail: tool };
+    if (this.usbOff) return { ok: false, state: 'unsupported', detail: this.usbOff };
+    const now = this.now();
+    if (this.lastManual[serial] && now - this.lastManual[serial] < this.cfg.manualEveryMs) {
+      return { ok: false, state: 'too_soon', detail: 'a USB reset of this phone ran less than a minute ago - give it a moment' };
+    }
+    if (this.busy) return { ok: false, state: 'busy', detail: 'another recovery try is running on this computer - try again in a minute' };
+    this.busy = true;
+    this.lastManual[serial] = now;
+    const p = this.phones[serial];
+    const before = (p && p.state) || 'ready';
+    let detail = '', ok = false;
+    try {
+      detail = await this._run('usb_reset', serial);
+      await sleep(this.cfg.settleMs);
+      let after = before;
+      try {
+        const rows = await this.host.scan();
+        const r = (rows || []).find((x) => x.serial === serial);
+        after = r ? r.state : 'absent';
+      } catch {}
+      if (after === 'ready' && this.host.probe) {
+        try { if (!(await this.host.probe(serial))) after = 'unresponsive'; } catch { after = 'unresponsive'; }
+      }
+      ok = after === 'ready';
+      this._report({ serial, step: 'usb_reset', ok, state_before: before, state_after: after, attempt: p ? p.tries : 0,
+        detail: ('by hand: ' + detail).slice(0, 300), since: p ? p.since : null });
+      if (ok && p) delete this.phones[serial];
+      return { ok, state: ok ? 'back' : after, detail };
+    } catch (e) {
+      detail = errText(e);
+      this._report({ serial, step: 'usb_reset', ok: false, state_before: before, state_after: before, attempt: p ? p.tries : 0,
+        detail: ('by hand, failed: ' + detail).slice(0, 300), since: p ? p.since : null });
+      return { ok: false, state: 'failed', detail };
+    } finally {
+      this.busy = false;
+    }
+  }
+
   _report(evt) {
     const e = { at: this.now(), ...evt };
     this.lastReport = e;
@@ -340,4 +504,4 @@ class Recovery {
   }
 }
 
-module.exports = { Recovery, nextStep, findUsbInstance, loadSettings, saveSettings, DEFAULTS, STEP_WORDS };
+module.exports = { Recovery, nextStep, findUsbInstance, findHubPort, findUhubctl, loadSettings, saveSettings, DEFAULTS, STEP_WORDS, STATE_LOG };

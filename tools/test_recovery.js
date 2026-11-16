@@ -10,7 +10,7 @@
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { Recovery, nextStep, findUsbInstance, loadSettings, saveSettings } = require(path.join(__dirname, '..', 'src', 'recovery.js'));
+const { Recovery, nextStep, findUsbInstance, findHubPort, findUhubctl, loadSettings, saveSettings } = require(path.join(__dirname, '..', 'src', 'recovery.js'));
 const { AgentCore } = require(path.join(__dirname, '..', 'src', 'core.js'));
 
 let fail = 0;
@@ -61,7 +61,8 @@ function farm(opts = {}) {
   const t = { now: 1_000_000 };
   const states = Object.assign({}, opts.states || {});   // serial -> 'ready' | 'offline' | 'unauthorized' | (missing = absent)
   const calls = [];
-  const reports = [];
+  const reports = [];        // the tries and their outcome ('stuck' state reports, v0.5.21, are in `said`)
+  const said = [];
   const runs = [];
   const pairedList = opts.paired || Object.keys(states);   // fixed at the start: a phone that leaves adb stays paired
   const st = Object.assign({ self_recovery: true, usb_reset: false }, opts.settings || {});
@@ -77,7 +78,7 @@ function farm(opts = {}) {
     streamsOpen: () => (opts.streams || 0),
     jobsRunning: () => !!opts.jobs,
     settings: () => st,
-    report: (e) => reports.push(e),
+    report: (e) => (e.step === 'stuck' ? said : reports).push(e),
     log: () => {},
     afterKill: () => calls.push('AFTER_KILL'),
     run: (cmd, args, timeoutMs) => {
@@ -86,11 +87,13 @@ function farm(opts = {}) {
     },
     now: () => t.now,
     platform: opts.platform || 'linux',
+    probe: (serial) => Promise.resolve(opts.probe ? opts.probe(serial, states) : true),
+    uhubctl: () => (opts.uhubctl || ''),
   };
   const r = new Recovery(host, { settleMs: 0 });
   const rows = () => Object.keys(states).map((s) => ({ serial: s, state: states[s] }));
   const scan = () => r.observe(rows());
-  return { r, t, states, calls, reports, runs, st, scan, host };
+  return { r, t, states, calls, reports, said, runs, st, scan, host };
 }
 const steps = (reports) => reports.map((e) => e.step + (e.ok ? ':ok' : ''));
 
@@ -163,7 +166,7 @@ const steps = (reports) => reports.map((e) => e.step + (e.ok ? ':ok' : ''));
     check('absent + nothing allowed: no try', f.r.tick(), null);
     check('no adb command was run', f.calls, []);
     check('one "none" report saying why', f.reports.map((e) => [e.step, e.state_before]), [['none', 'absent']]);
-    check('...in words', /does not see the phone on USB; restarting adb needs 3 stuck phones \(1 now\); USB reset is Windows only/.test(f.reports[0].detail), true);
+    check('...in words', /does not see the phone on USB; restarting adb needs 3 stuck phones \(1 now\); USB reset needs uhubctl/.test(f.reports[0].detail), true);
     f.t.now += 20 * 60000;
     f.r.tick();
     check('...not repeated every look', f.reports.length, 1);
@@ -226,7 +229,90 @@ const steps = (reports) => reports.map((e) => e.step + (e.ok ? ':ok' : ''));
   }
   {
     const f = farm({ states: { B: 'ready' }, platform: 'darwin', settings: { usb_reset: true } });
-    check('never on a Mac', f.r.usbBlocked('B', f.t.now), 'USB reset is Windows only');
+    check('a Mac without uhubctl: no USB reset, and it says what is missing', /uhubctl/.test(f.r.usbBlocked('B', f.t.now)), true);
+    check('...the status tells the website the button cannot work here', f.r.status().usb_tool, false);
+  }
+
+  // 6b. v0.5.21: Mac / Linux USB power cycle through uhubctl
+  const UHUB = [
+    'Current status for hub 20-3.4 [2109:2817 VIA Labs, Inc. USB2.0 Hub, USB 2.10, 4 ports, ppps]',
+    '  Port 1: 0103 power enable connect [18d1:4ee7 Google Pixel 8 48121FDJH000CR]',
+    '  Port 2: 0100 power',
+    '  Port 3: 0103 power enable connect [18d1:4ee7 Google Pixel 6a 26111JEGR0XXXX]',
+    'Current status for hub 20-3 [2109:0817 VIA Labs, Inc. USB3.0 Hub, USB 3.00, 4 ports, ppps]',
+    '  Port 1: 02a0 power 5gbps Rx.Detect',
+  ].join('\n');
+  check('uhubctl: the phone\'s hub and port by its serial', findHubPort(UHUB, '26111jegr0xxxx'), { hub: '20-3.4', port: '3' });
+  check('uhubctl: a serial on no port', findHubPort(UHUB, 'NOPE'), null);
+  check('uhubctl: an empty serial never matches', findHubPort(UHUB, ''), null);
+  check('uhubctl is found where Homebrew puts it', findUhubctl({}, (p) => p === '/opt/homebrew/bin/uhubctl'), '/opt/homebrew/bin/uhubctl');
+  check('...PD_UHUBCTL wins', findUhubctl({ PD_UHUBCTL: '/x/uhubctl' }, () => true), '/x/uhubctl');
+  check('...none installed: empty', findUhubctl({}, () => false), '');
+  {
+    const f = farm({ states: { '48121FDJH000CR': 'offline' }, platform: 'darwin', uhubctl: '/opt/homebrew/bin/uhubctl',
+      settings: { usb_reset: true },
+      onRun: (args) => { if (!args.length) return { code: 0, out: UHUB }; f.states['48121FDJH000CR'] = 'ready'; return { code: 0, out: 'Sent power cycle' }; } });
+    check('a Mac with uhubctl: the USB reset is allowed', f.r.usbBlocked('48121FDJH000CR', f.t.now), '');
+    check('...and the website button can work', f.r.status().usb_tool, true);
+    const res = await f.r.manualUsbReset('48121FDJH000CR');
+    check('the button: power cycle of the right port', f.runs,
+      ['/opt/homebrew/bin/uhubctl ', '/opt/homebrew/bin/uhubctl -l 20-3.4 -p 1 -a cycle -d 3']);
+    check('...the phone came back', [res.ok, res.state], [true, 'back']);
+    check('...reported as a by-hand USB reset', f.reports.map((e) => [e.step, e.ok, /by hand/.test(e.detail)]), [['usb_reset', true, true]]);
+    const again = await f.r.manualUsbReset('48121FDJH000CR');
+    check('...not twice within a minute', again.state, 'too_soon');
+    f.t.now += 61000;
+    delete f.states['48121FDJH000CR'];                 // gone from USB: the remembered port is used
+    const f2out = UHUB.replace('[18d1:4ee7 Google Pixel 8 48121FDJH000CR]', '');
+    f.host.run = (cmd, args) => { f.runs.push(cmd + ' ' + args.join(' ')); return Promise.resolve(args.length ? { code: 0, out: '' } : { code: 0, out: f2out }); };
+    const gone = await f.r.manualUsbReset('48121FDJH000CR');
+    check('a phone gone from USB: its remembered port is cycled', f.runs[f.runs.length - 1], '/opt/homebrew/bin/uhubctl -l 20-3.4 -p 1 -a cycle -d 3');
+    check('...still gone afterwards: not ok, says absent', [gone.ok, gone.state, /remembered port/.test(gone.detail)], [false, 'absent', true]);
+  }
+  {
+    const f = farm({ states: { B: 'ready' }, platform: 'darwin', uhubctl: '/u',
+      onRun: () => ({ code: 0, out: 'No compatible devices detected!' }) });
+    const res = await f.r.manualUsbReset('B');
+    check('no switchable hub: the button says so in words', [res.ok, /per-port power switching/.test(res.detail)], [false, true]);
+  }
+  {
+    const f = farm({ states: { B: 'ready' }, platform: 'darwin' });
+    const res = await f.r.manualUsbReset('B');
+    check('no uhubctl: unsupported, says what to install', [res.state, /brew install uhubctl/.test(res.detail)], ['unsupported', true]);
+  }
+
+  // 6c. v0.5.21: a phone adb lists but that does not answer ('unresponsive'), and the state reports
+  check('unresponsive: reconnect this phone, USB reset, then again', [0, 1, 2].map((n) => nextStep('unresponsive', n, all)),
+    ['reconnect_device', 'usb_reset', 'reconnect_device']);
+  {
+    let answers = false;
+    const f = farm({ states: { B: 'ready' }, settings: { self_recovery: false }, probe: () => answers,
+      onAdb: (cmd) => { if (cmd === '-s B reconnect') answers = true; } });
+    f.scan();
+    f.states.B = 'unresponsive'; f.scan(); f.scan();
+    check('stuck with self-recovery OFF: the state is still reported once', f.said.map((e) => [e.step, e.state_before]), [['stuck', 'unresponsive']]);
+    f.scan(); f.scan();
+    check('...not again every scan', f.said.length, 1);
+    f.states.B = 'offline'; f.scan();
+    check('...again when the state changes', f.said.map((e) => e.state_before), ['unresponsive', 'offline']);
+    check('...and nothing is tried while it is off', [f.r.tick(), f.calls.length], [null, 0]);
+    f.states.B = 'unresponsive'; f.scan();
+    f.st.self_recovery = true;
+    f.t.now += 20000;
+    // the first try: adb lists it as "device" again but a real command does not answer yet
+    answers = false;
+    f.host.adb = (args, t) => { f.calls.push(args.join(' ')); return Promise.resolve(''); };
+    f.states.B = 'unresponsive';
+    const realScan = f.host.scan;
+    f.host.scan = () => Promise.resolve([{ serial: 'B', state: 'ready' }]);
+    await f.r.tick();
+    check('listed again but not answering: NOT counted as back', f.reports.map((e) => [e.step, e.ok, e.state_after]), [['reconnect_device', false, 'unresponsive']]);
+    f.t.now += 61000;
+    answers = true;
+    await f.r.tick();
+    const last = f.reports[f.reports.length - 1];
+    check('...back only when a real command answers (2nd try, a reconnect: the USB reset is off)', [last.step, last.ok, last.state_after], ['reconnect_device', true, 'ready']);
+    f.host.scan = realScan;
   }
 
   // 7. switched off; a phone never seen since the app started
@@ -290,6 +376,36 @@ const steps = (reports) => reports.map((e) => e.step + (e.ok ? ':ok' : ''));
     check('...and it is saved', JSON.parse(fs.readFileSync(c2.settingsFile, 'utf8')), { self_recovery: true, usb_reset: true });
     c2._posting = new Set(['S9']);
     check('a post running counts as a job', c2._jobsRunning(), true);
+  }
+
+  // 9. v0.5.21: adb errors in words, and "on adb but not answering" from the heartbeat
+  {
+    const W = AgentCore._adbErrText;
+    check('a timeout says the phone did not answer', /did not answer in 15 s/.test(W({ killed: true }, '', 15000)), true);
+    check('adb\'s own complaint is kept (last line)', W({ code: 1, message: 'Command failed: adb -s X shell' }, 'x\nerror: device offline\n', 8000), 'adb: error: device offline');
+    check('"Command failed: <command line>" alone is never the answer', W({ code: 1, message: 'Command failed: adb -s X exec-out screencap -p' }, '', 8000), 'adb failed (exit code 1)');
+    const c = Object.create(AgentCore.prototype);
+    const logs = [];
+    c.emit = (k, l) => logs.push(l);
+    c.devices = { P: {} };
+    c._noteAdb('P', false, new Error('the phone did not answer in 8 s'));
+    check('one failed beat is not "unresponsive"', c._adbState('P').state, 'ready');
+    c._noteAdb('P', false, new Error('the phone did not answer in 8 s'));
+    const s = c._adbState('P');
+    check('two in a row are', [s.state, s.fails, /did not answer/.test(s.error)], ['unresponsive', 2, true]);
+    check('...logged once', logs.filter((l) => /not answering/.test(l)).length, 1);
+    c._noteAdb('P', true);
+    check('one good answer clears it', c._adbState('P').state, 'ready');
+    // the meta beat carries it, and an unresponsive phone keeps its last profile list (no 3 extra timeouts)
+    c.devices.P = { adbHealth: { fails: 3, since: 5, error: 'x' }, _metaCache: { users: [{ id: 0, name: 'Owner' }], current_user: 0 } };
+    c.appVersion = '0.5.21';
+    c._hostStats = () => ({});
+    let extra = 0;
+    c._adbAsync = (args) => { if (args.includes('dumpsys')) return Promise.reject(Object.assign(new Error('t'), { killed: true })); extra++; return Promise.reject(new Error('no')); };
+    c._loadTokens = () => ({});
+    const meta = await c._metaPayloadAsync('P', true);
+    check('the meta beat says unresponsive', meta.adb.state, 'unresponsive');
+    check('...keeps the last profile list and asks nothing more', [meta.users.length, extra], [1, 0]);
   }
 
   console.log(fail ? `\n${fail} FAILING` : '\nall recovery checks passed');
