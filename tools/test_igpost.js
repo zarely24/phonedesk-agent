@@ -169,7 +169,7 @@ function fakeDriver(screens) {
     d.primaryButton = async () => pngscan.primaryButton(shot);
     const r = await ig.run(d, ig.FLOW_REEL_WITH_AUDIO, { caption: 'with sound', mode: 'post' });
     check('an unreadable sound page: the button is tapped off the screenshot and the post goes on',
-      [r.state, r.trace[0].name, r.trace[0].matched.startsWith('screen unreadable'), d.taps[0]], ['shared', 'audio-page', true, [b.x, b.y]]);
+      [r.state, r.trace[0].name, r.trace[0].matched.startsWith('the blue button on a screenshot'), d.taps[0]], ['shared', 'audio-page', true, [b.x, b.y]]);
     const d2 = fakeDriver([EMPTY, EMPTY]);
     d2.primaryButton = async () => null;
     const r2 = await ig.run(d2, ig.FLOW_REEL_WITH_AUDIO, { caption: 'c', mode: 'post' });
@@ -182,7 +182,7 @@ function fakeDriver(screens) {
     d4.primaryButton = async () => pngscan.primaryButton(shot);
     const r4 = await ig.run(d4, ig.FLOW_REEL_WITH_AUDIO, { caption: 'with sound', mode: 'post', appPkg: 'com.instagram.android' });
     check('a read that is the home screen, not Instagram: the button is tapped off the screenshot',
-      [r4.state, r4.trace[0].matched.startsWith('screen unreadable'), d4.taps[0]], ['shared', true, [b.x, b.y]]);
+      [r4.state, r4.trace[0].matched.startsWith('the blue button on a screenshot'), d4.taps[0]], ['shared', true, [b.x, b.y]]);
     const d5 = fakeDriver([LAUNCHER, LAUNCHER]);
     d5.primaryButton = async () => null;           // a real home screen: no big blue button on it
     const r5 = await ig.run(d5, ig.FLOW_REEL_WITH_AUDIO, { caption: 'c', mode: 'post', appPkg: 'com.instagram.android' });
@@ -191,7 +191,26 @@ function fakeDriver(screens) {
     const d3 = fakeDriver([EMPTY, CAMERA, GALLERY]);
     d3.primaryButton = async () => ({ x: 1, y: 1 });
     const r3 = await ig.run(d3, ig.FLOW_REEL, { caption: 'c', mode: 'post' });
-    check('the plain reel flow never taps off a screenshot (only the sound page allows it)', r3.trace.every((t) => !/screen unreadable/.test(t.matched)), true);
+    check('the plain reel flow never taps off a screenshot (only the sound page allows it)', r3.trace.every((t) => !/the blue button on a screenshot/.test(t.matched)), true);
+    // v0.5.22: 2026-11-18 - the read IS Instagram but the button never shows up in it (a build
+    // whose dump hides the sound page's controls): after three clean Instagram reads the
+    // screenshot fallback fires too.
+    const IG_BLANK = screen({ id: 'com.instagram.android:id/tab_bar', bounds: [0, 2200, 1080, 2400] },
+                            { desc: 'Back', clickable: true, bounds: [0, 100, 140, 240] });
+    const d6 = fakeDriver([IG_BLANK, CAMERA, GALLERY, GALLERY, EDITOR, SHARE_SHEET, SHARE_SHEET, SHARED]);
+    d6.primaryButton = async () => pngscan.primaryButton(shot);
+    const r6 = await ig.run(d6, ig.FLOW_REEL_WITH_AUDIO, { caption: 'with sound', mode: 'post', appPkg: 'com.instagram.android' });
+    check('readable Instagram, button never in the dump: the screenshot fallback fires too',
+      [r6.state, r6.trace[0].matched.startsWith('the blue button on a screenshot'), d6.taps[0]], ['shared', true, [b.x, b.y]]);
+    // ...but a pop-up on the screen is dismissed FIRST, never mistaken for the button by the scan
+    const IG_POPUP = screen({ id: 'com.instagram.android:id/tab_bar', bounds: [0, 2200, 1080, 2400] },
+                             { text: 'Turn on notifications?', bounds: [100, 900, 980, 1000] },
+                             { text: 'Not now', clickable: true, bounds: [100, 1100, 980, 1200] });
+    const d7 = fakeDriver([IG_POPUP, IG_BLANK, CAMERA, GALLERY, GALLERY, EDITOR, SHARE_SHEET, SHARE_SHEET, SHARED]);
+    d7.primaryButton = async () => pngscan.primaryButton(shot);
+    const r7 = await ig.run(d7, ig.FLOW_REEL_WITH_AUDIO, { caption: 'with sound', mode: 'post', appPkg: 'com.instagram.android' });
+    check('a pop-up is dismissed first; only clean reads feed the screenshot fallback',
+      [r7.state, r7.trace[0].name, d7.taps[1]], ['shared', 'audio-page:dismiss', [b.x, b.y]]);
   }
   // ---------- whoami flow ----------
   {

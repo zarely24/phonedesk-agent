@@ -297,7 +297,7 @@ async function run(driver, flow, opts) {
     }
     // Look for a candidate, dismissing pop-ups in between, until the step's timeout.
     const limit = step.timeout || STEP_TIMEOUT_MS;
-    let hit = null, dismissed = 0, backs = 0, fatal = null, emptyReads = 0, shotTap = null;
+    let hit = null, dismissed = 0, backs = 0, fatal = null, emptyReads = 0, igMisses = 0, shotTap = null;
     while (true) {
       await dump();
       if (capture) screens.push({ at: step.name, ...describe(nodes, o.username) });
@@ -325,7 +325,18 @@ async function run(driver, flow, opts) {
         fatal = findAny(nodes, FATAL.map((f) => ({ text: f.text })));
         if (fatal) { const f = FATAL.find((x) => x.text === fatal.sel.text); return fail(step, f ? f.why : 'blocked'); }
       }
-      const popup = dismissed < 3 && (!away || sysDialog) ? findAny(nodes, DISMISS) : null;
+      // v0.5.22: the screenshot fallback also fires when the read IS Instagram but the button never
+      // shows up in it (a build whose dump hides the sound page's controls). Three clean Instagram
+      // reads with no match - and no pop-up on the dump, so a dialog's own blue OK button is never
+      // mistaken for the flow's; pop-ups are dismissed first (below) and the count resets.
+      const popupNow = dismissed < 3 && (!away || sysDialog) ? findAny(nodes, DISMISS) : null;
+      const cleanIg = !away && !fatal && nodes.length && !notApp && !popupNow;
+      igMisses = cleanIg ? igMisses + 1 : 0;
+      if (step.fallback === 'primary-button' && driver.primaryButton && igMisses >= 3) {
+        const b = await driver.primaryButton();
+        if (b) { shotTap = b; break; }
+      }
+      const popup = popupNow;
       if (popup) {
         const t = tapTarget(nodes, popup.node);
         await driver.tap(t.cx, t.cy); dismissed++;
@@ -346,7 +357,7 @@ async function run(driver, flow, opts) {
     }
     if (!hit && shotTap) {
       await driver.tap(shotTap.x, shotTap.y);
-      trace.push({ name: step.name, ok: true, matched: `screen unreadable: the blue button on a screenshot, tapped at ${shotTap.x},${shotTap.y}`, ms: now() - t0 });
+      trace.push({ name: step.name, ok: true, matched: `the blue button on a screenshot (the dump ${emptyReads >= 2 ? 'could not read the screen' : 'never showed it'}), tapped at ${shotTap.x},${shotTap.y}`, ms: now() - t0 });
       await driver.wait(step.settle || 1500);
       continue;
     }

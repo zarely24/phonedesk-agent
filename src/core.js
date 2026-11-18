@@ -19,6 +19,7 @@ const igstats = require('./igstats');       // v0.5.12: followers / dashboard vi
 const pngscan = require('./pngscan');       // v0.5.18: Instagram's blue button off a screenshot when the screen cannot be read
 const recovery = require('./recovery');     // v0.5.19: phones that fall off adb are tried again by themselves
 const igcheck = require('./igcheck');       // v0.5.15: the daily account check - what each screen is, the numbers, Insights (pure)
+const igengage = require('./igengage');     // v0.5.22: one USA target visit - follow, like a recent post (pure)
 // The version this file ships in, for replies that say which agent read a profile. The Electron app
 // passes its own (opts.appVersion); `node agent.js` and the tests fall back to package.json.
 const AGENT_VERSION = (() => { try { return require('../package.json').version; } catch { return ''; } })();
@@ -1510,6 +1511,7 @@ class AgentCore extends EventEmitter {
       else if (m.op === 'ig_post') this.igPost(serial, m, ws);              // switch profile, drop the clip in, share it
       else if (m.op === 'ig_whoami') this.igWhoami(serial, m, ws);          // which account is logged in, in this profile
       else if (m.op === 'ig_check') this.igCheck(serial, m, ws);            // v0.5.15: the daily account check of one profile (accounts, numbers, Insights)
+      else if (m.op === 'ig_engage') this.igEngage(serial, m, ws);          // v0.5.22: the engagement runner - one USA target visit (follow, like)
       // Physical device controls (real, deterministic: PhoneDesk button -> here -> adb -> phone).
       else if (m.op === 'input_key') this.inputKey(serial, m, ws);        // Power/Vol/Back/Home/Recent...
       else if (m.op === 'input_text') this.inputText(serial, m, ws);      // keyboard text into the focused field
@@ -2922,6 +2924,70 @@ class AgentCore extends EventEmitter {
       + `${out.dm_unread != null ? ', ' + out.dm_unread + ' unread DM(s)' : ''}${out.account_status ? ', Account status ' + out.account_status.state : ''}`
       + `${out.why ? ' (' + out.why + ')' : ''} in ${Math.round((Date.now() - t0) / 1000)} s`);
     return out;
+  }
+
+  /** One USA target visit for the backend's engagement runner (v0.5.22, posting/engage.py):
+      switch to the profile, deep-link the account INSIDE Instagram (the audio-link lesson: never a
+      plain VIEW - that lands in the browser), let igengage.js do the taps. ONE target per op - the
+      backend sends one at a time, the way ig_check is driven. Follows/likes only; never comments,
+      never DMs; a viewer opening the phone stops it. */
+  async igEngage(serial, m, ws) {
+    const uid = parseInt(m.uid != null ? m.uid : -1, 10);
+    const target = String(m.username || '').trim().replace(/^@/, '').toLowerCase();
+    const pkg = 'com.instagram.android';
+    const t0 = Date.now();
+    const log = (x) => this.emit('log', `[engage ${serial} u${uid}] ${x}`);
+    const reply = (obj) => this._rpcReply(ws, m, Object.assign({ seconds: Math.round((Date.now() - t0) / 1000), uid }, obj));
+    if (!(uid >= 0)) return reply({ ok: false, state: 'bad_request', why: 'uid missing' });
+    if (!/^[a-z0-9._]{1,30}$/.test(target)) return reply({ ok: false, state: 'bad_request', why: 'that is not an Instagram username' });
+    if (!this._posting) this._posting = new Set();
+    if (this._posting.has(serial)) return reply({ ok: false, state: 'device_busy', why: 'another job is running on this phone' });
+    this._posting.add(serial);
+    let previous = null;
+    let driver = null;
+    try {
+      if (await this._scrcpyRunning(serial)) return reply({ ok: false, state: 'device_busy', why: 'someone is watching this phone' });
+      if (!(await this._userExists(serial, uid))) return reply({ ok: false, state: 'profile_not_found', why: 'the profile is gone from the phone' });
+      if (!(await this._pkgInstalledForUser(serial, uid, pkg))) return reply({ ok: false, state: 'no_app', why: 'Instagram is not installed in this profile' });
+      previous = await this._igSwitchTo(serial, uid, false, log);
+      await this._waitUnlocked(serial, uid, 30000, log);
+      if (await this._scrcpyRunning(serial)) return reply({ ok: false, state: 'device_busy', why: 'someone is watching this phone' });
+      const url = `https://www.instagram.com/${target}/`;
+      const bad = (r) => /error|exception|unable|does not exist|no activity/i.test(String(r));
+      let r = await this._adbLong(serial, ['shell', 'am', 'start', '--user', String(uid), '-a', 'android.intent.action.VIEW', '-d', this._shq(url), '-p', pkg], 10000).catch((e) => 'Error ' + e);
+      if (bad(r)) r = await this._adbLong(serial, ['shell', 'am', 'start', '--user', String(uid), '-n', `${pkg}/com.instagram.url.UrlHandlerActivity`, '-d', this._shq(url)], 10000).catch((e) => 'Error ' + e);
+      if (bad(r)) return reply({ ok: false, state: 'failed', why: 'the profile would not open', error: String(r).trim().slice(0, 160) });
+      log(`opened instagram.com/${target}`);
+      await new Promise((res) => setTimeout(res, 4000));
+      driver = this._igDriver(serial, target);
+      const r2 = await igengage.run(driver, target, {
+        follow: m.follow !== false,
+        like_posts: parseInt(m.like_posts, 10) || 0,
+        abort: async () => this._scrcpyRunning(serial),
+      });
+      const out = { ok: r2.state === 'visited', state: r2.state, followed: !!r2.followed, already_following: !!r2.already_following,
+        requested: !!r2.requested, liked: r2.liked || 0, why: r2.why || '', trace: r2.trace || [], agent_version: this.appVersion || AGENT_VERSION };
+      if (out.state !== 'visited' && m.shot !== false) {
+        try { const png = await driver.screenshot(); if (png && png.length) out.screenshot_b64 = png.toString('base64'); } catch {}
+      }
+      log(`-> ${out.state}${out.followed ? ', followed' : out.requested ? ', requested' : out.already_following ? ', already following' : ''}, liked ${out.liked}${out.why ? ' (' + out.why + ')' : ''}`);
+      return reply(out);
+    } catch (e) {
+      const err = String((e && e.message) || e);
+      log(`failed: ${err}`);
+      const out = { ok: false, state: 'failed', why: 'exception', error: err.slice(0, 300) };
+      try { if (driver) { const png = await driver.screenshot(); if (png && png.length) out.screenshot_b64 = png.toString('base64'); } } catch {}
+      return reply(out);
+    } finally {
+      // the phone back as it was, BEFORE the reply - the same courtesy ig_check pays
+      try { await this._adbLong(serial, ['shell', 'input', 'keyevent', 'KEYCODE_HOME'], 5000); } catch {}
+      if (previous && previous !== String(uid)) {
+        try { await this._adbLong(serial, ['shell', 'am', 'switch-user', String(previous)], 12000); log(`restored profile ${previous}`); } catch {}
+      }
+      try { this.devices[serial] && (this.devices[serial]._metaCache = null); } catch {}
+      this._sendMeta(serial, ws);
+      this._posting.delete(serial);
+    }
   }
 
   /** Phase-1 REMOTE Instagram diagnostic (triggered from the web dashboard via the backend RPC). READ-
