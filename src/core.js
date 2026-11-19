@@ -20,6 +20,7 @@ const pngscan = require('./pngscan');       // v0.5.18: Instagram's blue button 
 const recovery = require('./recovery');     // v0.5.19: phones that fall off adb are tried again by themselves
 const igcheck = require('./igcheck');       // v0.5.15: the daily account check - what each screen is, the numbers, Insights (pure)
 const igengage = require('./igengage');     // v0.5.22: one USA target visit - follow, like a recent post (pure)
+const igcreate = require('./igcreate');     // v0.5.23: the signup / creator / photo walks for the backend's account-creation runner
 // The version this file ships in, for replies that say which agent read a profile. The Electron app
 // passes its own (opts.appVersion); `node agent.js` and the tests fall back to package.json.
 const AGENT_VERSION = (() => { try { return require('../package.json').version; } catch { return ''; } })();
@@ -1512,6 +1513,12 @@ class AgentCore extends EventEmitter {
       else if (m.op === 'ig_whoami') this.igWhoami(serial, m, ws);          // which account is logged in, in this profile
       else if (m.op === 'ig_check') this.igCheck(serial, m, ws);            // v0.5.15: the daily account check of one profile (accounts, numbers, Insights)
       else if (m.op === 'ig_engage') this.igEngage(serial, m, ws);          // v0.5.22: the engagement runner - one USA target visit (follow, like)
+      // Account creation (v0.5.23): the backend's igcreate runner sends ONE phase at a time -
+      // start (phone number), finish (code/password/name/username), creator, photo.
+      else if (m.op === 'ig_signup_start') this.igSignupPhase(serial, m, ws, 'start');
+      else if (m.op === 'ig_signup_finish') this.igSignupPhase(serial, m, ws, 'finish');
+      else if (m.op === 'ig_signup_creator') this.igSignupPhase(serial, m, ws, 'creator');
+      else if (m.op === 'ig_signup_photo') this.igSignupPhase(serial, m, ws, 'photo');
       // Physical device controls (real, deterministic: PhoneDesk button -> here -> adb -> phone).
       else if (m.op === 'input_key') this.inputKey(serial, m, ws);        // Power/Vol/Back/Home/Recent...
       else if (m.op === 'input_text') this.inputText(serial, m, ws);      // keyboard text into the focused field
@@ -2447,7 +2454,7 @@ class AgentCore extends EventEmitter {
         }
       },
       key: (name) => {
-        const KEYS = { back: 4, home: 3, enter: 66, tab: 61 };
+        const KEYS = { back: 4, home: 3, enter: 66, tab: 61, del: 67, move_end: 123 };   // del + move_end: clearing a pre-filled signup field (v0.5.23)
         return self._adbLong(serial, ['shell', 'input', 'keyevent', String(KEYS[name] || 4)], 8000);
       },
       // a finger drag (v0.5.14: moving the text Instagram wrote to its spot on the reel)
@@ -2980,6 +2987,71 @@ class AgentCore extends EventEmitter {
       return reply(out);
     } finally {
       // the phone back as it was, BEFORE the reply - the same courtesy ig_check pays
+      try { await this._adbLong(serial, ['shell', 'input', 'keyevent', 'KEYCODE_HOME'], 5000); } catch {}
+      if (previous && previous !== String(uid)) {
+        try { await this._adbLong(serial, ['shell', 'am', 'switch-user', String(previous)], 12000); log(`restored profile ${previous}`); } catch {}
+      }
+      try { this.devices[serial] && (this.devices[serial]._metaCache = null); } catch {}
+      this._sendMeta(serial, ws);
+      this._posting.delete(serial);
+    }
+  }
+
+  /** One account-creation phase for the backend's igcreate runner (v0.5.23, app/igcreate.py).
+      The same shell as igEngage - busy-set, no live viewer, real profile switch, HOME + previous
+      profile restored in `finally` - around the screen-driven walk in igcreate.js. `start` is
+      the only phase that cycles airplane mode for a fresh IP (the others must not break a flow
+      that is already halfway through, and the airplane cycle is what loses the code SMS). */
+  async igSignupPhase(serial, m, ws, phase) {
+    const uid = parseInt(m.uid != null ? m.uid : -1, 10);
+    const pkg = 'com.instagram.android';
+    const t0 = Date.now();
+    const secs = () => Math.round((Date.now() - t0) / 1000);
+    const log = (x) => this.emit('log', `[igcreate ${phase} ${serial} u${uid}] ${x}`);
+    const reply = (obj) => this._rpcReply(ws, m, Object.assign({ seconds: secs(), phase }, obj));
+    if (!(uid >= 0)) return reply({ ok: false, state: 'bad_request', why: 'uid missing' });
+    if (phase === 'start' && !/^\d{6,15}$/.test(String(m.phone || '').replace(/\D/g, ''))) {
+      return reply({ ok: false, state: 'bad_request', why: 'a phone number is needed for the start phase' });
+    }
+    if (phase === 'finish' && !(String(m.code || '').trim() && String(m.password || '').trim() && String(m.username || '').trim())) {
+      return reply({ ok: false, state: 'bad_request', why: 'code, password and username are needed for the finish phase' });
+    }
+    if (!this._posting) this._posting = new Set();
+    if (this._posting.has(serial)) return reply({ ok: false, state: 'device_busy', why: 'another job is running on this phone' });
+    this._posting.add(serial);
+    let previous = null;
+    let driver = null;
+    try {
+      if (await this._scrcpyRunning(serial)) return reply({ ok: false, state: 'device_busy', why: 'someone is watching this phone' });
+      if (!(await this._userExists(serial, uid))) return reply({ ok: false, state: 'profile_not_found', why: 'the profile is gone from the phone' });
+      if (!(await this._pkgInstalledForUser(serial, uid, pkg))) return reply({ ok: false, state: 'no_app', why: 'Instagram is not installed in this profile' });
+      previous = await this._igSwitchTo(serial, uid, phase === 'start', log);
+      await this._waitUnlocked(serial, uid, 30000, log);
+      if (await this._scrcpyRunning(serial)) return reply({ ok: false, state: 'device_busy', why: 'someone is watching this phone' });
+      await this._startApp(serial, uid, pkg);
+      await new Promise((res) => setTimeout(res, 4500));
+      driver = this._igDriver(serial, String(m.username || ''));
+      const abort = async () => this._scrcpyRunning(serial);
+      let out;
+      if (phase === 'start') out = await igcreate.signupStart(driver, { uid, phone: String(m.phone), abort });
+      else if (phase === 'finish') out = await igcreate.signupFinish(driver, { uid, code: String(m.code), password: String(m.password), name: String(m.name || ''), username: String(m.username), abort });
+      else if (phase === 'creator') out = await igcreate.switchCreator(driver, { uid, category: String(m.category || 'Digital creator'), abort });
+      else out = await igcreate.setPhoto(driver, { uid, abort });
+      out.agent_version = this.appVersion || AGENT_VERSION;
+      out.uid = uid;
+      const needShot = !out.ok || phase === 'finish';
+      if (needShot && !out.screenshot_b64) {
+        try { const png = await driver.screenshot(); if (png && png.length) out.screenshot_b64 = png.toString('base64'); } catch {}
+      }
+      log(`-> ${out.state}${out.why ? ' (' + out.why + ')' : ''}${out.step ? ' at ' + out.step : ''} in ${secs()} s`);
+      return reply(out);
+    } catch (e) {
+      const err = String((e && e.message) || e);
+      log(`failed: ${err}`);
+      const out = { ok: false, state: 'failed', why: 'exception', error: err.slice(0, 300) };
+      try { if (driver) { const png = await driver.screenshot(); if (png && png.length) out.screenshot_b64 = png.toString('base64'); } } catch {}
+      return reply(out);
+    } finally {
       try { await this._adbLong(serial, ['shell', 'input', 'keyevent', 'KEYCODE_HOME'], 5000); } catch {}
       if (previous && previous !== String(uid)) {
         try { await this._adbLong(serial, ['shell', 'am', 'switch-user', String(previous)], 12000); log(`restored profile ${previous}`); } catch {}
