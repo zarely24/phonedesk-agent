@@ -21,6 +21,7 @@ const recovery = require('./recovery');     // v0.5.19: phones that fall off adb
 const igcheck = require('./igcheck');       // v0.5.15: the daily account check - what each screen is, the numbers, Insights (pure)
 const igengage = require('./igengage');     // v0.5.22: one USA target visit - follow, like a recent post (pure)
 const igcreate = require('./igcreate');     // v0.5.23: the signup / creator / photo walks for the backend's account-creation runner
+const thlogin = require('./thlogin');       // v0.5.24: the Threads "Continue as @user" login walk (pure)
 // The version this file ships in, for replies that say which agent read a profile. The Electron app
 // passes its own (opts.appVersion); `node agent.js` and the tests fall back to package.json.
 const AGENT_VERSION = (() => { try { return require('../package.json').version; } catch { return ''; } })();
@@ -1519,6 +1520,8 @@ class AgentCore extends EventEmitter {
       else if (m.op === 'ig_signup_finish') this.igSignupPhase(serial, m, ws, 'finish');
       else if (m.op === 'ig_signup_creator') this.igSignupPhase(serial, m, ws, 'creator');
       else if (m.op === 'ig_signup_photo') this.igSignupPhase(serial, m, ws, 'photo');
+      // Threads setup (v0.5.24): the backend's thlogin runner sends one op per profile.
+      else if (m.op === 'th_login') this.thLogin(serial, m, ws);
       // Physical device controls (real, deterministic: PhoneDesk button -> here -> adb -> phone).
       else if (m.op === 'input_key') this.inputKey(serial, m, ws);        // Power/Vol/Back/Home/Recent...
       else if (m.op === 'input_text') this.inputText(serial, m, ws);      // keyboard text into the focused field
@@ -2987,6 +2990,60 @@ class AgentCore extends EventEmitter {
       return reply(out);
     } finally {
       // the phone back as it was, BEFORE the reply - the same courtesy ig_check pays
+      try { await this._adbLong(serial, ['shell', 'input', 'keyevent', 'KEYCODE_HOME'], 5000); } catch {}
+      if (previous && previous !== String(uid)) {
+        try { await this._adbLong(serial, ['shell', 'am', 'switch-user', String(previous)], 12000); log(`restored profile ${previous}`); } catch {}
+      }
+      try { this.devices[serial] && (this.devices[serial]._metaCache = null); } catch {}
+      this._sendMeta(serial, ws);
+      this._posting.delete(serial);
+    }
+  }
+
+  /** Threads login for the backend's thlogin runner (v0.5.24, app/thlogin.py): launch
+      com.instagram.barcelona on the profile and tap "Continue as @user" - a Threads account IS
+      the profile's Instagram account, so there is nothing to type. The igEngage shell (busy-set,
+      no live viewer, real profile switch, HOME + previous profile restored in `finally`) around
+      the screen-driven walk in thlogin.js. NO airplane cycle: login is not IP-sensitive (the
+      account is already the phone's own), and the cycle would only slow every profile down. */
+  async thLogin(serial, m, ws) {
+    const uid = parseInt(m.uid != null ? m.uid : -1, 10);
+    const pkg = 'com.instagram.barcelona';
+    const t0 = Date.now();
+    const secs = () => Math.round((Date.now() - t0) / 1000);
+    const log = (x) => this.emit('log', `[threads ${serial} u${uid}] ${x}`);
+    const reply = (obj) => this._rpcReply(ws, m, Object.assign({ seconds: secs(), uid }, obj));
+    if (!(uid >= 0)) return reply({ ok: false, state: 'bad_request', why: 'uid missing' });
+    if (!this._posting) this._posting = new Set();
+    if (this._posting.has(serial)) return reply({ ok: false, state: 'device_busy', why: 'another job is running on this phone' });
+    this._posting.add(serial);
+    let previous = null;
+    let driver = null;
+    try {
+      if (await this._scrcpyRunning(serial)) return reply({ ok: false, state: 'device_busy', why: 'someone is watching this phone' });
+      if (!(await this._userExists(serial, uid))) return reply({ ok: false, state: 'profile_not_found', why: 'the profile is gone from the phone' });
+      if (!(await this._pkgInstalledForUser(serial, uid, pkg))) return reply({ ok: false, state: 'not_installed', why: 'Threads is not installed on this profile' });
+      previous = await this._igSwitchTo(serial, uid, false, log);
+      await this._waitUnlocked(serial, uid, 30000, log);
+      if (await this._scrcpyRunning(serial)) return reply({ ok: false, state: 'device_busy', why: 'someone is watching this phone' });
+      await this._startApp(serial, uid, pkg);
+      await new Promise((res) => setTimeout(res, 4000));
+      driver = this._igDriver(serial, String(m.username || ''));
+      const out = await thlogin.run(driver, { uid, username: String(m.username || ''), abort: async () => this._scrcpyRunning(serial) });
+      out.agent_version = this.appVersion || AGENT_VERSION;
+      out.uid = uid;
+      if (!out.ok && !out.screenshot_b64) {
+        try { const png = await driver.screenshot(); if (png && png.length) out.screenshot_b64 = png.toString('base64'); } catch {}
+      }
+      log(`-> ${out.state}${out.why ? ' (' + out.why + ')' : ''}${out.username ? ' as @' + out.username : ''} in ${secs()} s`);
+      return reply(out);
+    } catch (e) {
+      const err = String((e && e.message) || e);
+      log(`failed: ${err}`);
+      const out = { ok: false, state: 'failed', why: 'exception', error: err.slice(0, 300) };
+      try { if (driver) { const png = await driver.screenshot(); if (png && png.length) out.screenshot_b64 = png.toString('base64'); } } catch {}
+      return reply(out);
+    } finally {
       try { await this._adbLong(serial, ['shell', 'input', 'keyevent', 'KEYCODE_HOME'], 5000); } catch {}
       if (previous && previous !== String(uid)) {
         try { await this._adbLong(serial, ['shell', 'am', 'switch-user', String(previous)], 12000); log(`restored profile ${previous}`); } catch {}
